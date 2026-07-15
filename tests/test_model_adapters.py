@@ -20,6 +20,7 @@ import torch.nn as nn
 from reap.model_adapters import (
     Qwen3MoeModelAdapter,
     Llama4MoeModelAdapter,
+    Lfm2MoeModelAdapter,
     MixtralMoeModelAdapter,
     infer_model_adapter,
 )
@@ -272,3 +273,126 @@ def test_dense_model_returns_none_adapter():
         MockConfig(model_type="qwen3_moe", num_experts=E, num_experts_per_tok=K),
     )
     assert infer_model_adapter(dense, dense.config) is None
+
+
+# --- LFM2 (Liquid Foundation Model 2.5 MoE, fused experts) ---
+
+
+class Lfm2MoeExperts(nn.Module):
+    """Fused expert container - NOT iterable (no __len__/__getitem__), mirrors HF."""
+
+    def __init__(self, num_experts=E, hidden=H, inter=H * 2):
+        super().__init__()
+        self.num_experts = num_experts
+        self.hidden_dim = hidden
+        self.intermediate_dim = inter
+        self.has_bias = False
+        # gate+up stacked on dim 1: (E, 2*I, H); down: (E, H, I)
+        self.gate_up_proj = nn.Parameter(torch.zeros(num_experts, 2 * inter, hidden))
+        self.down_proj = nn.Parameter(torch.zeros(num_experts, hidden, inter))
+
+
+class Lfm2MoeSparseMoeBlock(nn.Module):
+    """Mock of the HF Lfm2MoeSparseMoeBlock (router at .gate, fused experts)."""
+
+    def __init__(self, num_experts=E, hidden=H, inter=H * 2):
+        super().__init__()
+        self.num_experts = num_experts
+        self.gate = nn.Linear(hidden, num_experts, bias=False)  # router
+        self.experts = Lfm2MoeExperts(num_experts, hidden, inter)
+
+    def forward(self, x):
+        return x, torch.zeros(self.num_experts, x.shape[0])
+
+
+class Lfm2MoeMLP(nn.Module):
+    """Dense feed_forward for the first ``num_dense_layers`` layers."""
+
+    def __init__(self, hidden=H):
+        super().__init__()
+        self.fc = nn.Linear(hidden, hidden * 4)
+
+    def forward(self, x):
+        return self.fc(x)
+
+
+class Lfm2Layer(nn.Module):
+    def __init__(self, ff):
+        super().__init__()
+        self.feed_forward = ff
+
+
+def build_lfm2():
+    # layer 0 DENSE (Lfm2MoeMLP), layer 1 MoE -> exercises dense-skip + fused
+    cfg = MockConfig(
+        model_type="lfm2_moe",
+        architectures=["Lfm2MoeForCausalLM"],
+        num_experts=E,
+        num_experts_per_tok=K,
+        norm_topk_prob=True,
+        use_expert_bias=True,
+        num_dense_layers=1,
+    )
+    layers = [Lfm2Layer(Lfm2MoeMLP()), Lfm2Layer(Lfm2MoeSparseMoeBlock())]
+    return MockCausalLM(layers, cfg)
+
+
+def test_infer_adapter_lfm2_layout():
+    m = build_lfm2()
+    adapter = infer_model_adapter(m, m.config)
+    assert isinstance(adapter, Lfm2MoeModelAdapter)
+    assert adapter.hook_regex() == "Lfm2MoeSparseMoeBlock"
+    assert adapter.identify_moe_layers(m) == [1]  # layer 0 is dense
+
+
+def test_lfm2_get_layer_config_fused_with_bias():
+    m = build_lfm2()
+    adapter = infer_model_adapter(m, m.config)
+    lc = adapter.get_layer_config(adapter.layers(m)[1], m.config)
+    assert lc.fused_experts is True
+    assert lc.num_experts == E
+    assert lc.top_k == K
+    assert lc.norm_topk_prob is True
+    assert lc.use_expert_bias is True
+    assert lc.adapter_name == "lfm2_moe"
+
+
+def test_lfm2_expert_weight_attrs_fused():
+    m = build_lfm2()
+    adapter = infer_model_adapter(m, m.config)
+    attrs = adapter.expert_weight_attrs()
+    assert attrs["fused"] is True
+    assert attrs["gate"] == "gate"          # LFM2 router attr (not "router")
+    assert attrs["gate_proj"] == "gate_up_proj"
+    assert attrs["up_proj"] == "gate_up_proj"   # gate+up fused in one tensor
+    assert attrs["down_proj"] == "down_proj"
+
+
+def test_lfm2_slice_experts_and_update_config():
+    m = build_lfm2()
+    adapter = infer_model_adapter(m, m.config)
+    moe = adapter.get_moe(adapter.layers(m)[1])
+    keep = [0, 2, 4, 6]
+    adapter.slice_experts(moe, keep)
+    assert moe.experts.num_experts == 4
+    assert moe.experts.gate_up_proj.shape[0] == 4   # sliced on dim 0
+    assert moe.experts.down_proj.shape[0] == 4
+    assert moe.gate.out_features == 4
+    assert moe.gate.weight.shape[0] == 4
+    adapter.update_config(m.config, 4, K)
+    assert m.config.num_experts == 4
+    assert m.config.num_experts_per_tok == 2
+
+
+def test_lfm2_config_only_inference():
+    assert isinstance(
+        infer_model_adapter(
+            None, MockConfig(model_type="lfm2_moe", architectures=["Lfm2MoeForCausalLM"])
+        ),
+        Lfm2MoeModelAdapter,
+    )
+    # architecture-string fallback
+    assert isinstance(
+        infer_model_adapter(None, MockConfig(model_type="", architectures=["Lfm2MoeForCausalLM"])),
+        Lfm2MoeModelAdapter,
+    )

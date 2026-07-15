@@ -425,6 +425,169 @@ class Llama4MoeModelAdapter:
             config.num_experts_per_tok = top_k
 
 
+class Lfm2MoeModelAdapter:
+    """Liquid LFM2.5 MoE adapter for HuggingFace fused expert blocks.
+
+    Targets ``Lfm2MoeSparseMoeBlock`` modules found under
+    ``layer.feed_forward``. The router is a plain ``nn.Linear`` at
+    ``moe.gate`` (weight shape ``(num_experts, hidden_size)``). Experts are
+    fused into a single ``Lfm2MoeExperts`` module exposing stacked
+    ``gate_up_proj`` ``(E, 2*I, H)`` and ``down_proj`` ``(E, H, I)`` tensors
+    — no per-expert ``nn.Linear``, not iterable (no ``__getitem__``/``__len__``).
+    Dense layers (the first ``num_dense_layers``) use ``Lfm2MoeMLP`` and
+    expose neither ``gate`` nor ``experts``.
+
+    Requires ``transformers>=5.2`` (``Lfm2MoeForCausalLM`` is not present in
+    the pinned ``transformers==4.55`` — see issue #4 / the LFM2 runtime note).
+    """
+
+    adapter_name = "lfm2_moe"
+
+    def moe_block_attr(self) -> str:
+        return "feed_forward"
+
+    def hook_regex(self) -> str:
+        return "Lfm2MoeSparseMoeBlock"
+
+    def experts_attr(self) -> str:
+        return "experts"
+
+    def router_attr(self) -> str:
+        # LFM2 router is an ``nn.Linear`` at ``.gate`` (not ``.router`` like
+        # Llama4). Weight shape: ``(num_experts, hidden_size)``.
+        return "gate"
+
+    def num_experts_config_attr(self) -> str:
+        return "num_experts"
+
+    def expert_weight_attrs(self) -> dict[str, Any]:
+        """Fused layout: gate+up stacked in ``gate_up_proj`` (dim 1), ``down_proj``.
+
+        Same fused contract as Llama4 — merge/permute slice the stacked tensors
+        on dim 0 (expert axis) and split ``gate_up_proj`` into gate/up halves
+        on dim 1 when needed.
+        """
+        return {
+            "experts": self.experts_attr(),
+            "gate": self.router_attr(),
+            "fused": True,
+            "gate_proj": "gate_up_proj",
+            "up_proj": "gate_up_proj",
+            "down_proj": "down_proj",
+        }
+
+    # -- layout inspection ------------------------------------------------
+    def layers(self, model: Any) -> Sequence[Any]:
+        return get_model_layers(model)
+
+    def identify_moe_layers(self, model: Any) -> list[int]:
+        return [
+            layer_idx
+            for layer_idx, layer in enumerate(self.layers(model))
+            if self.is_moe_layer(layer)
+        ]
+
+    def is_moe_layer(self, layer: Any) -> bool:
+        ff = getattr(layer, "feed_forward", None)
+        if ff is None or not hasattr(ff, "experts"):
+            return False
+        # Guard against Llama4-style blocks (which also have feed_forward.experts
+        # but use .router). The LFM2 MoE block class is Lfm2MoeSparseMoeBlock.
+        return type(ff).__name__ == "Lfm2MoeSparseMoeBlock"
+
+    def get_moe(self, layer: Any) -> Any:
+        if not self.is_moe_layer(layer):
+            raise ValueError(
+                "Layer does not expose LFM2-style feed_forward.experts "
+                "(Lfm2MoeSparseMoeBlock)."
+            )
+        return layer.feed_forward
+
+    def get_dense_mlp(self, layer: Any) -> Any:
+        ff = getattr(layer, "feed_forward", None)
+        if ff is None:
+            raise ValueError("Layer does not expose a feed_forward module.")
+        return ff
+
+    def get_layer_config(
+        self,
+        layer: Any,
+        config: Mapping[str, Any] | None = None,
+    ) -> MoeLayerConfig:
+        moe = self.get_moe(layer)
+
+        num_experts = _positive_int(
+            _live_or_config_value(
+                moe,
+                ("num_experts",),
+                config,
+                ("num_experts",),
+            ),
+            "num_experts",
+        )
+        top_k = _positive_int(
+            _live_or_config_value(
+                moe,
+                ("top_k", "num_experts_per_tok"),
+                config,
+                ("num_experts_per_tok", "top_k"),
+            ),
+            "top_k",
+        )
+        norm_topk_prob = bool(
+            _live_or_config_value(
+                moe,
+                ("norm_topk_prob",),
+                config,
+                ("norm_topk_prob",),
+                default=False,
+            )
+        )
+        use_expert_bias = bool(
+            _live_or_config_value(
+                moe,
+                ("use_expert_bias",),
+                config,
+                ("use_expert_bias",),
+                default=False,
+            )
+        )
+        return MoeLayerConfig(
+            num_experts=num_experts,
+            top_k=top_k,
+            norm_topk_prob=norm_topk_prob,
+            adapter_name=self.adapter_name,
+            fused_experts=True,
+            use_expert_bias=use_expert_bias,
+        )
+
+    # -- expert slicing (fused, dim 0 = expert axis) ---------------------
+    def slice_experts(self, moe: nn.Module, keep_indices: list[int]) -> None:
+        """Slice fused LFM2 expert weights on dim 0 (expert axis)."""
+        exps = getattr(moe, self.experts_attr())
+        exps.gate_up_proj.data = exps.gate_up_proj.data[keep_indices]
+        exps.down_proj.data = exps.down_proj.data[keep_indices]
+        if hasattr(exps, "num_experts"):
+            exps.num_experts = len(keep_indices)
+        # Router is moe.gate (nn.Linear, weight (E, H)).
+        gate = getattr(moe, self.router_attr())
+        gate.weight.data = gate.weight.data[keep_indices, :]
+        if getattr(gate, "bias", None) is not None:
+            gate.bias.data = gate.bias.data[keep_indices]
+        gate.out_features = len(keep_indices)
+
+    def update_config(
+        self,
+        config: MutableMapping[str, Any],
+        num_experts: int,
+        top_k: int,
+    ) -> None:
+        setattr(config, self.num_experts_config_attr(), num_experts)
+        top_k = min(top_k, num_experts)
+        if hasattr(config, "num_experts_per_tok"):
+            config.num_experts_per_tok = top_k
+
+
 class MixtralMoeModelAdapter(Qwen3MoeModelAdapter):
     """Mixtral / PhiMoE-style adapter (``layer.block_sparse_moe``)."""
 
@@ -472,6 +635,7 @@ _QWEN_FAMILY_TYPES = frozenset(
     }
 )
 _MIXTRAL_FAMILY_TYPES = frozenset({"mixtral", "phimoe", "phi_moe"})
+_LFM2_FAMILY_TYPES = frozenset({"lfm2_moe"})
 
 
 def infer_model_adapter(
@@ -493,6 +657,16 @@ def infer_model_adapter(
             layers = get_model_layers(model)
         except ValueError:
             layers = ()
+
+        # LFM2: fused experts under feed_forward, MoE block class is
+        # Lfm2MoeSparseMoeBlock (router attr is .gate). Must be checked before
+        # the Llama4 fallback, since both expose feed_forward.experts.
+        if any(
+            type(getattr(layer, "feed_forward", None)).__name__
+            == "Lfm2MoeSparseMoeBlock"
+            for layer in layers
+        ):
+            return Lfm2MoeModelAdapter()
 
         if any(
             getattr(getattr(layer, "feed_forward", None), "experts", None)
@@ -519,6 +693,10 @@ def infer_model_adapter(
         return None
 
     # Config-only inference (no model object).
+    if model_type in _LFM2_FAMILY_TYPES or any(
+        str(a).startswith("Lfm2") and "Moe" in str(a) for a in architectures
+    ):
+        return Lfm2MoeModelAdapter()
     if model_type in _MIXTRAL_FAMILY_TYPES or any(
         "Mixtral" in str(a) or "PhiMoE" in str(a) for a in architectures
     ):
@@ -536,6 +714,7 @@ def infer_model_adapter(
 
 
 __all__ = [
+    "Lfm2MoeModelAdapter",
     "Llama4MoeModelAdapter",
     "MixtralMoeModelAdapter",
     "MoeLayerConfig",
