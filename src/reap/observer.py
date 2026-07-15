@@ -6,6 +6,7 @@ import gc
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import re
 from dataclasses import dataclass
 import logging
@@ -22,6 +23,27 @@ from reap.pruning_metrics import initialize_pruning_state, update_pruning_state
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+_ACT_FN_MAP = {
+    "silu": F.silu,
+    "swiglu": F.silu,  # SwiGLU: act(gate) * up; act_fn returns the gate activation
+    "gelu": F.gelu,
+    "relu": F.relu,
+}
+
+
+def _resolve_act_fn(config: Any) -> callable:
+    """Return the expert-MLP gate activation from ``config.hidden_act``.
+
+    All supported MoE targets (Qwen3, Llama4, LFM2, Mixtral) use SwiGLU/silu.
+    The ``* up`` half of SwiGLU is applied by the caller.
+    """
+    name = str(getattr(config, "hidden_act", None) or "silu").lower()
+    try:
+        return _ACT_FN_MAP[name]
+    except KeyError:
+        raise ValueError(f"Unsupported expert activation: {name!r}") from None
 
 
 class BaseTransformerObserverHookConfig:
@@ -351,25 +373,29 @@ class MoETransformerObserver(BaseTransformerObserver):
             activations = torch.zeros((num_experts, *flat_input.shape), device=device)
 
             if self.hook_config.fused_experts:
-                _, router_scores = output  # (num_experts, total_tokens)
-                router_logits = module.router(flat_input)  # (total_tokens, num_experts)
+                # Fused experts (Llama4 / LFM2): per-expert activations computed
+                # from the stacked gate_up_proj / down_proj weights. This is the
+                # Phase-1 bmm "grouped" pattern (routed-only) -- a bridge until the
+                # FREA kernel (docs/kernels/ Phase 3) replaces it. Validated
+                # bit-identical to Lfm2MoeExperts.forward for single-expert routing.
+                router = getattr(module, self.adapter.router_attr())
+                router_logits = router(flat_input)  # (total_tokens, num_experts)
                 _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
                 selected_experts = selected_experts.to(device)
-                router_indices = (
-                    torch.arange(batch_size * sequence_length, device=device)
-                    .view(1, -1)
-                    .expand(router_scores.size(0), -1)
-                )
-                router_indices = router_indices.reshape(-1, 1).expand(-1, hidden_dim)
-                routed_in = torch.gather(
-                    input=flat_input,
-                    dim=0,
-                    index=router_indices,
-                ).to(device)
-                # we do not apply router_scores
-                # record unweighted activations for all experts
-                routed_out = module.experts(routed_in)
-                activations = routed_out.view(num_experts, *flat_input.shape)
+                exps = module.experts
+                gup = exps.gate_up_proj  # (E, 2*I, H): rows [0:I]=gate, [I:2I]=up
+                dp = exps.down_proj        # (E, H, I)
+                inter = gup.shape[1] // 2
+                act_fn = _resolve_act_fn(self.model.config)
+                for e in range(num_experts):
+                    mask = (selected_experts == e).any(dim=-1)  # (total_tokens,)
+                    if not bool(mask.any()):
+                        continue
+                    xe = flat_input[mask]                         # (n_e, H)
+                    g = F.linear(xe, gup[e, :inter])             # (n_e, I) gate
+                    u = F.linear(xe, gup[e, inter:])              # (n_e, I) up
+                    h = act_fn(g) * u                              # SwiGLU
+                    activations[e, mask] = F.linear(h, dp[e])    # (n_e, H) down
 
             else:  # loop based MoE execution
                 *_, router_logits = output  # (total_tokens, num_experts)

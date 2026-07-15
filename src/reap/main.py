@@ -93,7 +93,7 @@ def _setup_observer(model, obs_args):
         raise ValueError(
             f"Cannot detect a supported MoE adapter for "
             f"{model.__class__.__name__}. REAP currently supports Qwen3-MoE, "
-            "Llama4-MoE, and Mixtral-style architectures."
+            "Llama4-MoE, LFM2-MoE, and Mixtral-style architectures."
         )
 
     moe_layer_indices = adapter.identify_moe_layers(model)

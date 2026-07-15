@@ -396,3 +396,13 @@ def test_lfm2_config_only_inference():
         infer_model_adapter(None, MockConfig(model_type="", architectures=["Lfm2MoeForCausalLM"])),
         Lfm2MoeModelAdapter,
     )
+
+
+def test_lfm2_setup_observer_registers_fused_hooks():
+    m = build_lfm2()
+    obs = _setup_observer(m, _obs_args())
+    assert obs is not None
+    # dense layer 0 skipped, MoE layer 1 hooked
+    assert len(obs.hooks) > 0
+    # fused_experts must be threaded from the adapter layer config
+    assert obs.hook_config.fused_experts is True
