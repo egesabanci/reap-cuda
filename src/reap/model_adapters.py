@@ -181,6 +181,21 @@ class Qwen3MoeModelAdapter:
     def num_experts_config_attr(self) -> str:
         return "num_experts"
 
+    def expert_weight_attrs(self) -> dict[str, Any]:
+        """Per-expert weight attribute-name layout used by merge/permute.
+
+        Non-fused layout: each expert in a ModuleList exposes separate
+        ``gate_proj`` / ``up_proj`` / ``down_proj`` linears.
+        """
+        return {
+            "experts": self.experts_attr(),
+            "gate": self.router_attr(),
+            "fused": False,
+            "gate_proj": "gate_proj",
+            "up_proj": "up_proj",
+            "down_proj": "down_proj",
+        }
+
     # -- layout inspection ------------------------------------------------
     def layers(self, model: Any) -> Sequence[Any]:
         return get_model_layers(model)
@@ -307,6 +322,19 @@ class Llama4MoeModelAdapter:
 
     def num_experts_config_attr(self) -> str:
         return "num_local_experts"
+
+    def expert_weight_attrs(self) -> dict[str, Any]:
+        """Fused expert layout: gate+up stacked into ``gate_up_proj`` and
+        ``down_proj``, both ``(num_experts, ...)`` tensors on a single module.
+        """
+        return {
+            "experts": self.experts_attr(),
+            "gate": self.router_attr(),
+            "fused": True,
+            "gate_proj": "gate_up_proj",
+            "up_proj": "gate_up_proj",
+            "down_proj": "down_proj",
+        }
 
     def layers(self, model: Any) -> Sequence[Any]:
         return get_model_layers(model)

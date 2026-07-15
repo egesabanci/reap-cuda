@@ -10,6 +10,9 @@ dependencies = [
     "torch==2.7.1",
     "transformers==4.55.0",
     "tqdm",
+    "scipy>=1.13.0",
+    "scikit-learn>=1.5.0",
+    "pyyaml>=6.0",
 ]
 
 [build-system]
