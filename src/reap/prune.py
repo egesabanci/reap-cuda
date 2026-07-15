@@ -1,7 +1,8 @@
 from __future__ import annotations
-import time
+import gc
 import logging
 import pathlib
+import time
 from typing import Any
 
 import torch
@@ -22,7 +23,7 @@ from reap.args import (
     DatasetArgs,
     ClusterArgs,
 )
-from reap.model_util import get_moe, MODEL_ATTRS
+from reap.model_adapters import infer_model_adapter
 from reap.eval import run_evaluate
 
 logger = logging.getLogger(__name__)
@@ -37,9 +38,16 @@ def prune(
     pruned_model_dir,
 ):
     """
-    Prune the model based on the observer data and clustering.
+    Prune the model based on the observer data.
     """
-    model_attrs = MODEL_ATTRS[model.__class__.__name__]
+    adapter = infer_model_adapter(model, model.config)
+    if adapter is None:
+        raise ValueError(
+            f"Cannot detect a supported MoE adapter for "
+            f"{model.__class__.__name__}. REAP currently supports Qwen3-MoE, "
+            "Llama4-MoE, and Mixtral-style architectures."
+        )
+    layers = adapter.layers(model)
 
     for layer in observer_data:
         if "expert_proba" not in observer_data[layer]:
@@ -75,41 +83,15 @@ def prune(
         retained_expert_indicies = [
             i for i in range(num_experts) if i not in experts_to_prune
         ]
-        # prune experts
-        moe = get_moe(model, layer)
-        if not model_attrs["fused"]:
-            all_experts = getattr(moe, model_attrs["experts"])
-            retained_experts = [all_experts[i] for i in retained_expert_indicies]
-            retained_experts = torch.nn.ModuleList(retained_experts)
-            setattr(moe, model_attrs["experts"], retained_experts)
-
-            # prune router
-            router = getattr(moe, model_attrs["router"])
-            router.weight.data = router.weight.data[retained_expert_indicies, :]
-            if getattr(router, "bias", None):
-                router.bias.data = router.bias.data[retained_expert_indicies]
-            router.out_features = len(retained_expert_indicies)
-            if hasattr(router, "e_score_correction_bias"):
-                router.e_score_correction_bias.data = (
-                    router.e_score_correction_bias.data[retained_expert_indicies]
-                )
-            setattr(moe, model_attrs["router"], router)
-        else:
-            # prune fused experts, only tested for llama-4
-            moe.experts.gate_up_proj.data = moe.experts.gate_up_proj[
-                retained_expert_indicies
-            ]
-            moe.experts.down_proj.data = moe.experts.down_proj[retained_expert_indicies]
-            moe.num_experts = len(retained_expert_indicies)
-            moe.router.weight.data = moe.router.weight.data[retained_expert_indicies]
-            moe.router.out_features = len(retained_expert_indicies)
-            if hasattr(moe.router, "num_experts"):  # transformers >= 4.54+
-                moe.router.num_experts = len(retained_expert_indicies)
+        # prune experts (architecture-specific slicing via adapter)
+        moe = adapter.get_moe(layers[layer])
+        adapter.slice_experts(moe, retained_expert_indicies)
 
     # patch config and dump
     logger.info("Saving pruned model...")
     retained_experts = len(retained_expert_indicies)
-    setattr(model.config, model_attrs["num_experts"], retained_experts)
+    layer_cfg = adapter.get_layer_config(layers[0], model.config)
+    adapter.update_config(model.config, retained_experts, layer_cfg.top_k)
 
     pruned_model_dir.mkdir(parents=True, exist_ok=True)
     start = time.time()

@@ -3,7 +3,6 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import Any, Optional
 import gc
-from functools import reduce
 
 import torch
 import torch.nn as nn
@@ -11,7 +10,6 @@ import re
 from dataclasses import dataclass
 import logging
 import pathlib
-from functools import reduce
 
 from reap.metrics import (
     ttm_online,
@@ -217,8 +215,6 @@ class BaseTransformerObserver(ABC):
 
 @dataclass
 class MoETransformerObserverConfig(BaseTransformerObserverHookConfig):
-    num_experts_attr_name: str = "num_experts"
-    top_k_attr_name: str = "top_k"
     fused_experts: bool = False
     distance_measure: str = "angular"
     renormalize_router_weights: bool = False
@@ -228,8 +224,9 @@ class MoETransformerObserverConfig(BaseTransformerObserverHookConfig):
 class MoETransformerObserver(BaseTransformerObserver):
     """MoE Transformer Observer for all methods including both pruning and merging."""
 
-    def __init__(self, model, hook_config=None):
+    def __init__(self, model, hook_config=None, adapter=None):
         self._current_attention_mask: Optional[torch.Tensor] = None
+        self.adapter = adapter
         super().__init__(model, hook_config)
 
     @contextmanager
@@ -315,16 +312,17 @@ class MoETransformerObserver(BaseTransformerObserver):
 
     def _hook_factory(self, module: nn.Module, layer_number: int) -> callable:
         distance_fn = get_distance_fn("cosine") # always use cosine for online dist. metrics
-        num_experts = reduce(
-            getattr, self.hook_config.num_experts_attr_name.split("."), module
-        )
-        top_k = reduce(getattr, self.hook_config.top_k_attr_name.split("."), module)
-        if num_experts is None or top_k is None:
-            raise ValueError(
-                f"Module {module.__class__.__name__} at layer {layer_number} "
-                "does not have expected 'num_experts' or 'top_k' attributes. Check "
-                "HookConfig settings."
+
+        # Read num_experts / top_k from the adapter-driven layer config.
+        if self.adapter is None:
+            raise RuntimeError(
+                "MoETransformerObserver requires an adapter (pass adapter=...)"
             )
+        layers = self.adapter.layers(self.model)
+        layer = layers[layer_number]
+        layer_cfg = self.adapter.get_layer_config(layer, self.model.config)
+        num_experts = layer_cfg.num_experts
+        top_k = layer_cfg.top_k
 
         @torch.no_grad()
         def _hook_fn(module, args, output):
@@ -474,29 +472,3 @@ class MoETransformerObserver(BaseTransformerObserver):
 
         return _hook_fn
 
-
-# --- Concrete Config Implementations ----
-
-
-@dataclass
-class Qwen3MoEObserverHookConfig(MoETransformerObserverConfig):
-    module_class_name_to_hook_regex: Optional[str] = "Qwen3MoeSparseMoeBlock"
-
-
-@dataclass
-class Llama4MoEObserverHookConfig(MoETransformerObserverConfig):
-    module_class_name_to_hook_regex: Optional[str] = "Llama4TextMoe"
-    fused_experts: bool = True  # Llama4 uses fused experts
-
-
-@dataclass
-class MixtralMoEObserverHookConfig(MoETransformerObserverConfig):
-    module_class_name_to_hook_regex: Optional[str] = "MixtralSparseMoeBlock"
-
-
-OBSERVER_CONFIG_REGISTRY = {
-    "Qwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
-    "NonUniformQwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
-    "Llama4ForCausalLM": Llama4MoEObserverHookConfig,
-    "MixtralForCausalLM": MixtralMoEObserverHookConfig,
-}

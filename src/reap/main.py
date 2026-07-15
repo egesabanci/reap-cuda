@@ -23,7 +23,8 @@ from reap.args import (
     MergeArgs,
 )
 from reap.data import load_category_batches, parse_composite_dataset_spec
-from reap.observer import OBSERVER_CONFIG_REGISTRY, MoETransformerObserver
+from reap.observer import MoETransformerObserver
+from reap.model_adapters import infer_model_adapter
 from reap.eval import run_evaluate
 
 logger = logging.getLogger(__name__)
@@ -86,26 +87,34 @@ def create_results_directory(model_name: str, dataset_name: str) -> pathlib.Path
 
 def _setup_observer(model, obs_args):
     """Create and return an MoETransformerObserver for the given model."""
-    try:
-        renormalize_router_weights = (
-            getattr(model.config, "norm_topk_prob", False)
-            and obs_args.renormalize_router_weights
-        )
-        if renormalize_router_weights:
-            logger.info("Renormalizing topk router weights to sum to 1.")
-        observer_config = OBSERVER_CONFIG_REGISTRY[model.__class__.__name__](
-            distance_measure="cosine",
-            renormalize_router_weights=renormalize_router_weights,
-            record_pruning_metrics_only=obs_args.record_pruning_metrics_only,
-        )
-    except KeyError:
+    adapter = infer_model_adapter(model, model.config)
+    if adapter is None:
         raise ValueError(
-            f"No observer configuration registered for model '{model.__class__.__name__}'. "
-            f"Supported: {list(OBSERVER_CONFIG_REGISTRY.keys())}"
+            f"Cannot detect a supported MoE adapter for "
+            f"{model.__class__.__name__}. REAP currently supports Qwen3-MoE, "
+            "Llama4-MoE, and Mixtral-style architectures."
         )
+
+    renormalize_router_weights = (
+        getattr(model.config, "norm_topk_prob", False)
+        and obs_args.renormalize_router_weights
+    )
+    if renormalize_router_weights:
+        logger.info("Renormalizing topk router weights to sum to 1.")
+
+    observer_config = MoETransformerObserverConfig(
+        module_class_name_to_hook_regex=adapter.hook_regex(),
+        fused_experts=adapter.get_layer_config(
+            adapter.layers(model)[0], model.config
+        ).fused_experts,
+        distance_measure="cosine",
+        renormalize_router_weights=renormalize_router_weights,
+        record_pruning_metrics_only=obs_args.record_pruning_metrics_only,
+    )
     return MoETransformerObserver(
         model=model,
         hook_config=observer_config,
+        adapter=adapter,
     )
 
 
@@ -267,7 +276,7 @@ def record_activations(
 
 
 @torch.no_grad()
-def smoke_test(model: nn.Module, tokenizer: AutoTokenizer):
+def smoke_test(model: torch.nn.Module, tokenizer: AutoTokenizer):
     """Run a smoke test to ensure the model is functioning correctly."""
     prompt = "What is your name?"
     test_input = [
@@ -298,9 +307,10 @@ def main():
         model_args,
         ds_args,
         obs_args,
-        *_rest,
+        cluster_args,
+        eval_args,
+        merge_args,
     ) = parse_args()
-    eval_args = _rest[2] if len(_rest) > 2 else None
     set_seed(reap_args.seed)
     results_dir = create_results_directory(model_args.model_name, ds_args.dataset_name)
 
@@ -344,7 +354,7 @@ def main():
             pass
 
     # eval
-    if reap_args.do_eval and eval_args is not None:
+    if reap_args.do_eval:
         remove_hook_from_module(model, recurse=True)
         model.to("cpu")
         del model
