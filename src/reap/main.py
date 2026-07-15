@@ -5,6 +5,7 @@ import pathlib
 import re
 import gc
 
+import yaml
 import torch
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
@@ -307,6 +308,35 @@ def smoke_test(model: torch.nn.Module, tokenizer: AutoTokenizer):
 
 
 
+
+
+def dump_args_to_yaml(
+    pruned_model_dir: pathlib.Path,
+    **all_args,
+):
+    """Dump all arguments to a YAML file."""
+
+    def convert_paths_to_str(data):
+        if isinstance(data, dict):
+            return {k: convert_paths_to_str(v) for k, v in data.items()}
+        elif isinstance(data, list):
+            return [convert_paths_to_str(i) for i in data]
+        elif isinstance(data, pathlib.Path):
+            return str(data)
+        else:
+            return data
+
+    serializable_args = {}
+    for name, arg in all_args.items():
+        if dataclasses.is_dataclass(arg):
+            serializable_args[name] = convert_paths_to_str(dataclasses.asdict(arg))
+        else:
+            serializable_args[name] = convert_paths_to_str(arg)
+
+    output_path = pruned_model_dir / "reap_args.yaml"
+    with open(output_path, "w") as f:
+        yaml.dump(serializable_args, f, default_flow_style=False)
+    logger.info(f"Arguments saved to {output_path}")
 
 
 def main():

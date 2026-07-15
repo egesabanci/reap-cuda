@@ -503,4 +503,37 @@ class PruneArgs:
     )
 
 
+@dataclass
+class LayerwiseArgs:
+    """Arguments for layerwise (memory-efficient) calibration."""
+
+    batch_group_size: int | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Number of pre-tokenized calibration batches to process at a time. "
+                "If not set, process all the batches generated from the dataset. "
+                "If set, the layerwise observer processes one group through all blocks "
+                "before moving to the next group, which reduces CPU RAM usage from "
+                "cached first-layer inputs."
+            )
+        },
+    )
+    save_intermediate: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to save intermediate results after each block during layerwise "
+                "calibration. Useful for debugging and recovery."
+            )
+        },
+    )
+    low_cpu_mem_usage: bool = field(
+        default=True,
+        metadata={
+            "help": ("Use memory-efficient model loading. Recommended for large models."),
+        },
+    )
+
+
 
