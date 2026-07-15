@@ -1,12 +1,8 @@
 from __future__ import annotations
 import time
 import logging
-import dataclasses
 import pathlib
-import time
 from typing import Any
-import gc
-import yaml
 
 import torch
 from tqdm import tqdm
@@ -16,7 +12,7 @@ from accelerate.utils import set_seed
 from accelerate.hooks import remove_hook_from_module
 
 
-from reap.main import record_activations, smoke_test, create_results_directory, dump_args_to_yaml
+from reap.main import record_activations, smoke_test, create_results_directory
 from reap.args import (
     ReapArgs,
     ModelArgs,
@@ -26,15 +22,8 @@ from reap.args import (
     DatasetArgs,
     ClusterArgs,
 )
-from reap.data import DATASET_REGISTRY
-from reap.cluster import (
-    get_penalty_vector,
-    hierarchical_clustering,
-    dynamic_frequency_penalized_clustering,
-)
-from reap.model_util import get_moe, assert_merge, MODEL_ATTRS, patched_model_map, get_super_expert_indices
+from reap.model_util import get_moe, MODEL_ATTRS
 from reap.eval import run_evaluate
-import shutil
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -59,25 +48,6 @@ def prune(
                 observer_data[layer]["expert_frequency"]
                 / observer_data[layer]["total_tokens"]
             )
-
-    if prune_args.perserve_super_experts or prune_args.perserve_outliers:
-        super_expert_idx = get_super_expert_indices(observer_data, include_last_layers=prune_args.perserve_outliers)
-        metrics = [
-            "expert_proba",
-            "ean_sum",
-            "ean_mean",
-            "weighted_expert_frequency_sum",
-            "weighted_ean_sum",
-            "reap",
-            "reap_l2",
-            "weighted_ean_sum_l2",
-        ]
-        for layer in observer_data:
-            super_experts_in_layer = super_expert_idx[super_expert_idx[:, 0] == layer][:, 1]
-            if len(super_experts_in_layer) > 0:
-                for metric in metrics:
-                    if metric in observer_data[layer]:
-                        observer_data[layer][metric][super_experts_in_layer] = float("inf")
 
     for layer in tqdm(observer_data, "Pruning layers..."):
         num_experts = observer_data[layer]["expert_frequency"].shape[0]
@@ -112,14 +82,6 @@ def prune(
             retained_experts = [all_experts[i] for i in retained_expert_indicies]
             retained_experts = torch.nn.ModuleList(retained_experts)
             setattr(moe, model_attrs["experts"], retained_experts)
-            if model.__class__.__name__.lower() == "Ernie4_5_MoEForCausalLM".lower():
-                # transformers version >=4.54
-                # prune expert score correction bias too
-                moe.moe_statics.e_score_correction_bias.data = (
-                    moe.moe_statics.e_score_correction_bias.data[
-                        :, retained_expert_indicies
-                    ]
-                )
 
             # prune router
             router = getattr(moe, model_attrs["router"])
@@ -148,12 +110,6 @@ def prune(
     logger.info("Saving pruned model...")
     retained_experts = len(retained_expert_indicies)
     setattr(model.config, model_attrs["num_experts"], retained_experts)
-    if model.__class__.__name__ == "Ernie4_5_MoeForCausalLM":  # remote-code verson
-        model.config.moe_capacity = [
-            retained_experts,
-            retained_experts,
-            retained_experts,
-        ]
 
     pruned_model_dir.mkdir(parents=True, exist_ok=True)
     start = time.time()
@@ -209,13 +165,10 @@ def main():
     reap_args, ds_args, obs_args, model_args, eval_args, prune_args, cluster_args = (
         parser.parse_args_into_dataclasses()
     )
-    if prune_args.perserve_super_experts and prune_args.perserve_outliers:
-        raise ValueError("Only one of perserve_super_experts or perserve_outliers can be set to True.")
     set_seed(reap_args.seed)
     results_dir = create_results_directory(model_args.model_name, ds_args.dataset_name)
 
-    # get local patched model if req'd
-    model_name = patched_model_map(model_args.model_name)
+    model_name = model_args.model_name
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     # load model
     model = AutoModelForCausalLM.from_pretrained(
@@ -223,7 +176,6 @@ def main():
         device_map="auto",
         torch_dtype="auto",
         trust_remote_code=True,
-        local_files_only=True,
     )
     # record activations or load previously recorded activations
     logger.info(
@@ -296,40 +248,17 @@ def main():
                 pass
 
         tokenizer.save_pretrained(pruned_model_dir)
-        if model_name == "artifacts/models/GLM-4.5-Air":
-            # move modelling file
-            source_file = pathlib.Path(model_name) / "modeling_glm4_moe.py"
-            target_file = pruned_model_dir / "modeling_glm4_moe.py"
-            if source_file.exists():
-                shutil.copy2(source_file, target_file)
-                logger.info(f"Copied modeling_glm4_moe.py to {pruned_model_dir}")
-            else:
-                raise RuntimeError(
-                    f"Source file {source_file} does not exist. Cannot copy to {target_file}."
-                )
-
         logger.info("Pruning completed.")
 
-        dump_args_to_yaml(
-            pruned_model_dir,
-            reap_args,
-            ds_args,
-            obs_args,
-            model_args,
-            eval_args,
-            prune_args,
-            cluster_args,
-        )
-
     # eval
-    if reap_args.do_eval:
+    if reap_args.do_eval and pruned_model_dir.exists():
         remove_hook_from_module(model, recurse=True)
         model.to("cpu")
         del model
         del observer_data
         torch.cuda.empty_cache()
         gc.collect()
-        model_args.model_name = pruned_model_dir
+        model_args.model_name = str(pruned_model_dir)
         run_evaluate(model_args, pruned_model_dir / "eval", eval_args, reap_args.seed)
 
 

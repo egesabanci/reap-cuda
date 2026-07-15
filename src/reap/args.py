@@ -1,13 +1,10 @@
 from dataclasses import dataclass, field
-import dotenv
 import os
-
-dotenv.load_dotenv()
 
 
 @dataclass
 class ReapArgs:
-    seed: int = field(default=42, metadata={"help": "Random seed for reproducibility."})  # 11, 99
+    seed: int = field(default=42, metadata={"help": "Random seed for reproducibility."})
     debug: bool = field(
         default=False, metadata={"help": "Enable debug mode for more verbose output."}
     )
@@ -20,19 +17,13 @@ class ReapArgs:
     )
     do_eval: bool = field(
         default=True,
-        metadata={"help": "Whether to run evaluation after merging experts."},
-    )
-    plot_clusters: bool = field(
-        default=True,
-        metadata={
-            "help": "Whether to plot clusters after clustering experts. "
-        }
+        metadata={"help": "Whether to run evaluation after pruning."},
     )
     smoke_test: bool = field(
         default=True,
         metadata={
             "help": (
-                "Whether to run a smoke test on the merged model to ensure it works "
+                "Whether to run a smoke test on the model to ensure it works "
                 "as expected prior to saving"
             )
         },
@@ -45,18 +36,6 @@ class ModelArgs:
         default="Qwen/Qwen3-30B-A3B",
         metadata={
             "help": "Name of the model to use.",
-            # "choices": [
-            #     "mistralai/Mixtral-8x7B-Instruct-v0.1",
-            #     "Qwen/Qwen3-30B-A3B",
-            #     "meta-llama/Llama-4-Scout-17B-16E-Instruct",
-            #     "baidu/ERNIE-4.5-21B-A3B-PT",
-            #     "deepseek-ai/DeepSeek-V2-Lite-Chat",
-            #     "Qwen/Qwen3-Coder-30B-A3B-Instruct",
-            #     "Qwen/Qwen3-30B-A3B-Instruct-2507",
-            #     "openai/gpt-oss-20b",
-            #     "openai/gpt-oss-120b",
-            #     "zai-org/GLM-4.5-Air"
-            # ],
         },
     )
     num_experts_per_tok_override: int | None = field(
@@ -361,11 +340,6 @@ class MergeArgs:
     )
 
 @dataclass
-class KdArgs:
-    pass
-
-
-@dataclass
 class EvalArgs:
     use_server: bool = field(
         default=True,
@@ -529,165 +503,4 @@ class PruneArgs:
     )
 
 
-@dataclass
-class LayerwiseArgs:
-    """Arguments for layerwise (memory-efficient) calibration."""
 
-    batch_group_size: int | None = field(
-        default=None,
-        metadata={
-            "help": (
-                "Number of pre-tokenized calibration batches to process at a time. "
-                "If not set, process all the batches generated from the dataset. "
-                "If set, the layerwise observer processes one group through all blocks "
-                "before moving to the next group, which reduces CPU RAM usage from "
-                "cached first-layer inputs."
-            )
-        },
-    )
-    save_intermediate: bool = field(
-        default=False,
-        metadata={
-            "help": (
-                "Whether to save intermediate results after each block during layerwise "
-                "calibration. Useful for debugging and recovery."
-            )
-        },
-    )
-    low_cpu_mem_usage: bool = field(
-        default=True,
-        metadata={
-            "help": (
-                "Use memory-efficient model loading. Recommended for large models."
-            )
-        },
-    )
-
-    
-@dataclass
-class QuantizationArgs:
-    quantization_method: str = field(
-        default="awq",
-        metadata={
-            "help": "Method to use for quantization.",
-            "choices": ["awq","gptq"]
-        },
-    )
-    scheme: str = field(
-        default="W4A16",
-        metadata={
-            "help": "Quantization scheme to use.",
-            "choices": ["W4A16",]
-        },
-    )
-    group_size: int = field(
-        default=128,
-        metadata={
-            "help": "Group / block size for quantization.",
-        },
-    )
-
-
-@dataclass
-class FSDPArgs:
-    compute_environment: str = field(
-        default="LOCAL_MACHINE", metadata={"help": "Compute environment type."}
-    )
-    debug: bool = field(default=False, metadata={"help": "Enable debug mode."})
-    distributed_type: str = field(
-        default="FSDP",
-        metadata={
-            "help": "Distributed training type.",
-            "choices": [
-                "NO",
-                "MULTI_CPU",
-                "MULTI_GPU",
-                "MULTI_NPU",
-                "FSDP",
-                "DEEPSPEED",
-            ],
-        },
-    )
-    downcast_bf16: str = field(
-        default="no",
-        metadata={
-            "help": "Whether to downcast bf16 operations.",
-            "choices": ["no", "yes"],
-        },
-    )
-    fsdp_auto_wrap_policy: str = field(
-        default="TRANSFORMER_BASED_WRAP",
-        metadata={
-            "help": "FSDP auto wrap policy.",
-            "choices": ["NO_WRAP", "SIZE_BASED_WRAP", "TRANSFORMER_BASED_WRAP"],
-        },
-    )
-    fsdp_backward_prefetch_policy: str = field(
-        default="BACKWARD_PRE",
-        metadata={
-            "help": "FSDP backward prefetch policy.",
-            "choices": ["NO_PREFETCH", "BACKWARD_PRE", "BACKWARD_POST"],
-        },
-    )
-    fsdp_forward_prefetch: bool = field(
-        default=False, metadata={"help": "Enable FSDP forward prefetch."}
-    )
-    fsdp_cpu_ram_efficient_loading: bool = field(
-        default=True, metadata={"help": "Enable CPU RAM efficient loading for FSDP."}
-    )
-    fsdp_offload_params: bool = field(
-        default=False, metadata={"help": "Offload parameters to CPU with FSDP."}
-    )
-    fsdp_sharding_strategy: str = field(
-        default="FULL_SHARD",
-        metadata={
-            "help": "FSDP sharding strategy.",
-            "choices": ["NO_SHARD", "SHARD_GRAD_OP", "FULL_SHARD", "HYBRID_SHARD"],
-        },
-    )
-    fsdp_state_dict_type: str = field(
-        default="SHARDED_STATE_DICT",
-        metadata={
-            "help": "FSDP state dict type.",
-            "choices": ["FULL_STATE_DICT", "LOCAL_STATE_DICT", "SHARDED_STATE_DICT"],
-        },
-    )
-    fsdp_sync_module_states: bool = field(
-        default=True, metadata={"help": "Synchronize module states in FSDP."}
-    )
-    fsdp_transformer_layer_cls_to_wrap: str = field(
-        default="BertLayer",
-        metadata={"help": "Transformer layer class name to wrap with FSDP."},
-    )
-    fsdp_use_orig_params: bool = field(
-        default=True, metadata={"help": "Use original parameters in FSDP."}
-    )
-    machine_rank: int = field(
-        default=0, metadata={"help": "Rank of the machine in multi-machine setup."}
-    )
-    main_training_function: str = field(
-        default="main", metadata={"help": "Name of the main training function."}
-    )
-    mixed_precision: str = field(
-        default="bf16",
-        metadata={
-            "help": "Mixed precision mode for training.",
-            "choices": ["no", "fp16", "bf16"],
-        },
-    )
-    num_machines: int = field(
-        default=1, metadata={"help": "Number of machines for distributed training."}
-    )
-    num_processes: int = field(
-        default=2, metadata={"help": "Number of processes for distributed training."}
-    )
-    rdzv_backend: str = field(
-        default="static",
-        metadata={"help": "Rendezvous backend for distributed training."},
-    )
-    same_network: bool = field(
-        default=True, metadata={"help": "Whether all machines are on the same network."}
-    )
-    use_cpu: bool = field(
-        default=False, metadata={"help": "Force use of CPU instead of GPU."}
-    )

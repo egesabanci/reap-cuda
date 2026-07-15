@@ -372,7 +372,6 @@ class MoETransformerObserver(BaseTransformerObserver):
                 activations = routed_out.view(num_experts, *flat_input.shape)
 
             else:  # loop based MoE execution
-                # ernie returns combined_output, combine_weights, router_loss, gate_logits
                 *_, router_logits = output  # (total_tokens, num_experts)
                 _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
                 # selected_experts = selected_experts.to(device)
@@ -495,42 +494,9 @@ class MixtralMoEObserverHookConfig(MoETransformerObserverConfig):
     module_class_name_to_hook_regex: Optional[str] = "MixtralSparseMoeBlock"
 
 
-@dataclass
-class DeepSeekMoEObserverHookConfig(MoETransformerObserverConfig):
-    module_class_name_to_hook_regex: Optional[str] = "DeepseekV2MoE"
-    num_experts_attr_name: str = "experts_per_rank"  # only for ep=1!
-    top_k_attr_name: str = "num_experts_per_tok"
-    fused_experts: bool = False
-
-
-@dataclass
-class Ernie4_5MoEObserverHookConfig(MoETransformerObserverConfig):
-    module_class_name_to_hook_regex: Optional[str] = "Ernie4_5_MoeMLP"
-    num_experts_attr_name: str = "num_local_experts"
-    top_k_attr_name: str = "k"
-
-    # hf in tree implementation below:
-    # module_class_name_to_hook_regex: Optional[str] = "Ernie4_5_MoESparseMoeBlock"
-    # num_experts_attr_name: str = "num_experts"
-    # top_k_attr_name: str = "top_k"
-    fused_experts: bool = False
-
-
-@dataclass
-class Glm44MoEObserverHookConfig(MoETransformerObserverConfig):
-    module_class_name_to_hook_regex: Optional[str] = "Glm4MoeMoE"
-    num_experts_attr_name: str = "config.n_routed_experts"
-    top_k_attr_name: str = "config.num_experts_per_tok"
-    fused_experts: bool = False
-
-
 OBSERVER_CONFIG_REGISTRY = {
     "Qwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
     "NonUniformQwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
     "Llama4ForCausalLM": Llama4MoEObserverHookConfig,
     "MixtralForCausalLM": MixtralMoEObserverHookConfig,
-    "DeepseekV2ForCausalLM": DeepSeekMoEObserverHookConfig,
-    "Ernie4_5_MoEForCausalLM": Ernie4_5MoEObserverHookConfig,
-    "Ernie4_5_MoeForCausalLM": Ernie4_5MoEObserverHookConfig,
-    "Glm4MoeForCausalLM": Glm44MoEObserverHookConfig,
 }

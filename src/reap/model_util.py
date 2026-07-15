@@ -16,28 +16,6 @@ MODEL_ATTRS = {
         "num_experts": "num_experts",
         "num_experts_per_tok": "num_experts_per_tok",
     },
-    "Qwen3-Coder-30B-A3B-Instruct": {
-        "moe_block": "mlp",
-        "gate_proj": "gate_proj",
-        "up_proj": "up_proj",
-        "down_proj": "down_proj",
-        "experts": "experts",
-        "fused": False,
-        "router": "gate",
-        "num_experts": "num_experts",
-        "num_experts_per_tok": "num_experts_per_tok",
-    },
-    "NonUniformQwen3MoeForCausalLM": {
-        "moe_block": "mlp",
-        "gate_proj": "gate_proj",
-        "up_proj": "up_proj",
-        "down_proj": "down_proj",
-        "experts": "experts",
-        "fused": False,
-        "router": "gate",
-        "num_experts": "num_experts",
-        "num_experts_per_tok": "num_experts_per_tok",
-    },
     "Llama4ForCausalLM": {
         "moe_block": "feed_forward",
         "gate_proj": "gate_up_proj",
@@ -58,61 +36,6 @@ MODEL_ATTRS = {
         "fused": False,
         "router": "gate",
         "num_experts": "num_local_experts",
-        "num_experts_per_tok": "num_experts_per_tok",
-    },
-    "DeepseekV2ForCausalLM": {
-        "moe_block": "mlp",
-        "gate_proj": "gate_proj",
-        "up_proj": "up_proj",
-        "down_proj": "down_proj",
-        "experts": "experts",
-        "fused": False,
-        "router": "gate",
-        "num_experts": "n_routed_experts",
-        "num_experts_per_tok": "num_experts_per_tok",
-    },
-    "Ernie4_5_MoEForCausalLM": {
-        "moe_block": "mlp",
-        "gate_proj": "gate_proj",
-        "up_proj": "up_proj",
-        "down_proj": "down_proj",
-        "experts": "experts",
-        "fused": False,
-        "router": "gate",
-        "num_experts": "moe_num_experts",
-        "num_experts_per_tok": "num_experts_per_tok",
-    },
-    "Ernie4_5_MoeForCausalLM": {
-        "moe_block": "mlp",
-        "gate_proj": "gate_proj",
-        "up_proj": "up_proj",
-        "down_proj": "down_proj",
-        "experts": "experts",
-        "fused": False,
-        "router": "gate",
-        "num_experts": "moe_num_experts",
-        "num_experts_per_tok": "moe_k",
-    },
-    "gpt-oss-20b": {
-        "moe_block": "mlp",
-        "gate_proj": "gate_proj",
-        "up_proj": "up_proj",
-        "down_proj": "down_proj",
-        "experts": "experts",
-        "fused": False,
-        "router": "gate",
-        "num_experts": "num_experts",
-        "num_experts_per_tok": "num_experts_per_tok",
-    },
-    "Glm4MoeForCausalLM": {
-        "moe_block": "mlp",
-        "gate_proj": "gate_proj",
-        "up_proj": "up_proj",
-        "down_proj": "down_proj",
-        "experts": "experts",
-        "fused": False,
-        "router": "gate",
-        "num_experts": "n_routed_experts",
         "num_experts_per_tok": "num_experts_per_tok",
     },
 }
@@ -165,38 +88,7 @@ def assert_merge(model, merged_moe, cluster_label):
                 ).all(), f"Experts {expert_indices} are not merged correctly."
 
 
-def patched_model_map(model: str):
-    patched = False
-    model_name = model
 
-    if model == "deepseek-ai/DeepSeek-V2-Lite-Chat":
-        patched = True
-        model_name = "artifacts/models/DeepSeek-V2-Lite-Chat"
-
-    # until hf version lands
-    if model == "baidu/ERNIE-4.5-21B-A3B-PT":
-        patched = True
-        model_name = "artifacts/models/ERNIE-4.5-21B-A3B-PT"
-
-    if model == "Qwen/NonUniformQwen3-30B-A3B":
-        patched = True
-        model_name = "artifacts/models/NonUniformQwen3-30B-A3B"
-
-    if model == "zai-org/GLM-4.5-Air":
-        patched = True
-        model_name = "artifacts/models/GLM-4.5-Air"
-
-    if model == "zai-org/GLM-4.5-Air-FP8":
-        patched = True
-        model_name = "artifacts/models/GLM-4.5-Air-FP8"
-
-    if model == "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8":
-        patched = True
-        model_name = "artifacts/models/Qwen3-Coder-480B-A35B-Instruct-FP8"
-
-    if patched:
-        logger.info(f"Using patched model for {model} from: {model_name}")
-    return model_name
 
 
 def assert_tied_weights(model, clusters_labels):
@@ -262,7 +154,3 @@ def get_super_expert_indices(observer_data, include_last_layers: bool = False):
     logger.info(f"Identified {super_experts_mask.sum().item()} super experts with threshold: {final_threshold:.4f}")
     return super_expert_idx
 
-def register_llama_with_vllm():
-    from vllm.model_executor.models import ModelRegistry
-    print("Registering Llama4ForCausalLM with vLLM")
-    ModelRegistry.register_model("Llama4ForCausalLM", "vllm.model_executor.models.llama4:Llama4ForCausalLM")
