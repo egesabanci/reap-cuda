@@ -219,7 +219,7 @@ class Qwen3MoeModelAdapter:
                 moe,
                 ("num_experts",),
                 config,
-                ("num_experts",),
+                (self.num_experts_config_attr(), "num_experts"),
             ),
             "num_experts",
         )

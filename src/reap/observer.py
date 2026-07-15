@@ -28,7 +28,7 @@ class BaseTransformerObserverHookConfig:
     state_attr_name: str = "hook_state"
     hook_attr_name: str = "hooks"
     module_name_to_hook_regex: Optional[str] = None
-    module_class_name_to_hook_regex: Optional[nn.Module] = None
+    module_class_name_to_hook_regex: Optional[str] = None
 
 
 class BaseTransformerObserver(ABC):
@@ -215,6 +215,8 @@ class BaseTransformerObserver(ABC):
 
 @dataclass
 class MoETransformerObserverConfig(BaseTransformerObserverHookConfig):
+    module_name_to_hook_regex: Optional[str] = None
+    module_class_name_to_hook_regex: Optional[str] = None
     fused_experts: bool = False
     distance_measure: str = "angular"
     renormalize_router_weights: bool = False

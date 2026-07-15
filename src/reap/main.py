@@ -23,7 +23,7 @@ from reap.args import (
     MergeArgs,
 )
 from reap.data import load_category_batches, parse_composite_dataset_spec
-from reap.observer import MoETransformerObserver
+from reap.observer import MoETransformerObserver, MoETransformerObserverConfig
 from reap.model_adapters import infer_model_adapter
 from reap.eval import run_evaluate
 
@@ -95,6 +95,14 @@ def _setup_observer(model, obs_args):
             "Llama4-MoE, and Mixtral-style architectures."
         )
 
+    moe_layer_indices = adapter.identify_moe_layers(model)
+    if not moe_layer_indices:
+        raise ValueError(
+            f"No MoE layers found in {model.__class__.__name__}; "
+            "cannot configure observer."
+        )
+    first_moe_layer = adapter.layers(model)[moe_layer_indices[0]]
+
     renormalize_router_weights = (
         getattr(model.config, "norm_topk_prob", False)
         and obs_args.renormalize_router_weights
@@ -105,7 +113,7 @@ def _setup_observer(model, obs_args):
     observer_config = MoETransformerObserverConfig(
         module_class_name_to_hook_regex=adapter.hook_regex(),
         fused_experts=adapter.get_layer_config(
-            adapter.layers(model)[0], model.config
+            first_moe_layer, model.config
         ).fused_experts,
         distance_measure="cosine",
         renormalize_router_weights=renormalize_router_weights,

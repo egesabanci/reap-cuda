@@ -27,7 +27,15 @@ import logging
 import torch
 from datasets import Dataset, DatasetDict, load_dataset
 from transformers import AutoTokenizer, BatchEncoding
-from vllm import TokensPrompt
+
+try:
+    from vllm import TokensPrompt
+except ImportError:  # vllm is an optional dependency (opt-in via return_vllm_tokens_prompt)
+    def TokensPrompt(*_args, **_kwargs):  # type: ignore[no-redef]
+        raise ImportError(
+            "vllm is not installed. Install vllm or set "
+            "return_vllm_tokens_prompt=False."
+        )
 
 
 logger = logging.getLogger(__name__)

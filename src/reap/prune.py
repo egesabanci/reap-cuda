@@ -90,7 +90,9 @@ def prune(
     # patch config and dump
     logger.info("Saving pruned model...")
     retained_experts = len(retained_expert_indicies)
-    layer_cfg = adapter.get_layer_config(layers[0], model.config)
+    moe_layer_indices = adapter.identify_moe_layers(model)
+    first_moe_layer = layers[moe_layer_indices[0]]
+    layer_cfg = adapter.get_layer_config(first_moe_layer, model.config)
     adapter.update_config(model.config, retained_experts, layer_cfg.top_k)
 
     pruned_model_dir.mkdir(parents=True, exist_ok=True)
