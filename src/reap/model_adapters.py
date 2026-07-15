@@ -55,14 +55,21 @@ def _lookup_attr_path(root: Any, path: tuple[str, ...]) -> Any | None:
 
 
 def _config_value(
-    config: Mapping[str, Any] | None,
+    config: Any,
     *keys: str,
     default: Any = None,
 ) -> Any:
+    """Read the first non-None value for *keys from a config.
+
+    Supports both dict-like configs (``.get(key)``) and attribute-based configs
+    such as HuggingFace ``PretrainedConfig`` (which has no ``.get()``).
+    """
     if config is None:
         return default
+    getter = getattr(config, "get", None)
+    use_get = callable(getter)
     for key in keys:
-        value = config.get(key)
+        value = getter(key) if use_get else getattr(config, key, None)
         if value is not None:
             return value
     return default
