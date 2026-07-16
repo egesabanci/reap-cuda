@@ -579,7 +579,11 @@ def run(
         )
 
     set_seed(reap_args.seed)
-    results_dir = create_results_directory(model_args.model_name, ds_args.dataset_name)
+    results_dir = create_results_directory(
+        model_args.model_name,
+        ds_args.dataset_name,
+        base=getattr(reap_args, "artifacts_dir", None),
+    )
 
     model_name = model_args.model_name
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)

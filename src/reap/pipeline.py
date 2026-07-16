@@ -32,11 +32,30 @@ def str_to_directory_name(s: str) -> str:
     return re.sub(r"[^\w\-_.]", "_", s)
 
 
-def create_results_directory(model_name: str, dataset_name: str) -> pathlib.Path:
+def resolve_artifacts_root(base: str | pathlib.Path | None = None) -> pathlib.Path:
+    """Resolve artifacts root: explicit arg → ``REAP_ARTIFACTS_DIR`` → ``./artifacts``."""
+    import os
+
+    if base is not None and str(base).strip():
+        return pathlib.Path(base).expanduser().resolve()
+    env = os.environ.get("REAP_ARTIFACTS_DIR") or os.environ.get("REAP_OUTPUT_DIR")
+    if env and env.strip():
+        return pathlib.Path(env).expanduser().resolve()
+    return pathlib.Path("./artifacts").resolve()
+
+
+def create_results_directory(
+    model_name: str,
+    dataset_name: str,
+    *,
+    base: str | pathlib.Path | None = None,
+) -> pathlib.Path:
     """Create a clean directory name from model and dataset names.
 
     For composite dataset specs (comma-separated), uses a short hash of the
     full spec as the directory name: ``composite_<md5[:8]>``.
+
+    *base* overrides the root (also via ``REAP_ARTIFACTS_DIR`` / ``REAP_OUTPUT_DIR``).
     """
     import hashlib
 
@@ -44,7 +63,6 @@ def create_results_directory(model_name: str, dataset_name: str) -> pathlib.Path
     model_clean = str_to_directory_name(model_clean)
 
     if "," in dataset_name:
-        # Composite dataset spec — use hash-based directory name
         spec_hash = hashlib.md5(dataset_name.encode()).hexdigest()[:8]
         dataset_clean = f"composite_{spec_hash}"
         logger.info(
@@ -54,7 +72,8 @@ def create_results_directory(model_name: str, dataset_name: str) -> pathlib.Path
         dataset_clean = dataset_name.split("/")[-1]
         dataset_clean = str_to_directory_name(dataset_clean)
 
-    results_dir = pathlib.Path("./artifacts") / model_clean / dataset_clean
+    root = resolve_artifacts_root(base)
+    results_dir = root / model_clean / dataset_clean
 
     if results_dir.exists():
         logger.warning(f"Directory '{results_dir}' already exists")
@@ -135,9 +154,28 @@ def _profile_model(model, tokenizer, model_args, obs_args, observer):
     observer.reset()
 
 
+def _primary_device(model: torch.nn.Module) -> torch.device:
+    """Best-effort device for accelerate / device_map models."""
+    try:
+        dev = getattr(model, "device", None)
+        if isinstance(dev, torch.device):
+            return dev
+    except Exception:
+        pass
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device("cpu")
+
+
 def record_activations(
     model, tokenizer, reap_args, model_args, ds_args, obs_args, results_dir
 ):
+    from reap.kernels.triton_utils import log_triton_usage_summary, reset_triton_usage
+
+    reset_triton_usage()
+    dataset_path = getattr(ds_args, "dataset_path", None)
+
     if ds_args.dataset_name == "combined":
         # just return the combined data
         cat_dir = results_dir / "all"
@@ -187,6 +225,7 @@ def record_activations(
                 truncate=obs_args.truncate,
                 batches_per_category=component.num_batches,
                 batch_size=obs_args.batch_size,
+                dataset_path=None,
             )
             combined_batches.extend(component_batches["all"])
 
@@ -203,6 +242,7 @@ def record_activations(
             truncate=obs_args.truncate,
             batches_per_category=obs_args.batches_per_category,
             batch_size=obs_args.batch_size,
+            dataset_path=dataset_path,
         )
 
     logger.info(
@@ -212,6 +252,7 @@ def record_activations(
     
     # load observer and hook model
     observer = _setup_observer(model, obs_args)
+    primary_device = _primary_device(model)
 
     if reap_args.profile:
         _profile_model(model, tokenizer, model_args, obs_args, observer)
@@ -233,7 +274,7 @@ def record_activations(
                 for sample in tqdm(cat_data, desc=f"Processing {category} samples"):
                     attention_mask = sample.get("attention_mask", None)
                     sample = {
-                        k: v.to(model.device) if torch.is_tensor(v) else v
+                        k: v.to(primary_device) if torch.is_tensor(v) else v
                         for k, v in sample.items()
                     }
                     with observer.set_attention_mask(attention_mask):
@@ -256,35 +297,47 @@ def record_activations(
                 f"{cat_dir / obs_args.output_file_name}"
             )
     observer.close_hooks()
+    log_triton_usage_summary()
     with open(f"{cat_dir / obs_args.output_file_name}", "rb") as f:
         observer_data = torch.load(f, weights_only=False)
     return observer_data
 
 
-
-
-
 @torch.no_grad()
 def smoke_test(model: torch.nn.Module, tokenizer: AutoTokenizer):
-    """Run a smoke test to ensure the model is functioning correctly."""
+    """Run a short generate smoke test (transformers 5.x BatchEncoding-safe)."""
+    device = _primary_device(model)
     prompt = "What is your name?"
-    test_input = [
-        {"role": "user", "content": prompt},
-    ]
-    inputs = tokenizer.apply_chat_template(
-        test_input,
-        return_tensors="pt",
-        add_generation_prompt=True,
-        tokenize=True,
-        return_dict=True,
-        # enable_thinking=False,
-    )
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    test_input = [{"role": "user", "content": prompt}]
+    try:
+        inputs = tokenizer.apply_chat_template(
+            test_input,
+            return_tensors="pt",
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+        )
+        if hasattr(inputs, "items"):
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+        elif torch.is_tensor(inputs):
+            inputs = {"input_ids": inputs.to(device)}
+        else:
+            raise TypeError(f"Unexpected apply_chat_template return type: {type(inputs)}")
+    except Exception as exc:
+        logger.warning(
+            "apply_chat_template failed (%s); falling back to plain tokenize", exc
+        )
+        enc = tokenizer(prompt, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in enc.items()}
+
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = getattr(tokenizer, "eos_token_id", None)
     outputs = model.generate(
         **inputs,
         max_new_tokens=50,
         do_sample=True,
-        pad_token_id=tokenizer.pad_token_id,
+        pad_token_id=pad_id,
     )
     response = tokenizer.batch_decode(outputs, skip_special_tokens=False)
     logger.info("Smoke test response: %s", response[0])

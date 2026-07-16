@@ -233,6 +233,53 @@ def _load_raw_dataset(dataset_name, split, subset=None):
         )
 
 
+def _load_local_dataset(path: str, split: str = "train"):
+    """Load a local arrow file/dir or json/jsonl without the HF hub."""
+    import pathlib as _pl
+
+    p = _pl.Path(path).expanduser().resolve()
+    if not p.exists():
+        raise FileNotFoundError(f"dataset_path does not exist: {p}")
+
+    try:
+        from datasets import Dataset, load_dataset as _ld
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("datasets package required for local load") from exc
+
+    # Single arrow shard
+    if p.is_file() and p.suffix in {".arrow", ".parquet"}:
+        if p.suffix == ".arrow":
+            return Dataset.from_file(str(p))
+        return _ld("parquet", data_files=str(p), split=split)
+
+    # Directory of shards or HF dataset save_to_disk
+    if p.is_dir():
+        # save_to_disk layout
+        if (p / "dataset_info.json").exists() or (p / "state.json").exists():
+            return Dataset.load_from_disk(str(p))
+        arrows = sorted(p.glob("*.arrow"))
+        if arrows:
+            # Concatenate shards
+            parts = [Dataset.from_file(str(a)) for a in arrows]
+            if len(parts) == 1:
+                return parts[0]
+            from datasets import concatenate_datasets
+
+            return concatenate_datasets(parts)
+        jsons = sorted(list(p.glob("*.jsonl")) + list(p.glob("*.json")))
+        if jsons:
+            return _ld("json", data_files=[str(j) for j in jsons], split=split)
+        raise ValueError(f"No loadable dataset files under {p}")
+
+    if p.suffix in {".json", ".jsonl"}:
+        return _ld("json", data_files=str(p), split=split)
+
+    raise ValueError(
+        f"Unsupported local dataset path {p} "
+        "(expected .arrow/.parquet/.json/.jsonl or a directory)"
+    )
+
+
 def load_category_batches(
     dataset_name,
     split,
@@ -244,16 +291,63 @@ def load_category_batches(
     return_vllm_tokens_prompt,
     truncate,
     batches_per_category,
+    dataset_path=None,
 ):
-    raw_ds = _load_raw_dataset(dataset_name, split, subset=subset)
+    """Load + process calibration batches.
+
+    *dataset_name* selects the registered processor (field mapping).
+    *dataset_path*, when set, loads arrow/json from disk (offline) instead of
+    the HuggingFace hub. If *dataset_name* itself is an existing path and
+    *dataset_path* is unset, that path is used as the local source.
+    """
+    import os
+    import pathlib as _pl
+
+    path = dataset_path
+    if path is None and dataset_name and os.path.exists(dataset_name):
+        path = dataset_name
+
+    if path is not None:
+        logger.info("Loading local dataset from %s", path)
+        raw_ds = _load_local_dataset(path, split=split)
+        # Processor is still keyed by registry name when path is separate.
+        registry_key = dataset_name
+        if path == dataset_name or (
+            dataset_name
+            and os.path.exists(dataset_name)
+            and _pl.Path(dataset_name).resolve() == _pl.Path(path).resolve()
+        ):
+            # Prefer a default processor when only a path is given.
+            registry_key = (
+                dataset_name
+                if dataset_name in DATASET_REGISTRY
+                else "theblackcat102/evol-codealpaca-v1"
+            )
+            if dataset_name not in DATASET_REGISTRY:
+                logger.info(
+                    "No processor for path-as-name %s; using evol-codealpaca processor",
+                    dataset_name,
+                )
+    else:
+        raw_ds = _load_raw_dataset(dataset_name, split, subset=subset)
+        registry_key = dataset_name
 
     # load dataset processor
-    proc_cls = DATASET_REGISTRY.get(dataset_name)
+    proc_cls = DATASET_REGISTRY.get(registry_key)
     if proc_cls is None:
-        raise ValueError(
-            f"No DatasetProcessor registered for '{dataset_name}'. "
-            f"Supported: {list(DATASET_REGISTRY.keys())}"
-        )
+        # Fall back to evol-codealpaca (instruction/output) for unknown hub ids
+        # when a local path was provided with a processor-bearing --dataset.
+        if path is not None and "theblackcat102/evol-codealpaca-v1" in DATASET_REGISTRY:
+            logger.warning(
+                "No DatasetProcessor for %r; using evol-codealpaca mapping for local path",
+                registry_key,
+            )
+            proc_cls = DATASET_REGISTRY["theblackcat102/evol-codealpaca-v1"]
+        else:
+            raise ValueError(
+                f"No DatasetProcessor registered for '{registry_key}'. "
+                f"Supported: {list(DATASET_REGISTRY.keys())}"
+            )
 
     # init processor & process dataset
     processor = proc_cls(

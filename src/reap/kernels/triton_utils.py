@@ -1,13 +1,17 @@
-"""Safe Triton capability detection and launch helpers.
+"""Safe Triton capability detection, usage accounting, and launch helpers.
 
-Importing this module never imports ``triton`` unless it is available; kernel
-modules import triton lazily inside functions that only run on CUDA.
+Importing this module never requires ``triton`` unless the package is present;
+kernel modules import triton lazily inside functions that only run on CUDA.
+
+Hardware checks (shared memory, dtype, profitability) are device-agnostic:
+they query the active CUDA device properties rather than hardcoding SKUs.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+from collections import defaultdict
 from functools import lru_cache
 from typing import Any
 
@@ -25,6 +29,12 @@ except Exception as exc:  # pragma: no cover - environment dependent
     _HAS_TRITON_PKG = False
     _TRITON_IMPORT_ERROR = f"{type(exc).__name__}: {exc}"
 
+# Per-component launch accounting (ok / fallback). Reset per observe run.
+_USAGE: dict[str, dict[str, int]] = defaultdict(lambda: {"ok": 0, "fallback": 0})
+_FALLBACK_WARNED: set[str] = set()
+# Memoized permanent disable reasons for a component (process-local).
+_DISABLED: dict[str, str] = {}
+
 
 def triton_package_available() -> bool:
     return _HAS_TRITON_PKG
@@ -41,10 +51,14 @@ def triton_runtime_available() -> bool:
         return False
     if not torch.cuda.is_available():
         return False
-    if os.environ.get("REAP_DISABLE_TRITON", "").strip() in {"1", "true", "TRUE", "yes"}:
+    if os.environ.get("REAP_DISABLE_TRITON", "").strip() in {
+        "1",
+        "true",
+        "TRUE",
+        "yes",
+    }:
         return False
     try:
-        # Touch a device to fail early on broken driver installs.
         _ = torch.zeros(1, device="cuda")
         return True
     except Exception as exc:  # pragma: no cover
@@ -52,14 +66,69 @@ def triton_runtime_available() -> bool:
         return False
 
 
-def prefer_triton_for(tensor: torch.Tensor) -> bool:
-    """Whether *tensor* is eligible for a Triton launch."""
-    return (
-        triton_runtime_available()
-        and tensor.is_cuda
-        and tensor.numel() > 0
-        and tensor.dtype in (torch.float16, torch.bfloat16, torch.float32)
-    )
+def device_shared_memory_bytes(device: torch.device | int | None = None) -> int | None:
+    """Return per-block dynamic shared-memory limit (bytes) for *device*.
+
+    Uses the **default** (not opt-in) limit so preflight matches what Triton
+    launches get without ``cudaFuncSetAttribute``. Returns ``None`` without CUDA.
+    """
+    if not torch.cuda.is_available():
+        return None
+    try:
+        idx = 0
+        if device is not None:
+            if isinstance(device, torch.device):
+                idx = device.index if device.index is not None else 0
+            else:
+                idx = int(device)
+        props = torch.cuda.get_device_properties(idx)
+        return int(props.shared_memory_per_block)
+    except Exception as exc:  # pragma: no cover
+        logger.debug("shared_memory probe failed: %s", exc)
+        return None
+
+
+def shared_mem_feasible(
+    required_bytes: int,
+    *,
+    device: torch.device | int | None = None,
+    safety_margin: int = 2048,
+) -> tuple[bool, str]:
+    """Whether *required_bytes* fits the device's per-block shared memory."""
+    limit = device_shared_memory_bytes(device)
+    if limit is None:
+        return False, "no CUDA shared-memory limit (no device)"
+    if required_bytes + safety_margin > limit:
+        return (
+            False,
+            f"shared mem required~{required_bytes}B + margin > device limit {limit}B",
+        )
+    return True, ""
+
+
+def prefer_triton_for(
+    tensor: torch.Tensor,
+    *,
+    min_numel: int | None = None,
+) -> bool:
+    """Whether *tensor* is eligible for a Triton launch (dtype/device/size).
+
+    Does **not** check shared-memory feasibility for a specific kernel — each
+    kernel's ``_supported`` gate must call :func:`shared_mem_feasible` with its
+    estimated requirement. Optional *min_numel* avoids launch overhead on tiny
+    shapes (profitability).
+    """
+    if not triton_runtime_available():
+        return False
+    if not tensor.is_cuda:
+        return False
+    if tensor.numel() <= 0:
+        return False
+    if tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return False
+    if min_numel is not None and tensor.numel() < min_numel:
+        return False
+    return True
 
 
 def next_power_of_2(n: int) -> int:
@@ -68,8 +137,83 @@ def next_power_of_2(n: int) -> int:
     return 1 << (n - 1).bit_length()
 
 
+def is_component_disabled(component: str) -> str | None:
+    """Return disable reason if *component* was memoized as permanently failed."""
+    return _DISABLED.get(component)
+
+
+def disable_component(component: str, reason: str) -> None:
+    """Memoize a permanent failure so we stop re-attempting the same launch."""
+    if component not in _DISABLED:
+        _DISABLED[component] = reason
+        logger.warning(
+            "Triton %s disabled for this process: %s", component, reason
+        )
+
+
+def record_triton_ok(component: str) -> None:
+    _USAGE[component]["ok"] += 1
+
+
 def log_triton_fallback(component: str, reason: str) -> None:
+    """Account a fallback; WARN once per component, DEBUG thereafter."""
+    _USAGE[component]["fallback"] += 1
+    if component not in _FALLBACK_WARNED:
+        _FALLBACK_WARNED.add(component)
+        logger.warning(
+            "Triton %s fallback → PyTorch (%s); further fallbacks at DEBUG",
+            component,
+            reason,
+        )
     logger.debug("Triton %s fallback → PyTorch (%s)", component, reason)
+
+
+def reset_triton_usage() -> None:
+    """Clear ok/fallback counters (call at start of an observe run)."""
+    _USAGE.clear()
+    _FALLBACK_WARNED.clear()
+    # Keep _DISABLED: once a kernel can't launch on this device, stay off.
+
+
+def clear_triton_disable_memo() -> None:
+    """Clear permanent disable memo (tests only)."""
+    _DISABLED.clear()
+
+
+def triton_usage_snapshot() -> dict[str, dict[str, int]]:
+    return {k: dict(v) for k, v in _USAGE.items()}
+
+
+def format_triton_usage_summary() -> str:
+    if not _USAGE and not _DISABLED:
+        return "no Triton kernel attempts this run"
+    parts: list[str] = []
+    keys = sorted(set(_USAGE) | set(_DISABLED))
+    for name in keys:
+        stats = _USAGE.get(name, {"ok": 0, "fallback": 0})
+        ok = stats.get("ok", 0)
+        fb = stats.get("fallback", 0)
+        disabled = _DISABLED.get(name)
+        if disabled:
+            parts.append(f"{name}: {ok} Triton / {fb} PyTorch (disabled: {disabled})")
+        else:
+            parts.append(f"{name}: {ok} Triton / {fb} PyTorch")
+    return "; ".join(parts)
+
+
+def log_triton_usage_summary() -> None:
+    """Emit INFO summary so the f2 performance contract is verifiable."""
+    summary = format_triton_usage_summary()
+    logger.info("Triton usage summary: %s", summary)
+    # Explicit warn if a heavy kernel never succeeded but fell back.
+    for name, stats in _USAGE.items():
+        if stats.get("fallback", 0) > 0 and stats.get("ok", 0) == 0:
+            logger.warning(
+                "Triton %s never launched successfully (%d fallbacks); "
+                "backend label may overstate Triton coverage",
+                name,
+                stats["fallback"],
+            )
 
 
 def get_triton() -> Any:

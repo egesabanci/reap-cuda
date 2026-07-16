@@ -97,6 +97,28 @@ Residency = Annotated[
         rich_help_panel="Residency",
     ),
 ]
+DatasetPath = Annotated[
+    Optional[str],
+    typer.Option(
+        "--dataset-path",
+        help=(
+            "Local calibration path (arrow file/dir, json/jsonl). "
+            "Offline: skips HF hub. --dataset still selects the processor."
+        ),
+        rich_help_panel="Data",
+    ),
+]
+ArtifactsDir = Annotated[
+    Optional[str],
+    typer.Option(
+        "--artifacts-dir",
+        help=(
+            "Root for pruned/merged checkpoints and observations "
+            "(default ./artifacts or REAP_ARTIFACTS_DIR)."
+        ),
+        rich_help_panel="Run",
+    ),
+]
 
 
 def build_reap_args(
@@ -108,6 +130,7 @@ def build_reap_args(
     do_eval: bool = False,
     smoke_test: bool = True,
     residency: str = "auto",
+    artifacts_dir: str | None = None,
 ) -> ReapArgs:
     return ReapArgs(
         seed=seed,
@@ -117,6 +140,7 @@ def build_reap_args(
         do_eval=do_eval,
         smoke_test=smoke_test,
         residency=residency,
+        artifacts_dir=artifacts_dir,
     )
 
 
@@ -135,12 +159,14 @@ def build_dataset_args(
     *,
     dataset_name: str = "theblackcat102/evol-codealpaca-v1",
     dataset_config_name: str | None = None,
+    dataset_path: str | None = None,
     split: str = "train",
     shuffle: bool = True,
 ) -> DatasetArgs:
     return DatasetArgs(
         dataset_name=dataset_name,
         dataset_config_name=dataset_config_name,
+        dataset_path=dataset_path,
         split=split,
         shuffle=shuffle,
     )

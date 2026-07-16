@@ -40,6 +40,15 @@ class ReapArgs:
             "choices": ["auto", "gpu_full", "layerwise", "cpu_full"],
         },
     )
+    artifacts_dir: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Root directory for prune/merge artifacts (default ./artifacts or "
+                "REAP_ARTIFACTS_DIR / REAP_OUTPUT_DIR)."
+            ),
+        },
+    )
 
 
 @dataclass
@@ -79,6 +88,16 @@ class DatasetArgs:
     )
     dataset_config_name: str = field(
         default=None, metadata={"help": "Configuration name of the dataset."}
+    )
+    dataset_path: str | None = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional local path to calibration data (arrow file/dir, json/jsonl). "
+                "When set, loads offline without the HuggingFace hub. "
+                "--dataset still selects the field-mapping processor."
+            ),
+        },
     )
     split: str = field(default="train", metadata={"help": "Dataset split to use."})
     shuffle: bool = field(

@@ -102,6 +102,7 @@ def prepare_calibration_batches(
                 truncate=obs_args.truncate,
                 batches_per_category=component.num_batches,
                 batch_size=obs_args.batch_size,
+                dataset_path=None,
             )
             for _category, batches in category_data_batches.items():
                 all_batches.extend(batches)
@@ -118,6 +119,7 @@ def prepare_calibration_batches(
         truncate=obs_args.truncate,
         batches_per_category=obs_args.batches_per_category,
         batch_size=obs_args.batch_size,
+        dataset_path=getattr(ds_args, "dataset_path", None),
     )
     all_batches: List[torch.Tensor] = []
     for _category, samples in category_data_batches.items():
@@ -272,7 +274,11 @@ def run(
         )
 
     set_seed(reap_args.seed)
-    results_dir = create_results_directory(model_args.model_name, ds_args.dataset_name)
+    results_dir = create_results_directory(
+        model_args.model_name,
+        ds_args.dataset_name,
+        base=getattr(reap_args, "artifacts_dir", None),
+    )
 
     model_name = model_args.model_name
 

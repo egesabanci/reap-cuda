@@ -138,6 +138,66 @@ def f5_router(
     )
 
 
+def _resolve_router(moe, adapter):
+    return (
+        getattr(moe, adapter.router_attr(), None)
+        or getattr(moe, "router", None)
+        or getattr(moe, "gate", None)
+    )
+
+
+def prefers_native_router(moe, adapter) -> bool:
+    """True when softmax+topk would mis-route this MoE (model-agnostic).
+
+    Structural signals (no architecture name required):
+    * adapter exposes ``prefer_native_router`` / ``prefer_native_router()``
+    * MoE has an ``expert_bias`` buffer (LFM2-style)
+    * router has ``use_expert_bias=True``
+    * router.forward accepts an ``expert_bias`` kwarg
+    """
+    flag = getattr(adapter, "prefer_native_router", None)
+    if callable(flag):
+        try:
+            if flag():
+                return True
+        except TypeError:
+            pass
+    elif flag:
+        return True
+    if getattr(adapter, "adapter_name", "") == "lfm2_moe":
+        return True
+    if getattr(moe, "expert_bias", None) is not None:
+        return True
+    router = _resolve_router(moe, adapter)
+    if router is None:
+        return False
+    if bool(getattr(router, "use_expert_bias", False)):
+        return True
+    import inspect
+
+    try:
+        sig = inspect.signature(router.forward)
+    except (TypeError, ValueError):
+        return False
+    return "expert_bias" in sig.parameters
+
+
+def _router_weight_activation(moe, adapter) -> str:
+    """Heuristic for full (T, E) weight matrix used by merge metrics."""
+    explicit = getattr(adapter, "router_activation", None)
+    if callable(explicit):
+        try:
+            return str(explicit())
+        except TypeError:
+            pass
+    elif isinstance(explicit, str):
+        return explicit
+    if prefers_native_router(moe, adapter):
+        # sigmoid+bias families (LFM2); merge path uses sigmoid on logits.
+        return "sigmoid"
+    return "softmax"
+
+
 def f5_router_from_module(
     moe,
     adapter,
@@ -148,14 +208,10 @@ def f5_router_from_module(
 ) -> tuple[torch.Tensor, RouterPairOutputs]:
     """Build router pairs by calling the model's own router module.
 
-    Used for routers whose routing semantics differ from softmax+topk —
-    notably LFM2, which uses ``sigmoid(logits) + expert_bias`` then top-k on
-    those scores, gathers the sigmoid weights, optionally renormalizes, and
-    scales by ``routed_scaling_factor``. The model router returns
-    ``(logits, routing_weights, selected_experts)``; we reuse its exact
-    routing and only build the CSR pair structure that FREA/F2 expect. The
-    heavy compute (FREA SwiGLU, F2 scatter-reduce) still runs through the
-    Triton kernels on the resulting pairs.
+    Used when routing semantics differ from softmax+topk (e.g. sigmoid +
+    expert_bias → top-k on scores → gather → renorm → scale). The model router
+    returns ``(logits, routing_weights, selected_experts)``; we reuse its exact
+    routing and only build the CSR pair structure that FREA/F2 expect.
 
     Returns ``(router_logits_full, RouterPairOutputs)`` where
     ``router_logits_full`` is the raw ``(T, E)`` logits.
@@ -163,15 +219,10 @@ def f5_router_from_module(
     import inspect
 
     device = flat_input.device
-    router = (
-        getattr(moe, adapter.router_attr(), None)
-        or getattr(moe, "router", None)
-        or getattr(moe, "gate", None)
-    )
+    router = _resolve_router(moe, adapter)
     if router is None:
         raise ValueError("Cannot find router on MoE module")
 
-    # Pass expert_bias when the router accepts it (LFM2 with use_expert_bias).
     kw: dict = {}
     try:
         sig = inspect.signature(router.forward)
@@ -194,9 +245,9 @@ def f5_router_from_module(
     selected_experts = selected_experts.to(device)
     routing_weights = routing_weights.to(device)
 
-    # Full (T, E) routing weights for merge-criteria metrics. LFM2 uses sigmoid;
-    # other families fall back to softmax. Prune-only path does not read this.
-    if getattr(adapter, "adapter_name", "") == "lfm2_moe":
+    # Full (T, E) weights for merge-criteria metrics (prune-only ignores these).
+    act = _router_weight_activation(moe, adapter)
+    if act == "sigmoid":
         router_weights_full = torch.sigmoid(router_logits_full.float()).to(device)
     else:
         router_weights_full = F.softmax(

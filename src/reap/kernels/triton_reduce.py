@@ -1,7 +1,8 @@
 """F2 Triton scatter-reduce over routed pair outputs (optional).
 
 Computes per-pair L2 norms and scatters into per-expert sum / weighted-sum /
-weight-sum / max buffers. Welford online means stay in PyTorch
+weight-sum / max buffers. Accumulates **fp64** to match the PyTorch path and
+the documented state schema. Welford online means stay in PyTorch
 (``OnlineStatsTracker``) for exact parity with the existing path.
 """
 
@@ -13,8 +14,11 @@ from reap.kernels.triton_utils import (
     log_triton_fallback,
     next_power_of_2,
     prefer_triton_for,
+    record_triton_ok,
     triton_runtime_available,
 )
+
+_COMPONENT = "f2_reduce"
 
 
 def scatter_pair_stats(
@@ -27,7 +31,7 @@ def scatter_pair_stats(
 
     Returns dict with keys:
       ``ean_sum``, ``weighted_ean_sum``, ``weighted_freq``, ``batch_max``
-    all on ``pair_out.device``.
+    all on ``pair_out.device``. Sums are ``float64``; ``batch_max`` is ``float32``.
     """
     device = pair_out.device
     if pair_out.numel() == 0:
@@ -42,13 +46,17 @@ def scatter_pair_stats(
 
     if (
         triton_runtime_available()
-        and prefer_triton_for(pair_out)
+        and prefer_triton_for(pair_out, min_numel=16)
         and pair_out.shape[-1] >= 16
     ):
         try:
-            return _scatter_triton(pair_out, pair_expert_idx, pair_router_w, num_experts)
+            out = _scatter_triton(
+                pair_out, pair_expert_idx, pair_router_w, num_experts
+            )
+            record_triton_ok(_COMPONENT)
+            return out
         except Exception as exc:  # pragma: no cover
-            log_triton_fallback("f2_reduce", str(exc))
+            log_triton_fallback(_COMPONENT, str(exc))
 
     return _scatter_pytorch(pair_out, pair_expert_idx, pair_router_w, num_experts)
 
@@ -101,10 +109,10 @@ def _scatter_triton(
     idx = pair_expert_idx.to(device=y.device, dtype=torch.int64).contiguous()
     w = pair_router_w.to(device=y.device, dtype=torch.float32).contiguous()
 
-    # Prefer fp32 atomics (widely supported); cast sums to fp64 for state parity.
-    ean_sum_f = torch.zeros(num_experts, device=y.device, dtype=torch.float32)
-    weighted_ean_f = torch.zeros(num_experts, device=y.device, dtype=torch.float32)
-    weighted_freq_f = torch.zeros(num_experts, device=y.device, dtype=torch.float32)
+    # fp64 accumulators match PyTorch path and docs (ean_sum (E,) fp64).
+    ean_sum_f = torch.zeros(num_experts, device=y.device, dtype=torch.float64)
+    weighted_ean_f = torch.zeros(num_experts, device=y.device, dtype=torch.float64)
+    weighted_freq_f = torch.zeros(num_experts, device=y.device, dtype=torch.float64)
     batch_max = torch.full(
         (num_experts,), float("-inf"), device=y.device, dtype=torch.float32
     )
@@ -144,9 +152,12 @@ def _scatter_triton(
         norm = tl.sqrt(acc)
         e_id = tl.load(IDX_ptr + pid)
         ww = tl.load(W_ptr + pid)
-        tl.atomic_add(EAN_ptr + e_id, norm)
-        tl.atomic_add(WEAN_ptr + e_id, norm * ww)
-        tl.atomic_add(WFREQ_ptr + e_id, ww)
+        # Cast to fp64 for atomic_add into fp64 buffers (cc ≥ 6.0).
+        norm64 = norm.to(tl.float64)
+        ww64 = ww.to(tl.float64)
+        tl.atomic_add(EAN_ptr + e_id, norm64)
+        tl.atomic_add(WEAN_ptr + e_id, norm64 * ww64)
+        tl.atomic_add(WFREQ_ptr + e_id, ww64)
         tl.atomic_max(MAX_ptr + e_id, row_max)
 
     grid = (n,)
@@ -169,8 +180,8 @@ def _scatter_triton(
         torch.isfinite(batch_max), batch_max, torch.zeros_like(batch_max)
     )
     return {
-        "ean_sum": ean_sum_f.to(torch.float64),
-        "weighted_ean_sum": weighted_ean_f.to(torch.float64),
-        "weighted_freq": weighted_freq_f.to(torch.float64),
+        "ean_sum": ean_sum_f,
+        "weighted_ean_sum": weighted_ean_f,
+        "weighted_freq": weighted_freq_f,
         "batch_max": batch_max,
     }

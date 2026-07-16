@@ -45,6 +45,8 @@ def prune_full(
     model_max_length: opt.ModelMaxLength = 2048,
     seed: opt.Seed = 42,
     residency: opt.Residency = "auto",
+    dataset_path: opt.DatasetPath = None,
+    artifacts_dir: opt.ArtifactsDir = None,
     observe_only: Annotated[
         bool,
         typer.Option(
@@ -145,10 +147,12 @@ def prune_full(
             do_eval=do_eval,
             smoke_test=smoke_test,
             residency=residency,
+            artifacts_dir=artifacts_dir,
         ),
         opt.build_dataset_args(
             dataset_name=dataset,
             dataset_config_name=dataset_config,
+            dataset_path=dataset_path,
             split=split,
         ),
         opt.build_observer_args(
@@ -224,6 +228,8 @@ def prune_layerwise(
     ] = True,
     seed: opt.Seed = 42,
     residency: opt.Residency = "auto",
+    dataset_path: opt.DatasetPath = None,
+    artifacts_dir: opt.ArtifactsDir = None,
     observe_only: Annotated[
         bool,
         typer.Option(
@@ -299,10 +305,12 @@ def prune_layerwise(
             smoke_test=False,
             profile=False,
             residency=residency,
+            artifacts_dir=artifacts_dir,
         ),
         opt.build_dataset_args(
             dataset_name=dataset,
             dataset_config_name=dataset_config,
+            dataset_path=dataset_path,
             split=split,
         ),
         opt.build_observer_args(

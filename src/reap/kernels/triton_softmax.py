@@ -12,8 +12,11 @@ from reap.kernels.triton_utils import (
     log_triton_fallback,
     next_power_of_2,
     prefer_triton_for,
+    record_triton_ok,
     triton_runtime_available,
 )
+
+_COMPONENT = "softmax"
 
 
 def softmax_rows(logits: torch.Tensor) -> torch.Tensor:
@@ -26,11 +29,13 @@ def softmax_rows(logits: torch.Tensor) -> torch.Tensor:
     if logits.numel() == 0:
         return logits.to(dtype=torch.float32)
 
-    if prefer_triton_for(logits) and triton_runtime_available():
+    if prefer_triton_for(logits, min_numel=16) and triton_runtime_available():
         try:
-            return _softmax_triton(logits)
+            out = _softmax_triton(logits)
+            record_triton_ok(_COMPONENT)
+            return out
         except Exception as exc:  # pragma: no cover - device specific
-            log_triton_fallback("softmax", str(exc))
+            log_triton_fallback(_COMPONENT, str(exc))
     return F.softmax(logits, dim=-1, dtype=torch.float32)
 
 
@@ -48,7 +53,7 @@ def _softmax_triton(logits: torch.Tensor) -> torch.Tensor:
     if block_e < e:
         # Fall back when E does not fit one block (rare for current MoEs ≤256).
         # Multi-tile online softmax is possible but not required for targets.
-        log_triton_fallback("softmax", f"E={e} > BLOCK_E={block_e}")
+        log_triton_fallback(_COMPONENT, f"E={e} > BLOCK_E={block_e}")
         return F.softmax(logits, dim=-1, dtype=torch.float32)
 
     @triton.jit

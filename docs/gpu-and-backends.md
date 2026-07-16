@@ -19,6 +19,21 @@ documented separately: **[residency.md](residency.md)** (`--residency`).
 | Clustering (scipy/sklearn) | CPU |
 | Expert matmuls in observe backends | Same as activations (GPU) |
 
+### Triton hardware gates (model / SKU agnostic)
+
+- `prefer_triton_for` checks CUDA + dtype + optional min numel.
+- **FREA** queries `shared_memory_per_block` and auto-scales `BLOCK_H` /
+  `BLOCK_I` (128→64→32→16) so L4/T4 and large datacenter GPUs both work.
+- Shared-mem infeasible configs fail the support gate **before** launch; failures
+  are memoized so observe does not re-attempt thousands of times.
+- End of observe logs an INFO **Triton usage summary**
+  (`FREA N Triton / M PyTorch; F2 …`).
+- F2 scatter accumulates **fp64** (matches docs and the PyTorch path).
+
+Native routers (sigmoid + `expert_bias`, etc.) use
+`f5_router_from_module` when `prefers_native_router` detects structural signals —
+not a hard-coded model list.
+
 ## Backend selection
 
 ```python

@@ -73,6 +73,8 @@ def merge_full(
     model_max_length: opt.ModelMaxLength = 2048,
     seed: opt.Seed = 42,
     residency: opt.Residency = "auto",
+    dataset_path: opt.DatasetPath = None,
+    artifacts_dir: opt.ArtifactsDir = None,
     skip_first: Annotated[
         bool,
         typer.Option("--skip-first/--no-skip-first", rich_help_panel="Merge"),
@@ -136,11 +138,13 @@ def merge_full(
             do_eval=do_eval,
             smoke_test=False,
             residency=residency,
+            artifacts_dir=artifacts_dir,
         ),
         opt.build_model_args(model_name=model),
         opt.build_dataset_args(
             dataset_name=dataset,
             dataset_config_name=dataset_config,
+            dataset_path=dataset_path,
             split=split,
         ),
         opt.build_observer_args(
@@ -216,6 +220,8 @@ def merge_layerwise(
     ] = True,
     seed: opt.Seed = 42,
     residency: opt.Residency = "auto",
+    dataset_path: opt.DatasetPath = None,
+    artifacts_dir: opt.ArtifactsDir = None,
     skip_first: Annotated[
         bool,
         typer.Option("--skip-first/--no-skip-first", rich_help_panel="Merge"),
@@ -271,10 +277,12 @@ def merge_layerwise(
             smoke_test=False,
             profile=False,
             residency=residency,
+            artifacts_dir=artifacts_dir,
         ),
         opt.build_dataset_args(
             dataset_name=dataset,
             dataset_config_name=dataset_config,
+            dataset_path=dataset_path,
             split=split,
         ),
         opt.build_observer_args(

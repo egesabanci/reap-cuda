@@ -4,8 +4,9 @@ Layout-agnostic: expects Linear-convention weights from F4
 (``W_gate/up: (E, I, H)``, ``W_down: (E, H, I)``).
 
 Only supports SiLU gate activation (all current MoE targets). Other ``act_fn``
-values fall back to the PyTorch grouped path. Small shapes (unit tests) also
-fall back so Triton ``tl.dot`` size constraints never break CPU CI.
+values fall back to the PyTorch grouped path. Block sizes auto-scale to the
+active GPU's per-block shared memory so L4/T4 and large-datacenter GPUs both
+work without hardcoding SKUs.
 """
 
 from __future__ import annotations
@@ -18,18 +19,73 @@ import torch.nn.functional as F
 from reap.kernels.bmm import routed_expert_activations_grouped
 from reap.kernels.router import RouterPairOutputs
 from reap.kernels.triton_utils import (
+    device_shared_memory_bytes,
+    disable_component,
+    is_component_disabled,
     log_triton_fallback,
     next_power_of_2,
     prefer_triton_for,
+    record_triton_ok,
     triton_runtime_available,
 )
 
 # tl.dot on recent Triton wants M/N/K multiples of 16 for tensor cores.
 _MIN_DOT = 16
+_COMPONENT = "frea"
 
 
 def _is_silu(act_fn: Callable) -> bool:
     return act_fn is F.silu or getattr(act_fn, "__name__", "") in {"silu", "swish"}
+
+
+def estimate_frea_shared_bytes(block_n: int, block_h: int, block_i: int) -> int:
+    """Estimate dynamic shared memory for the SwiGLU tile kernel.
+
+    Matches observed Triton requirements: two live weight tiles (gate/up) as
+    ``BLOCK_I × BLOCK_H`` fp32 plus the ``x`` tile ``BLOCK_N × BLOCK_H`` fp32
+    (e.g. 128/128/16 → 139 264 B on Ada default 99 KiB → too large; 64/64/16 fits).
+    """
+    return int(2 * block_h * block_i * 4 + block_n * block_h * 4 + 4096)
+
+
+def choose_frea_block_sizes(
+    h: int,
+    i_dim: int,
+    *,
+    device: torch.device | None = None,
+    block_n: int = 16,
+) -> tuple[int, int, int] | None:
+    """Pick largest power-of-two tiles that fit device shared memory.
+
+    Returns ``(block_h, block_i, block_n)`` or ``None`` if no feasible config.
+    """
+    smem = device_shared_memory_bytes(device)
+    if smem is None:
+        return None
+
+    # Prefer larger tiles when the device allows (throughput).
+    candidates_h = [
+        b
+        for b in (128, 64, 32, 16)
+        if b >= _MIN_DOT and b <= max(_MIN_DOT, next_power_of_2(h))
+    ]
+    candidates_i = [
+        b
+        for b in (128, 64, 32, 16)
+        if b >= _MIN_DOT and b <= max(_MIN_DOT, next_power_of_2(i_dim))
+    ]
+    if not candidates_h:
+        candidates_h = [_MIN_DOT]
+    if not candidates_i:
+        candidates_i = [_MIN_DOT]
+
+    safety = 2048
+    for bh in candidates_h:
+        for bi in candidates_i:
+            need = estimate_frea_shared_bytes(block_n, bh, bi)
+            if need + safety <= smem:
+                return bh, bi, block_n
+    return None
 
 
 def _triton_frea_supported(
@@ -38,18 +94,27 @@ def _triton_frea_supported(
     *,
     act_fn: Callable,
 ) -> tuple[bool, str]:
+    disabled = is_component_disabled(_COMPONENT)
+    if disabled:
+        return False, f"disabled: {disabled}"
     if not _is_silu(act_fn):
         return False, "non-SiLU activation"
     if not triton_runtime_available():
         return False, "triton runtime unavailable"
-    if not prefer_triton_for(flat_input):
-        return False, "input not CUDA float16/bfloat16/float32"
+    if not prefer_triton_for(flat_input, min_numel=16):
+        return False, "input not CUDA float16/bfloat16/float32 or too small"
     if not (W_gate.is_cuda and prefer_triton_for(W_gate)):
         return False, "weights not on CUDA"
     _e, i_dim, h = W_gate.shape
-    # Tiny unit-test models (H=8/16) stay on PyTorch; production MoEs are larger.
     if h < _MIN_DOT or i_dim < _MIN_DOT:
         return False, f"dims H={h}, I={i_dim} below Triton tl.dot floor {_MIN_DOT}"
+    blocks = choose_frea_block_sizes(h, i_dim, device=flat_input.device)
+    if blocks is None:
+        limit = device_shared_memory_bytes(flat_input.device)
+        return (
+            False,
+            f"no FREA tile config fits shared mem (device limit={limit}B, H={h}, I={i_dim})",
+        )
     return True, ""
 
 
@@ -65,14 +130,24 @@ def frea_triton_activations(
     """Compute ``(n_pairs, H)`` routed expert outputs via Triton when possible."""
     ok, reason = _triton_frea_supported(flat_input, W_gate, act_fn=act_fn)
     if not ok:
-        log_triton_fallback("frea", reason)
+        log_triton_fallback(_COMPONENT, reason)
+        # Permanent disable when shared-mem infeasible (avoids N failed launches).
+        if "shared mem" in reason or reason.startswith("disabled:"):
+            if not is_component_disabled(_COMPONENT) and "shared mem" in reason:
+                disable_component(_COMPONENT, reason)
         return routed_expert_activations_grouped(
             flat_input, router_pairs, W_gate, W_up, W_down, act_fn=act_fn
         )
     try:
-        return _frea_triton_impl(flat_input, router_pairs, W_gate, W_up, W_down)
+        out = _frea_triton_impl(flat_input, router_pairs, W_gate, W_up, W_down)
+        record_triton_ok(_COMPONENT)
+        return out
     except Exception as exc:  # pragma: no cover - device/compile specific
-        log_triton_fallback("frea", str(exc))
+        msg = str(exc)
+        log_triton_fallback(_COMPONENT, msg)
+        # Memoize hard resource failures (shared mem / out of resource).
+        if "shared memory" in msg.lower() or "out of resource" in msg.lower():
+            disable_component(_COMPONENT, msg)
         return routed_expert_activations_grouped(
             flat_input, router_pairs, W_gate, W_up, W_down, act_fn=act_fn
         )
@@ -107,9 +182,10 @@ def _frea_triton_impl(
     Wu = W_up.contiguous()
     Wd = W_down.contiguous()
 
-    block_h = max(_MIN_DOT, min(next_power_of_2(h), 128))
-    block_i = max(_MIN_DOT, min(next_power_of_2(i_dim), 128))
-    block_n = 16
+    blocks = choose_frea_block_sizes(h, i_dim, device=flat_input.device)
+    if blocks is None:
+        raise RuntimeError("FREA block selection failed after support check")
+    block_h, block_i, block_n = blocks
 
     @triton.jit
     def _expert_swiglu_kernel(
@@ -139,7 +215,6 @@ def _frea_triton_impl(
         offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         mask_n = offs_n < N
 
-        # Zero Y for this token block (fp32 accum).
         for h0 in range(0, H, BLOCK_H):
             offs_h = h0 + tl.arange(0, BLOCK_H)
             mask_h = offs_h < H
@@ -177,11 +252,9 @@ def _frea_triton_impl(
                     mask=mask_ih,
                     other=0.0,
                 ).to(tl.float32)
-                # (N,H) @ (I,H)^T -> (N,I)
                 g_acc += tl.dot(x, tl.trans(wg))
                 u_acc += tl.dot(x, tl.trans(wu))
 
-            # silu(g) * u
             act = g_acc * (1.0 / (1.0 + tl.exp(-g_acc))) * u_acc
 
             for h0 in range(0, H, BLOCK_H):
@@ -195,7 +268,6 @@ def _frea_triton_impl(
                     mask=mask_hi,
                     other=0.0,
                 ).to(tl.float32)
-                # (N,I) @ (H,I)^T -> (N,H)
                 y_delta = tl.dot(act, tl.trans(wd))
                 y_ptrs = (
                     Y_ptr + offs_n[:, None] * stride_yn + offs_h[None, :] * stride_yh
@@ -203,6 +275,8 @@ def _frea_triton_impl(
                 y_prev = tl.load(y_ptrs, mask=mask_nh, other=0.0)
                 tl.store(y_ptrs, y_prev + y_delta, mask=mask_nh)
 
+    # num_stages=2 keeps pipeline staging modest vs default 3–4 on shared mem.
+    num_warps = 4 if h <= 1024 else 8
     for expert_id in range(e):
         start = int(expert_offsets[expert_id].item())
         end = int(expert_offsets[expert_id + 1].item())
@@ -235,7 +309,8 @@ def _frea_triton_impl(
             BLOCK_N=block_n,
             BLOCK_H=block_h,
             BLOCK_I=block_i,
-            num_warps=4 if h <= 1024 else 8,
+            num_warps=num_warps,
+            num_stages=2,
         )
         out[start:end].copy_(y_fp32.to(dtype=out.dtype))
 

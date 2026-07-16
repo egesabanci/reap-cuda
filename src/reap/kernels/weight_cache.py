@@ -20,6 +20,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 _STACK_CACHE: dict[int, dict[str, Any]] = {}
+# Full-observer path hooks every MoE each batch. Keep at most one entry so
+# stacked weights do not accumulate across layers (tight-VRAM OOM guard).
+_MAX_CACHE_ENTRIES = 1
 
 
 def free_cache(moe: nn.Module | None = None) -> None:
@@ -28,6 +31,11 @@ def free_cache(moe: nn.Module | None = None) -> None:
         _STACK_CACHE.clear()
     else:
         _STACK_CACHE.pop(id(moe), None)
+
+
+def cache_size() -> int:
+    """Number of MoE modules currently holding stacked weights (tests)."""
+    return len(_STACK_CACHE)
 
 
 def get_stacked_expert_weights(
@@ -39,13 +47,18 @@ def get_stacked_expert_weights(
 ) -> dict[str, torch.Tensor]:
     """Return contiguous stacked expert weights in Linear convention.
 
-    Cached on ``id(moe)`` for the layer's calibration lifetime.
+    Cached on ``id(moe)``. At most :data:`_MAX_CACHE_ENTRIES` MoEs are retained
+    so the full-observer path cannot pin every layer's stacks simultaneously.
     """
     key = id(moe)
     if key in _STACK_CACHE:
         cached = _STACK_CACHE[key]
         if device is None or cached["W_gate"].device == device:
             return cached
+
+    # Evict other layers before building a new stack (OOM guard for full observe).
+    if key not in _STACK_CACHE and len(_STACK_CACHE) >= _MAX_CACHE_ENTRIES:
+        _STACK_CACHE.clear()
 
     attrs = adapter.expert_weight_attrs(moe)
     convention = attrs.get("weight_convention") or getattr(

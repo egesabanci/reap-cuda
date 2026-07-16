@@ -11,7 +11,12 @@ import torch.nn.functional as F
 from reap.kernels.bmm import materialize_sparse_activations
 from reap.kernels.f2 import f2_accumulate
 from reap.kernels.frea import frea_activations
-from reap.kernels.router import extract_router_logits, f5_router
+from reap.kernels.router import (
+    extract_router_logits,
+    f5_router,
+    f5_router_from_module,
+    prefers_native_router,
+)
 from reap.kernels.weight_cache import free_cache, get_stacked_expert_weights
 from reap.pruning_metrics import update_pruning_state
 
@@ -25,17 +30,31 @@ def _loop_activations(
     act_fn: Callable,
     fused: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Legacy full-expert activation path (parity oracle)."""
-    device = flat_input.device
-    router = getattr(moe, adapter.router_attr(), None) or getattr(moe, "router", None)
-    if router is None and hasattr(moe, "gate"):
-        router = moe.gate
-    if router is None:
-        raise ValueError("Cannot find router on MoE module")
+    """Legacy full-expert activation path (parity oracle).
 
-    router_logits = extract_router_logits(router, flat_input)
-    _, selected_experts = torch.topk(router_logits, min(top_k, router_logits.shape[-1]), dim=-1)
-    selected_experts = selected_experts.to(device)
+    Routing uses the model router when softmax+topk would be wrong
+    (``prefers_native_router``); otherwise top-k on raw logits as historically.
+    """
+    device = flat_input.device
+
+    if prefers_native_router(moe, adapter):
+        router_logits, pairs = f5_router_from_module(
+            moe, adapter, flat_input, top_k=top_k, valid_token_mask=None
+        )
+        selected_experts = pairs.selected_experts
+    else:
+        router = (
+            getattr(moe, adapter.router_attr(), None)
+            or getattr(moe, "router", None)
+            or getattr(moe, "gate", None)
+        )
+        if router is None:
+            raise ValueError("Cannot find router on MoE module")
+        router_logits = extract_router_logits(router, flat_input)
+        _, selected_experts = torch.topk(
+            router_logits, min(top_k, router_logits.shape[-1]), dim=-1
+        )
+        selected_experts = selected_experts.to(device)
 
     activations = torch.zeros(
         (num_experts, *flat_input.shape), device=device, dtype=flat_input.dtype
@@ -56,6 +75,7 @@ def _loop_activations(
         for idx, expert in enumerate(moe.experts):
             activations[idx] = expert(flat_input).to(device)
 
+    free_cache(moe)
     return activations, selected_experts, router_logits
 
 
@@ -100,13 +120,9 @@ def observe_moe_batch(
     from reap.kernels.triton_utils import triton_runtime_available
 
     if backend == "loop":
-        # Loop over full flat_input then let update_pruning_state apply mask
-        # (matches historical behavior for parity).
         activations, selected_experts, router_logits = _loop_activations(
             moe, adapter, flat_input, num_experts, top_k, act_fn, fused
         )
-        from reap.pruning_metrics import PreparedPruningBatch  # noqa: F401
-
         pruning_batch = update_pruning_state(
             layer_state,
             activations=activations,
@@ -126,17 +142,16 @@ def observe_moe_batch(
         }
 
     # --- Routed backends: bmm / frea / f2 ---------------------------------
-    router = getattr(moe, adapter.router_attr(), None) or getattr(moe, "router", None)
-    if router is None and hasattr(moe, "gate"):
-        router = moe.gate
+    router = (
+        getattr(moe, adapter.router_attr(), None)
+        or getattr(moe, "router", None)
+        or getattr(moe, "gate", None)
+    )
     if router is None:
         raise ValueError("Cannot find router on MoE module")
 
-    # LFM2 uses sigmoid + per-expert bias + topk-on-scores (not softmax+topk).
-    # Use the model's own router to get correct pairs; FREA/F2 still run on them.
-    if getattr(adapter, "adapter_name", "") == "lfm2_moe":
-        from reap.kernels.router import f5_router_from_module
-
+    # Model-agnostic: use native router when softmax+topk would be wrong.
+    if prefers_native_router(moe, adapter):
         router_logits_full, router_pairs = f5_router_from_module(
             moe,
             adapter,
@@ -152,7 +167,6 @@ def observe_moe_batch(
             sequence_length=sequence_length,
             hidden_dim=flat_input.shape[-1],
         )
-        # F5 on full logits then filter pairs — keep pair_token_idx into flat_input.
         router_pairs = f5_router(
             router_logits_full,
             top_k,
@@ -161,7 +175,6 @@ def observe_moe_batch(
         )
 
     stacked = get_stacked_expert_weights(moe, adapter, device=device)
-    # frea/f2 try Triton when runtime is ready; bmm stays pure PyTorch.
     use_triton = backend in ("frea", "f2") and triton_runtime_available()
     pair_out = frea_activations(
         flat_input,
@@ -173,7 +186,6 @@ def observe_moe_batch(
         use_triton=use_triton,
     )
 
-    # Filtered token-axis tensors for state updates / merge metrics.
     if mask is not None:
         router_logits = router_logits_full[mask]
     else:
@@ -186,13 +198,11 @@ def observe_moe_batch(
         router_logits=router_logits,
         num_experts=num_experts,
         valid_token_mask=None,
-        renormalize_router_weights=False,  # already applied in F5
+        renormalize_router_weights=False,
         compute_routed_ca=compute_routed_ca,
     )
 
-    # Drop the F4 stacked-weight cache for this MoE so the full-observer path
-    # does not accumulate one entry per layer across batches (the layerwise
-    # path frees per block; the full path hooks every layer each batch).
+    # Drop F4 stack for this MoE (full path also limited to 1 entry in cache).
     free_cache(moe)
 
     result: dict[str, Any] = {
@@ -201,16 +211,13 @@ def observe_moe_batch(
         "num_tokens": torch.tensor(
             router_pairs.selected_experts.shape[0], device=device, dtype=torch.long
         ),
-        "expert_frequency": layer_state["expert_frequency"],  # cumulative; merge path
+        "expert_frequency": layer_state["expert_frequency"],
         "pairwise_expert_frequency": layer_state["pairwise_expert_frequency"],
     }
 
     if need_dense:
         t_valid = router_pairs.selected_experts.shape[0]
-        # Rebuild pair indices into filtered token axis for materialization.
-        # F5 pair_token_idx indexes original flat_input; map to filtered positions.
         if mask is not None:
-            # Map original token ids -> contiguous valid positions.
             valid_pos = torch.full(
                 (flat_input.shape[0],), -1, device=device, dtype=torch.long
             )
@@ -239,7 +246,6 @@ def observe_moe_batch(
                 dtype=flat_input.dtype,
             )
         result["activations"] = activations
-        # Per-batch frequencies for merge metrics (not cumulative).
         if router_pairs.selected_experts.numel():
             result["expert_frequency"] = torch.bincount(
                 router_pairs.selected_experts.reshape(-1), minlength=num_experts
