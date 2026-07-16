@@ -255,6 +255,17 @@ class OnlineStatsTracker:
             shape, dtype=dtype, device=self.device, requires_grad=False
         )
 
+    def to(self, device: torch.device | str) -> "OnlineStatsTracker":
+        """Move tracker state onto *device* (in-place)."""
+        device = torch.device(device)
+        if device == self.device:
+            return self
+        self.device = device
+        self.count = self.count.to(device)
+        self.mean = self.mean.to(device)
+        self.mean_compensation = self.mean_compensation.to(device)
+        return self
+
     def update(self, new_mean: torch.Tensor, new_count: int | torch.Tensor):
         """
         Update the statistics with a new batch of data.
@@ -264,6 +275,9 @@ class OnlineStatsTracker:
             new_count (int | torch.Tensor): The count of new data points in the batch to
                 normalize the mean entires with.
         """
+        # Prefer the incoming tensor device so GPU-resident updates never hop to CPU.
+        if isinstance(new_mean, torch.Tensor) and new_mean.device != self.device:
+            self.to(new_mean.device)
         new_count = new_count.to(self.device, torch.long)
         new_mean = new_mean.to(self.device, dtype=self.dtype)
 

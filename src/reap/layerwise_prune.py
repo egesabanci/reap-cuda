@@ -182,6 +182,7 @@ def record_activations_layerwise(
         fused_experts=layer_cfg.fused_experts,
         renormalize_router_weights=obs_args.renormalize_router_weights,
         record_pruning_metrics_only=obs_args.record_pruning_metrics_only,
+        observe_backend=getattr(obs_args, "observe_backend", "auto"),
     )
 
     # Create layerwise observer

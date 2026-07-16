@@ -50,15 +50,17 @@ single-L40S target):
 
 | Doc | Phase | Concern | Status |
 |---|---|---|---|
-| [`00-cost-model.md`](00-cost-model.md) | — | The current bottleneck: quantified | reference |
-| [`01-f3-dead-metric-audit.md`](01-f3-dead-metric-audit.md) | 0 | Prerequisite contract: prune consumes routed-only metrics | planned |
-| [`02-bmm-baseline.md`](02-bmm-baseline.md) | 1 | Pure-PyTorch bmm baseline (parity oracle, MPS-runnable) | planned |
-| [`03-f5-router-fusion.md`](03-f5-router-fusion.md) | 2 | Fused router softmax + topk + gather-index builder | planned |
-| [`04-frea-kernel.md`](04-frea-kernel.md) | 3 | FREA: fused routed expert activation (headline kernel) | planned |
-| [`05-f2-saliency-accumulator.md`](05-f2-saliency-accumulator.md) | 4 | F2: fused online saliency accumulator (all consumed metrics) | planned |
-| [`06-f4-weight-stacking.md`](06-f4-weight-stacking.md) | 5 | F4: expert weight pre-stacking cache | planned |
-| [`07-validation-strategy.md`](07-validation-strategy.md) | — | Parity + benchmark harness | planned |
+| [`00-cost-model.md`](00-cost-model.md) | — | The current bottleneck: quantified | reference (partially historical) |
+| [`01-f3-dead-metric-audit.md`](01-f3-dead-metric-audit.md) | 0 | Prerequisite contract: prune consumes routed-only metrics | **landed** (`record_pruning_metrics_only=True` default + contract tests) |
+| [`02-bmm-baseline.md`](02-bmm-baseline.md) | 1 | Pure-PyTorch bmm baseline (parity oracle, MPS-runnable) | **landed** (`reap.kernels.bmm` / `--observe_backend bmm`) |
+| [`03-f5-router-fusion.md`](03-f5-router-fusion.md) | 2 | Fused router softmax + topk + gather-index builder | **landed** (`reap.kernels.router`) |
+| [`04-frea-kernel.md`](04-frea-kernel.md) | 3 | FREA: fused routed expert activation (headline kernel) | **landed** (PyTorch + `torch.compile` on CUDA; `--observe_backend frea`) |
+| [`05-f2-saliency-accumulator.md`](05-f2-saliency-accumulator.md) | 4 | F2: fused online saliency accumulator (all consumed metrics) | **landed** (`update_pruning_state_routed` / `--observe_backend f2`) |
+| [`06-f4-weight-stacking.md`](06-f4-weight-stacking.md) | 5 | F4: expert weight pre-stacking cache | **landed** (`reap.kernels.weight_cache`, layout-normalized) |
+| [`07-validation-strategy.md`](07-validation-strategy.md) | — | Parity + benchmark harness | **partial** (parity tests in `tests/test_kernel_parity_*.py`) |
 | [`08-expected-improvements.md`](08-expected-improvements.md) | — | Performance & memory projections | reference |
+
+Implementation package: `src/reap/kernels/`.
 
 ## Phase dependency graph
 

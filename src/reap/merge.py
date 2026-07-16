@@ -25,6 +25,7 @@ class MergeMethod(str, Enum):
     """Available methods for merging experts."""
 
     FREQUENCY_WEIGHTED_AVERAGE = "frequency_weighted_average"
+    AVERAGE = "average"
     TIES = "ties"
     MULTISLERP = "multislerp"
     SCE = "sce"
@@ -141,12 +142,21 @@ class MoEExpertMerger:
                     tensors_to_merge = [dom_tensors[param_name]] + [
                         t[param_name] for t in other_tensors
                     ]
-                    tensor_weights = torch.concat(
-                        (
-                            self.expert_proba[dom_expert].unsqueeze(dim=0),
-                            self.expert_proba[non_dom_indices],
+                    if self.merge_method == MergeMethod.AVERAGE:
+                        n = 1 + len(non_dom_indices)
+                        tensor_weights = torch.full(
+                            (n,),
+                            1.0 / n,
+                            device=self.expert_proba.device,
+                            dtype=self.expert_proba.dtype,
                         )
-                    )
+                    else:
+                        tensor_weights = torch.concat(
+                            (
+                                self.expert_proba[dom_expert].unsqueeze(dim=0),
+                                self.expert_proba[non_dom_indices],
+                            )
+                        )
 
                 # Merge the tensors using the selected method
                 merged_tensor = merge_fn(
@@ -175,7 +185,10 @@ class MoEExpertMerger:
 
     def _get_merge_function(self) -> Callable:
         """Get the appropriate merge function based on the selected method."""
-        if self.merge_method == MergeMethod.FREQUENCY_WEIGHTED_AVERAGE:
+        if self.merge_method in (
+            MergeMethod.FREQUENCY_WEIGHTED_AVERAGE,
+            MergeMethod.AVERAGE,
+        ):
             return self.frequency_weighted_average_merge
         elif self.merge_method == MergeMethod.TIES:
             return self._ties_merge

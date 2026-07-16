@@ -98,6 +98,7 @@ def _setup_observer(model, obs_args):
         distance_measure="cosine",
         renormalize_router_weights=renormalize_router_weights,
         record_pruning_metrics_only=obs_args.record_pruning_metrics_only,
+        observe_backend=getattr(obs_args, "observe_backend", "auto"),
     )
     return MoETransformerObserver(
         model=model,

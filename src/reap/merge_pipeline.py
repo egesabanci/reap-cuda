@@ -317,24 +317,13 @@ def merge(
             f"No model adapter for {model.__class__.__name__}. REAP currently "
             "supports Qwen3-MoE, Llama4-MoE, and Mixtral-style architectures."
         )
-    model_attrs = dict(adapter.expert_weight_attrs())
-    # Qwen3-MoE is fused under transformers>=5.x but the Qwen3 adapter's
-    # ``expert_weight_attrs()`` defaults to the non-fused layout; correct it
-    # from the live model so the merger uses ``_get_tensors_fused`` / the fused
-    # setter (Llama4 / LFM2 already report fused=True and are left untouched).
     _moe_indices = adapter.identify_moe_layers(model)
-    if _moe_indices and (
-        adapter.get_layer_config(
-            adapter.layers(model)[_moe_indices[0]], model.config
-        ).fused_experts
-        and not model_attrs["fused"]
-    ):
-        model_attrs.update({
-            "fused": True,
-            "gate_proj": "gate_up_proj",
-            "up_proj": "gate_up_proj",
-            "down_proj": "down_proj",
-        })
+    first_moe = (
+        adapter.get_moe(adapter.layers(model)[_moe_indices[0]])
+        if _moe_indices
+        else None
+    )
+    model_attrs = dict(adapter.expert_weight_attrs(first_moe))
     try:
         merge_method = MergeMethod(merge_args.merge_method)
     except ValueError:

@@ -30,6 +30,8 @@ class MoeLayerConfig:
         adapter_name: Adapter identifier (e.g. ``"qwen3_moe"``).
         fused_experts: Experts share a single fused weight (Llama4-style).
         use_expert_bias: Layer uses per-expert bias terms (LFM2 / ERNIE).
+        weight_convention: ``"linear"`` = ``(E, out, in)`` / F.linear;
+            ``"bmm"`` = ``(E, in, out)`` / bmm (Llama4 fused).
     """
 
     num_experts: int
@@ -38,6 +40,31 @@ class MoeLayerConfig:
     adapter_name: str = "qwen3_moe"
     fused_experts: bool = False
     use_expert_bias: bool = False
+    weight_convention: str = "linear"  # "linear" | "bmm"
+
+
+def _patch_router_after_slice(router: Any, keep_indices: list[int], top_k: int | None = None) -> None:
+    """Slice router weights / live counters after expert pruning."""
+    n = len(keep_indices)
+    if hasattr(router, "weight") and router.weight is not None:
+        router.weight.data = router.weight.data[keep_indices, ...]
+    if getattr(router, "bias", None) is not None:
+        router.bias.data = router.bias.data[keep_indices]
+    if hasattr(router, "out_features"):
+        router.out_features = n
+    if hasattr(router, "num_experts"):
+        router.num_experts = n
+    if hasattr(router, "top_k") and top_k is not None:
+        router.top_k = min(int(top_k), n)
+    if hasattr(router, "e_score_correction_bias"):
+        router.e_score_correction_bias.data = router.e_score_correction_bias.data[
+            keep_indices
+        ]
+
+
+def _patch_fused_experts_count(experts: Any, n: int) -> None:
+    if hasattr(experts, "num_experts"):
+        experts.num_experts = n
 
 
 # ---------------------------------------------------------------------------
@@ -188,12 +215,29 @@ class Qwen3MoeModelAdapter:
     def num_experts_config_attr(self) -> str:
         return "num_experts"
 
-    def expert_weight_attrs(self) -> dict[str, Any]:
-        """Per-expert weight attribute-name layout used by merge/permute.
+    def weight_convention(self) -> str:
+        """``linear`` = F.linear ``(out, in)``; ``bmm`` = matmul ``(in, out)``."""
+        return "linear"
 
-        Non-fused layout: each expert in a ModuleList exposes separate
-        ``gate_proj`` / ``up_proj`` / ``down_proj`` linears.
+    def expert_weight_attrs(self, moe: Any | None = None) -> dict[str, Any]:
+        """Per-expert weight attribute-name layout used by merge/permute/kernels.
+
+        When *moe* is provided, ``fused`` reflects the live module layout so
+        transformers>=5.x Qwen3 fused stacks are reported correctly.
         """
+        fused = False
+        if moe is not None:
+            fused = self._is_fused_experts(getattr(moe, self.experts_attr(), None))
+        if fused:
+            return {
+                "experts": self.experts_attr(),
+                "gate": self.router_attr(),
+                "fused": True,
+                "gate_proj": "gate_up_proj",
+                "up_proj": "gate_up_proj",
+                "down_proj": "down_proj",
+                "weight_convention": self.weight_convention(),
+            }
         return {
             "experts": self.experts_attr(),
             "gate": self.router_attr(),
@@ -201,6 +245,7 @@ class Qwen3MoeModelAdapter:
             "gate_proj": "gate_proj",
             "up_proj": "up_proj",
             "down_proj": "down_proj",
+            "weight_convention": self.weight_convention(),
         }
 
     # -- layout inspection ------------------------------------------------
@@ -248,24 +293,31 @@ class Qwen3MoeModelAdapter:
     ) -> MoeLayerConfig:
         moe = self.get_moe(layer)
 
-        num_experts = _positive_int(
-            _live_or_config_value(
-                moe,
-                ("num_experts",),
-                config,
-                (self.num_experts_config_attr(), "num_experts"),
-            ),
-            "num_experts",
-        )
-        top_k = _positive_int(
-            _live_or_config_value(
-                moe,
-                ("top_k", "num_experts_per_tok"),
-                config,
-                ("num_experts_per_tok", "top_k"),
-            ),
-            "top_k",
-        )
+        experts = getattr(moe, self.experts_attr(), None)
+        # Prefer live stack / ModuleList length over stale counters.
+        if self._is_fused_experts(experts) and hasattr(experts, "gate_up_proj"):
+            num_experts = int(experts.gate_up_proj.shape[0])
+        elif isinstance(experts, nn.ModuleList):
+            num_experts = len(experts)
+        else:
+            num_experts = _positive_int(
+                _live_or_config_value(
+                    moe,
+                    ("num_experts",),
+                    config,
+                    (self.num_experts_config_attr(), "num_experts"),
+                ),
+                "num_experts",
+            )
+
+        router = getattr(moe, self.router_attr(), None)
+        live_top = _live_value(moe, "top_k", "num_experts_per_tok")
+        if live_top is None and router is not None:
+            live_top = _live_value(router, "top_k", "num_experts_per_tok")
+        if live_top is None:
+            live_top = _config_value(config, "num_experts_per_tok", "top_k")
+        top_k = _positive_int(live_top, "top_k")
+
         norm_topk_prob = bool(
             _live_or_config_value(
                 moe,
@@ -277,10 +329,11 @@ class Qwen3MoeModelAdapter:
         )
         return MoeLayerConfig(
             num_experts=num_experts,
-            top_k=top_k,
+            top_k=min(top_k, num_experts),
             norm_topk_prob=norm_topk_prob,
             adapter_name=self.adapter_name,
-            fused_experts=self._is_fused_experts(getattr(moe, self.experts_attr(), None)),
+            fused_experts=self._is_fused_experts(experts),
+            weight_convention=self.weight_convention(),
         )
 
     # -- expert slicing (PyTorch, replaces prune.py non-fused branch) -----
@@ -289,25 +342,26 @@ class Qwen3MoeModelAdapter:
         moe: nn.Module,
         keep_indices: list[int],
     ) -> None:
-        """Slice the non-fused MoE module to only retain *keep_indices*."""
+        """Slice MoE experts and router so the live module stays runnable."""
+        n = len(keep_indices)
         all_experts = getattr(moe, self.experts_attr())
         if self._is_fused_experts(all_experts):
-            # Fused layout: stack weights on dim 0
             all_experts.gate_up_proj.data = all_experts.gate_up_proj.data[keep_indices]
             all_experts.down_proj.data = all_experts.down_proj.data[keep_indices]
+            _patch_fused_experts_count(all_experts, n)
         else:
             retained = nn.ModuleList([all_experts[i] for i in keep_indices])
             setattr(moe, self.experts_attr(), retained)
 
+        if hasattr(moe, "num_experts"):
+            moe.num_experts = n
+
         router = getattr(moe, self.router_attr())
-        router.weight.data = router.weight.data[keep_indices, :]
-        if getattr(router, "bias", None) is not None:
-            router.bias.data = router.bias.data[keep_indices]
-        router.out_features = len(keep_indices)
-        if hasattr(router, "e_score_correction_bias"):
-            router.e_score_correction_bias.data = (
-                router.e_score_correction_bias.data[keep_indices]
-            )
+        # Preserve current top_k if present, clamp to retained count.
+        prev_top = getattr(router, "top_k", None)
+        if prev_top is None:
+            prev_top = getattr(moe, "top_k", None)
+        _patch_router_after_slice(router, keep_indices, top_k=prev_top)
 
     # -- config patching ---------------------------------------------------
     def update_config(
@@ -321,6 +375,8 @@ class Qwen3MoeModelAdapter:
         top_k = min(top_k, num_experts)
         if hasattr(config, "num_experts_per_tok"):
             config.num_experts_per_tok = top_k
+        if hasattr(config, "top_k"):
+            config.top_k = top_k
 
 
 class Qwen3_5MoeModelAdapter(Qwen3MoeModelAdapter):
@@ -362,15 +418,18 @@ class Llama4MoeModelAdapter:
         return "experts"
 
     def router_attr(self) -> str:
-        return "gate"
+        # HF Llama4TextMoe uses ``self.router`` (not ``.gate``).
+        return "router"
 
     def num_experts_config_attr(self) -> str:
         return "num_local_experts"
 
-    def expert_weight_attrs(self) -> dict[str, Any]:
-        """Fused expert layout: gate+up stacked into ``gate_up_proj`` and
-        ``down_proj``, both ``(num_experts, ...)`` tensors on a single module.
-        """
+    def weight_convention(self) -> str:
+        # gate_up_proj is (E, H, 2I); down_proj is (E, I, H) — bmm convention.
+        return "bmm"
+
+    def expert_weight_attrs(self, moe: Any | None = None) -> dict[str, Any]:
+        """Fused expert layout: bmm convention stacked gate_up / down."""
         return {
             "experts": self.experts_attr(),
             "gate": self.router_attr(),
@@ -378,6 +437,7 @@ class Llama4MoeModelAdapter:
             "gate_proj": "gate_up_proj",
             "up_proj": "gate_up_proj",
             "down_proj": "down_proj",
+            "weight_convention": self.weight_convention(),
         }
 
     def layers(self, model: Any) -> Sequence[Any]:
@@ -392,7 +452,10 @@ class Llama4MoeModelAdapter:
 
     def is_moe_layer(self, layer: Any) -> bool:
         ff = getattr(layer, "feed_forward", None)
-        return ff is not None and hasattr(ff, "experts") and hasattr(ff, "gate")
+        if ff is None or not hasattr(ff, "experts"):
+            return False
+        # Real HF Llama4 uses .router; some mocks alias .gate = .router.
+        return hasattr(ff, "router") or hasattr(ff, "gate")
 
     def get_moe(self, layer: Any) -> Any:
         if not self.is_moe_layer(layer):
@@ -413,42 +476,46 @@ class Llama4MoeModelAdapter:
         config: Mapping[str, Any] | None = None,
     ) -> MoeLayerConfig:
         moe = self.get_moe(layer)
-
-        num_experts = _positive_int(
-            _live_or_config_value(
-                moe,
-                ("num_experts",),
-                config,
-                ("num_local_experts", "num_experts"),
-            ),
-            "num_experts",
-        )
-        top_k = _positive_int(
-            _live_or_config_value(
-                moe,
-                ("top_k", "num_experts_per_tok"),
-                config,
-                ("num_experts_per_tok", "top_k"),
-            ),
-            "top_k",
-        )
+        experts = getattr(moe, self.experts_attr(), None)
+        if experts is not None and hasattr(experts, "gate_up_proj"):
+            num_experts = int(experts.gate_up_proj.shape[0])
+        else:
+            num_experts = _positive_int(
+                _live_or_config_value(
+                    moe,
+                    ("num_experts",),
+                    config,
+                    ("num_local_experts", "num_experts"),
+                ),
+                "num_experts",
+            )
+        live_top = _live_value(moe, "top_k", "num_experts_per_tok")
+        if live_top is None:
+            live_top = _config_value(config, "num_experts_per_tok", "top_k")
+        top_k = _positive_int(live_top, "top_k")
         return MoeLayerConfig(
             num_experts=num_experts,
-            top_k=top_k,
+            top_k=min(top_k, num_experts),
             norm_topk_prob=False,
             adapter_name=self.adapter_name,
             fused_experts=True,
+            weight_convention=self.weight_convention(),
         )
 
     def slice_experts(self, moe: nn.Module, keep_indices: list[int]) -> None:
         """Slice fused Llama4 expert weights on dim 0."""
+        n = len(keep_indices)
         moe.experts.gate_up_proj.data = moe.experts.gate_up_proj.data[keep_indices]
         moe.experts.down_proj.data = moe.experts.down_proj.data[keep_indices]
-        moe.num_experts = len(keep_indices)
-        moe.router.weight.data = moe.router.weight.data[keep_indices]
-        moe.router.out_features = len(keep_indices)
-        if hasattr(moe.router, "num_experts"):
-            moe.router.num_experts = len(keep_indices)
+        _patch_fused_experts_count(moe.experts, n)
+        moe.num_experts = n
+        router = getattr(moe, self.router_attr(), None) or getattr(moe, "gate", None)
+        if router is None:
+            raise ValueError("Llama4 MoE block has neither .router nor .gate")
+        prev_top = getattr(moe, "top_k", None)
+        _patch_router_after_slice(router, keep_indices, top_k=prev_top)
+        if hasattr(moe, "top_k") and prev_top is not None:
+            moe.top_k = min(int(prev_top), n)
 
     def update_config(
         self,
@@ -497,13 +564,12 @@ class Lfm2MoeModelAdapter:
     def num_experts_config_attr(self) -> str:
         return "num_experts"
 
-    def expert_weight_attrs(self) -> dict[str, Any]:
-        """Fused layout: gate+up stacked in ``gate_up_proj`` (dim 1), ``down_proj``.
+    def weight_convention(self) -> str:
+        # LFM2 matches Qwen fused Linear layout: gate_up (E, 2I, H).
+        return "linear"
 
-        Same fused contract as Llama4 — merge/permute slice the stacked tensors
-        on dim 0 (expert axis) and split ``gate_up_proj`` into gate/up halves
-        on dim 1 when needed.
-        """
+    def expert_weight_attrs(self, moe: Any | None = None) -> dict[str, Any]:
+        """Fused layout: gate+up stacked in ``gate_up_proj`` (Linear convention)."""
         return {
             "experts": self.experts_attr(),
             "gate": self.router_attr(),
@@ -511,6 +577,7 @@ class Lfm2MoeModelAdapter:
             "gate_proj": "gate_up_proj",
             "up_proj": "gate_up_proj",
             "down_proj": "down_proj",
+            "weight_convention": self.weight_convention(),
         }
 
     # -- layout inspection ------------------------------------------------
@@ -589,33 +656,33 @@ class Lfm2MoeModelAdapter:
                 default=False,
             )
         )
+        experts = getattr(moe, self.experts_attr(), None)
+        if experts is not None and hasattr(experts, "gate_up_proj"):
+            num_experts = int(experts.gate_up_proj.shape[0])
         return MoeLayerConfig(
             num_experts=num_experts,
-            top_k=top_k,
+            top_k=min(top_k, num_experts),
             norm_topk_prob=norm_topk_prob,
             adapter_name=self.adapter_name,
             fused_experts=True,
             use_expert_bias=use_expert_bias,
+            weight_convention=self.weight_convention(),
         )
 
     # -- expert slicing (fused, dim 0 = expert axis) ---------------------
     def slice_experts(self, moe: nn.Module, keep_indices: list[int]) -> None:
         """Slice fused LFM2 expert weights on dim 0 (expert axis)."""
+        n = len(keep_indices)
         exps = getattr(moe, self.experts_attr())
         exps.gate_up_proj.data = exps.gate_up_proj.data[keep_indices]
         exps.down_proj.data = exps.down_proj.data[keep_indices]
-        if hasattr(exps, "num_experts"):
-            exps.num_experts = len(keep_indices)
-        # Router is moe.gate (nn.Linear, weight (E, H)).
+        _patch_fused_experts_count(exps, n)
+        if hasattr(moe, "num_experts"):
+            moe.num_experts = n
         gate = getattr(moe, self.router_attr())
-        gate.weight.data = gate.weight.data[keep_indices, :]
-        if getattr(gate, "bias", None) is not None:
-            gate.bias.data = gate.bias.data[keep_indices]
-        gate.out_features = len(keep_indices)
-        # LFM2 per-expert bias (config.use_expert_bias=True): a (E,) parameter on
-        # the MoE block (``feed_forward.expert_bias``) added to the router logits.
-        # Must be sliced alongside the experts or the saved checkpoint won't match
-        # the patched config (num_experts) on reload.
+        prev_top = getattr(moe, "top_k", None) or getattr(gate, "top_k", None)
+        _patch_router_after_slice(gate, keep_indices, top_k=prev_top)
+        # LFM2 per-expert bias (config.use_expert_bias=True).
         if hasattr(moe, "expert_bias") and moe.expert_bias is not None:
             moe.expert_bias.data = moe.expert_bias.data[keep_indices]
 

@@ -75,7 +75,7 @@ def prepare_calibration_batches(
 ) -> List[torch.Tensor]:
     """Prepare calibration samples for layerwise processing.
 
-    Returns a list of tokenized input tensors.
+    Mirrors ``layerwise_prune.prepare_calibration_batches``.
     """
     logger.info(f"Loading dataset {ds_args.dataset_name}...")
 
@@ -91,24 +91,38 @@ def prepare_calibration_batches(
             f"components, {total_samples} total samples."
         )
         for component in composite_components:
-            batches = load_category_batches(
-                tokenizer,
-                component.dataset_name,
-                obs_args,
-                ds_args,
-                component.num_batches,
+            category_data_batches = load_category_batches(
+                dataset_name=component.name,
+                split=component.split,
+                subset=component.subset,
+                tokenizer=tokenizer,
+                model_max_length=obs_args.model_max_length,
+                split_by_category=False,
+                return_vllm_tokens_prompt=obs_args.return_vllm_tokens_prompt,
+                truncate=obs_args.truncate,
+                batches_per_category=component.num_batches,
+                batch_size=obs_args.batch_size,
             )
-            all_batches.extend(batches)
+            for _category, batches in category_data_batches.items():
+                all_batches.extend(batches)
         return all_batches
 
-    batches = load_category_batches(
-        tokenizer,
-        ds_args.dataset_name,
-        obs_args,
-        ds_args,
-        obs_args.batches_per_category,
+    category_data_batches = load_category_batches(
+        dataset_name=ds_args.dataset_name,
+        split=ds_args.split,
+        subset=ds_args.dataset_config_name,
+        tokenizer=tokenizer,
+        model_max_length=obs_args.model_max_length,
+        split_by_category=obs_args.split_by_category,
+        return_vllm_tokens_prompt=obs_args.return_vllm_tokens_prompt,
+        truncate=obs_args.truncate,
+        batches_per_category=obs_args.batches_per_category,
+        batch_size=obs_args.batch_size,
     )
-    return batches
+    all_batches: List[torch.Tensor] = []
+    for _category, samples in category_data_batches.items():
+        all_batches.extend(samples)
+    return all_batches
 
 
 def record_activations_layerwise_merge(
@@ -147,6 +161,7 @@ def record_activations_layerwise_merge(
         fused_experts=layer_cfg.fused_experts,
         renormalize_router_weights=obs_args.renormalize_router_weights,
         record_pruning_metrics_only=False,  # merge needs ALL metrics
+        observe_backend=getattr(obs_args, "observe_backend", "auto"),
     )
 
     observer = LayerwiseMoEObserver(

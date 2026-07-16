@@ -108,11 +108,12 @@ class ObserverArgs:
         metadata={"help": "Name of the output file for observer data."},
     )
     record_pruning_metrics_only: bool = field(
-        default=False,
+        default=True,
         metadata={
             "help": (
-                "Whether to only record pruning metrics during observation to reduce "
-                "memory usage and wall-clock time."
+                "Only record prune-path metrics (routed-token saliency). Default True "
+                "because prune never reads merge-criteria tensors. Merge entrypoints "
+                "force this to False."
             )
         },
     )
@@ -123,6 +124,17 @@ class ObserverArgs:
                 "Whether to renormalize topk router weights to sum to 1 if the model.config.norm_topk_prob is True."
             )
         }, 
+    )
+    observe_backend: str = field(
+        default="auto",
+        metadata={
+            "help": (
+                "Observation backend: auto|loop|bmm|frea|f2. "
+                "auto picks f2 on CUDA+Triton else bmm (routed-only GPU). "
+                "loop is the legacy full (E,T,H) parity oracle."
+            ),
+            "choices": ["auto", "loop", "bmm", "frea", "f2"],
+        },
     )
 
 @dataclass
@@ -264,7 +276,7 @@ class MergeArgs:
             "help": "Method to use for merging experts.",
             "choices": [
                 "frequency_weighted_average",
-                "average",
+                "average",  # alias of frequency_weighted_average with uniform weights
                 "ties",
                 "multislerp",
                 "sce",

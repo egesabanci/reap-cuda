@@ -27,7 +27,6 @@ from transformers.tokenization_utils_base import BatchEncoding
 
 from reap.observer import (
     MoETransformerObserverConfig,
-    compute_fused_expert_activations,
     _resolve_act_fn,
 )
 from reap.layerwise_model_utils import (
@@ -39,7 +38,7 @@ from reap.layerwise_model_utils import (
     safe_get_device,
     has_meta_tensors,
 )
-from reap.pruning_metrics import initialize_pruning_state, update_pruning_state
+from reap.pruning_metrics import initialize_pruning_state, resolve_compute_device
 from reap.metrics import (
     OnlineStatsTracker,
     get_distance_fn,
@@ -47,6 +46,9 @@ from reap.metrics import (
     get_routed_characteristic_activation,
     ca_dist_online,
 )
+from reap.kernels.backend import select_observe_backend
+from reap.kernels.observe import observe_moe_batch
+from reap.kernels.weight_cache import free_cache
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -245,15 +247,15 @@ class LayerwiseMoEObserver:
         )
         return module
 
-    def _initialize_block_state(self, num_experts: int, hidden_dim: int | None = None) -> Dict[str, Any]:
-        """Initialize state dictionary for a block.
-
-        When ``record_pruning_metrics_only`` is ``False``, this also allocates
-        the OnlineStatsTracker-backed merging-criteria metrics (ttm, routed
-        characteristic activation, characteristic activation, online CA dist,
-        router logit similarity) so the layerwise observer can feed clustering.
-        """
-        state = initialize_pruning_state(num_experts)
+    def _initialize_block_state(
+        self,
+        num_experts: int,
+        hidden_dim: int | None = None,
+        device: str | torch.device | None = None,
+    ) -> Dict[str, Any]:
+        """Initialize state dictionary for a block on the compute device."""
+        device = resolve_compute_device(device)
+        state = initialize_pruning_state(num_experts, device=device)
 
         if not self.hook_config.record_pruning_metrics_only:
             if hidden_dim is None:
@@ -264,31 +266,31 @@ class LayerwiseMoEObserver:
             state["ttm_similarity_matrix"] = OnlineStatsTracker(
                 shape=(num_experts, num_experts),
                 count_shape=(num_experts, num_experts),
-                device="cpu",
+                device=device,
                 dtype=torch.float32,
             )
             state["routed_characteristic_activation"] = OnlineStatsTracker(
                 shape=(num_experts, hidden_dim),
                 count_shape=(num_experts, hidden_dim),
-                device="cpu",
+                device=device,
                 dtype=torch.float32,
             )
             state["characteristic_activation"] = OnlineStatsTracker(
                 shape=(num_experts, hidden_dim),
                 count_shape=1,
-                device="cpu",
+                device=device,
                 dtype=torch.float32,
             )
             state["online_characteristic_activation_dist"] = OnlineStatsTracker(
                 shape=(num_experts, num_experts),
                 count_shape=1,
-                device="cpu",
+                device=device,
                 dtype=torch.float32,
             )
             state["router_logit_similiarity"] = OnlineStatsTracker(
                 shape=(num_experts, num_experts),
                 count_shape=1,
-                device="cpu",
+                device=device,
                 dtype=torch.float32,
             )
 
@@ -659,178 +661,110 @@ class LayerwiseMoEObserver:
         batch_size, sequence_length, hidden_dim = input_hidden_states.shape
         flat_input = input_hidden_states.view(-1, hidden_dim)
 
-        # Create valid token mask from attention mask
-        # This filters out padding tokens from metric computation
         valid_token_mask = None
         if attention_mask is not None:
             attention_mask = attention_mask.to(device)
-            # Handle different attention mask shapes
             if attention_mask.dim() == 4:
-                # Shape: [batch_size, 1, seq_len, seq_len] - HuggingFace 4D causal mask
-                # Use the last row of each batch's mask to infer which token
-                # positions are valid for the full sequence. Some models pass
-                # a boolean mask (True = valid), others an additive mask
-                # (0 = valid, large negative = masked).
                 mask_row = attention_mask[:, 0, -1, :]
                 if mask_row.dtype == torch.bool:
                     valid_token_mask = mask_row
                 else:
                     valid_token_mask = mask_row == 0
             elif attention_mask.dim() == 2:
-                # Shape: [batch_size, seq_len] - standard padding mask
-                # Convention: 1 = valid, 0 = padding.
                 valid_token_mask = attention_mask.bool()
             else:
                 logger.warning(
                     f"Unexpected attention_mask shape {attention_mask.shape}, ignoring"
                 )
-
             if valid_token_mask is not None:
-                # Flatten to [batch_size * seq_len]
                 valid_token_mask = valid_token_mask.reshape(-1)
 
-        # Initialize state for this block if needed
         if block_idx not in self.state:
-            self.state[block_idx] = self._initialize_block_state(num_experts, hidden_dim)
+            self.state[block_idx] = self._initialize_block_state(
+                num_experts, hidden_dim, device=device
+            )
 
-        # Compute activations for all experts (loop branch only; the fused
-        # branch builds its own activations tensor via the shared helper).
-        activations = torch.zeros(
-            (num_experts, *flat_input.shape), device=device, dtype=flat_input.dtype,
+        backend = select_observe_backend(
+            getattr(self.hook_config, "observe_backend", "auto")
         )
+        act_fn = _resolve_act_fn(self.config)
+        compute_routed_ca = not self.hook_config.record_pruning_metrics_only
 
-        # TODO(ivanl): model-specific handling of router_module return signature
-        def extract_router_logits(router_module, input):
-            """Call routers that expect either flattened or sequence-shaped hidden states.
-
-            DeepSeek's gate unpacks `[batch, seq, hidden]` internally, while other
-            routers accept the flattened `[tokens, hidden]` view used for metric
-            collection. Retry with the original 3D shape when the flat call fails.
-            """
-            try:
-                result = router_module(input)
-            except (TypeError, ValueError):
-                if input.ndim != 2:
-                    raise
-                result = router_module(
-                    input.view(batch_size, sequence_length, hidden_dim)
-                )
-            if isinstance(result, tuple):
-                *_, router_logits = result
-            else:
-                router_logits = result
-            return router_logits
-
-        if fused_experts:
-            # Fused experts (Llama4 / LFM2 / Qwen3.5/3.6): delegate to the shared
-            # Phase-1 bmm "grouped" helper so the layerwise and standard
-            # observers cannot drift apart (and so qwen3_5 routers, which return
-            # a 3-tuple and whose experts.forward needs (hidden, selected,
-            # weights), are handled correctly -- the previous inline code called
-            # ``moe_module.experts(routed_in)`` with one arg and took the wrong
-            # tuple element from the router).
-            act_fn = _resolve_act_fn(self.config)
-            activations, selected_experts, router_logits = (
-                compute_fused_expert_activations(
-                    moe_module, self.adapter, flat_input, num_experts, top_k, act_fn,
-                )
-            )
-        else:
-            # Loop-based MoE execution
-            # First, we need to get router logits by doing a forward pass
-            # This is done via the router in the MoE module
-            router = getattr(moe_module, self.adapter.router_attr(), None) or getattr(
-                moe_module, "router", None
-            )
-            if router is None:
-                raise ValueError(
-                    f"Cannot find router in MoE module at block {block_idx}"
-                )
-            router_logits = extract_router_logits(router, flat_input)
-
-            _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
-
-            # Compute activations for all experts
-            for idx, expert in enumerate(moe_module.experts):
-                activations[idx] = expert(flat_input).to(device)
-
-        pruning_batch = update_pruning_state(
+        batch_out = observe_moe_batch(
             self.state[block_idx],
-            activations=activations,
-            selected_experts=selected_experts,
-            router_logits=router_logits,
+            moe_module,
+            self.adapter,
+            flat_input,
             num_experts=num_experts,
+            top_k=top_k,
+            act_fn=act_fn,
             valid_token_mask=valid_token_mask,
             renormalize_router_weights=self.hook_config.renormalize_router_weights,
+            backend=backend,
+            record_pruning_metrics_only=self.hook_config.record_pruning_metrics_only,
+            compute_routed_ca=compute_routed_ca,
+            fused=fused_experts,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
         )
 
-        # Merging-criteria metrics (mirrors observer.py:_hook_fn)
         if not self.hook_config.record_pruning_metrics_only:
             distance_fn = get_distance_fn("cosine")
+            activations = batch_out["activations"]
+            selected_experts = batch_out["selected_experts"]
+            router_logits = batch_out["router_logits"]
+            expert_frequency = batch_out["expert_frequency"]
+            pairwise = batch_out["pairwise_expert_frequency"]
+            num_tokens = batch_out["num_tokens"]
 
             ttm = ttm_online(
-                pruning_batch.activations,
-                pruning_batch.selected_experts,
+                activations,
+                selected_experts,
                 distance_callable=distance_fn,
                 num_experts=num_experts,
-                pairwise_expert_frequency=pruning_batch.pairwise_expert_frequency,
+                pairwise_expert_frequency=pairwise,
             )
-            self.state[block_idx]["ttm_similarity_matrix"].update(
-                ttm, pruning_batch.pairwise_expert_frequency
-            )
+            self.state[block_idx]["ttm_similarity_matrix"].update(ttm, pairwise)
             del ttm
 
             rca = get_routed_characteristic_activation(
-                pruning_batch.activations,
-                pruning_batch.selected_experts,
-                pruning_batch.expert_frequency,
+                activations,
+                selected_experts,
+                expert_frequency,
                 device,
                 hidden_dim,
                 num_experts,
             )
-            freq_expanded = pruning_batch.expert_frequency.unsqueeze(-1).expand(
-                (-1, hidden_dim)
-            )
+            freq_expanded = expert_frequency.unsqueeze(-1).expand((-1, hidden_dim))
             self.state[block_idx]["routed_characteristic_activation"].update(
                 rca, freq_expanded
             )
             del freq_expanded, rca
 
-            ca_dist = ca_dist_online(
-                pruning_batch.activations,
-                distance_callable=distance_fn,
-            ).to(device="cpu")
+            ca_dist = ca_dist_online(activations, distance_callable=distance_fn)
             self.state[block_idx]["online_characteristic_activation_dist"].update(
-                ca_dist, pruning_batch.num_tokens
+                ca_dist, num_tokens
             )
             del ca_dist
 
-            # router_logit_similarity with total tokens count
-            rl_sim = (
-                distance_fn(
-                    pruning_batch.router_logits.permute(1, 0).view(
-                        1, num_experts, 1, -1
-                    ),
-                    pruning_batch.router_logits.permute(1, 0).view(
-                        1, 1, num_experts, -1
-                    ),
-                )
-                .squeeze()
-                .to(device="cpu")
-            )
-            self.state[block_idx]["router_logit_similiarity"].update(
-                rl_sim, pruning_batch.num_tokens
-            )
+            rl_sim = distance_fn(
+                router_logits.permute(1, 0).view(1, num_experts, 1, -1),
+                router_logits.permute(1, 0).view(1, 1, num_experts, -1),
+            ).squeeze()
+            self.state[block_idx]["router_logit_similiarity"].update(rl_sim, num_tokens)
             del rl_sim
 
             self.state[block_idx]["characteristic_activation"].update(
-                pruning_batch.activations.mean(dim=1), pruning_batch.num_tokens
+                activations.mean(dim=1), num_tokens
             )
+            del activations
 
-        # Clean up
-        del activations, selected_experts, router_logits, pruning_batch
+        free_cache(moe_module)
+        del batch_out
         if valid_token_mask is not None:
             del valid_token_mask
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         gc.collect()
 
     @torch.inference_mode()
@@ -1111,11 +1045,13 @@ class LayerwiseMoEObserver:
 
         state_dict = self.report_state()
 
-        # Move all tensors to CPU
+        # Host transfer only at save time (hot path stays on GPU).
         for block_num, block_state in state_dict.items():
-            for key, value in block_state.items():
+            for key, value in list(block_state.items()):
                 if isinstance(value, torch.Tensor):
                     state_dict[block_num][key] = value.cpu()
+                elif isinstance(value, OnlineStatsTracker):
+                    state_dict[block_num][key] = value.mean.cpu()
 
         torch.save(state_dict, file_path)
         logger.info(f"State saved to {file_path}")
@@ -1133,6 +1069,7 @@ class LayerwiseMoEObserver:
     def close_hooks(self):
         """Clean up resources."""
         self.reset()
+        free_cache()
         for hook in self.hooks:
             hook.remove()
         self.hooks.clear()

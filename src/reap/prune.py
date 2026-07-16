@@ -24,10 +24,45 @@ from reap.args import (
     ClusterArgs,
 )
 from reap.model_adapters import infer_model_adapter
+from reap.pruning_metrics import PRUNE_METHOD_KEY_MAP
 from reap.eval import run_evaluate
+from reap.merge_pipeline import get_super_expert_indices
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+
+def _resolve_saliency(
+    layer_data: dict[str, Any],
+    prune_method: str,
+    *,
+    model_device: torch.device | str,
+) -> torch.Tensor:
+    """Map CLI prune_method to a per-expert saliency vector (lower = prune first)."""
+    if prune_method == "ean_ca":
+        rca = layer_data.get("routed_characteristic_activation")
+        if rca is None:
+            raise ValueError(
+                "ean_ca requires routed_characteristic_activation; re-run the "
+                "observer with --record_pruning_metrics_only False "
+                "(or use a merge-mode calibration)."
+            )
+        num_experts = rca.shape[0]
+        ean = torch.zeros(num_experts, device=model_device, dtype=torch.float32)
+        for i in range(num_experts):
+            ean[i] = torch.linalg.norm(rca[i].float(), dim=-1).sum()
+        return ean
+
+    key = PRUNE_METHOD_KEY_MAP.get(prune_method, prune_method)
+    saliency_data = layer_data.get(key)
+    if saliency_data is None:
+        raise ValueError(
+            f"Prune method {prune_method!r} (key {key!r}) not found in observer "
+            f"data. Available keys: {list(layer_data.keys())}"
+        )
+    if not isinstance(saliency_data, torch.Tensor):
+        saliency_data = torch.as_tensor(saliency_data)
+    return saliency_data.to(device=model_device)
 
 
 def prune(
@@ -37,57 +72,65 @@ def prune(
     n_experts_to_prune,
     pruned_model_dir,
 ):
-    """
-    Prune the model based on the observer data.
-    """
+    """Prune the model based on the observer data."""
     adapter = infer_model_adapter(model, model.config)
     if adapter is None:
         raise ValueError(
             f"Cannot detect a supported MoE adapter for "
             f"{model.__class__.__name__}. REAP currently supports Qwen3-MoE, "
-            "Llama4-MoE, and Mixtral-style architectures."
+            "Llama4-MoE, LFM2-MoE, and Mixtral-style architectures."
         )
     layers = adapter.layers(model)
+    model_device = next(model.parameters()).device
 
     for layer in observer_data:
         if "expert_proba" not in observer_data[layer]:
-            # Calculate expert probabilities if not already present
             observer_data[layer]["expert_proba"] = (
                 observer_data[layer]["expert_frequency"]
                 / observer_data[layer]["total_tokens"]
             )
 
+    # Optional super/outlier expert preservation (mirrors merge path).
+    protected: dict[int, set[int]] = {}
+    if prune_args.perserve_super_experts or prune_args.perserve_outliers:
+        super_idx = get_super_expert_indices(
+            observer_data,
+            include_last_layers=bool(prune_args.perserve_outliers),
+        )
+        for row in super_idx:
+            layer_i, expert_i = int(row[0].item()), int(row[1].item())
+            protected.setdefault(layer_i, set()).add(expert_i)
+        logger.info(
+            "Preserving %s super/outlier experts across layers during prune",
+            int(super_idx.shape[0]),
+        )
+
+    retained_expert_indicies = None
     for layer in tqdm(observer_data, "Pruning layers..."):
         num_experts = observer_data[layer]["expert_frequency"].shape[0]
-        if prune_args.prune_method == "ean_ca":
-            ean = torch.zeros(num_experts, device=model.device, dtype=torch.float32)
-            for i in range(num_experts):
-                ean[i] = torch.linalg.norm(
-                    observer_data[layer]["routed_characteristic_activation"][i], dim=-1
-                ).sum()
-            _, experts_to_prune = torch.topk(ean, n_experts_to_prune, largest=False)
-        else:
-            prune_method = prune_args.prune_method
-            if prune_method == "frequency":
-                prune_method = "expert_frequency"
-            saliency_data = observer_data[layer].get(prune_method)
-            if saliency_data is None:
-                raise ValueError(
-                    f"Prune method {prune_args.prune_method} not found in observer data for layer {layer}. "
-                    f"Available keys: {list(observer_data[layer].keys())}"
-                )
-            _, experts_to_prune = torch.topk(
-                saliency_data, n_experts_to_prune, largest=False
-            )
+        saliency = _resolve_saliency(
+            observer_data[layer], prune_args.prune_method, model_device=model_device
+        )
+        # Mask protected experts so they are never among the lowest-k.
+        if layer in protected:
+            saliency = saliency.clone()
+            for e in protected[layer]:
+                if 0 <= e < num_experts:
+                    saliency[e] = torch.finfo(saliency.dtype).max
 
+        n_prune = min(n_experts_to_prune, num_experts - 1)
+        if n_prune < 1:
+            retained_expert_indicies = list(range(num_experts))
+            continue
+
+        _, experts_to_prune = torch.topk(saliency, n_prune, largest=False)
+        prune_set = set(experts_to_prune.tolist())
         retained_expert_indicies = [
-            i for i in range(num_experts) if i not in experts_to_prune
+            i for i in range(num_experts) if i not in prune_set
         ]
-        # prune experts (architecture-specific slicing via adapter)
         moe = adapter.get_moe(layers[layer])
         adapter.slice_experts(moe, retained_expert_indicies)
 
-    # patch config and dump
     logger.info("Saving pruned model...")
     retained_experts = len(retained_expert_indicies)
     moe_layer_indices = adapter.identify_moe_layers(model)
@@ -97,13 +140,8 @@ def prune(
 
     pruned_model_dir.mkdir(parents=True, exist_ok=True)
     start = time.time()
-    # Strip accelerate's device_map dispatch hooks so save_pretrained takes the
-    # plain safetensors path (streams each shard straight from the GPU tensors
-    # via safetensors.safe_save_file, which handles CUDA tensors natively and
-    # cleans up between shards) instead of accelerate's get_state_dict_from_offload
-    # which materializes the entire state dict on CPU. On a low-RAM box (15GB RAM,
-    # 16GB model, 0 swap) the CPU-materializing path wedges the host. With hooks
-    # removed the save is GPU-streamed and CPU-light.
+    # Strip accelerate dispatch hooks so save streams GPU tensors via safetensors
+    # without materializing a full CPU state dict.
     remove_hook_from_module(model, recurse=True)
     model.save_pretrained(pruned_model_dir)
     end = time.time()
@@ -162,14 +200,12 @@ def main():
 
     model_name = model_args.model_name
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    # load model
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         device_map="auto",
         torch_dtype="auto",
         trust_remote_code=True,
     )
-    # record activations or load previously recorded activations
     logger.info(
         f"Running observer to collect activation data for model {model_args.model_name} on dataset {ds_args.dataset_name}."
     )
@@ -189,26 +225,28 @@ def main():
         )
         return
 
-    # pruning
     logger.info("Start of pruning")
+    total_experts = len(
+        observer_data[next(iter(observer_data))]["expert_frequency"]
+    )
     n_experts_to_prune = prune_args.n_experts_to_prune
     if n_experts_to_prune is None:
         if cluster_args.compression_ratio is None:
             raise ValueError(
                 "Either n_experts_to_prune or compression_ratio must be set for pruning."
             )
-        else:
-            # Calculate n_experts_to_prune from compression_ratio
-            total_experts = len(
-                observer_data[next(iter(observer_data))]["expert_frequency"]
-            )
-            n_experts_to_prune = int(total_experts * cluster_args.compression_ratio)
-            logger.info(
-                f"Calculated n_experts to prune: {n_experts_to_prune} from compression_ratio: {cluster_args.compression_ratio}"
-            )
+        n_experts_to_prune = int(total_experts * cluster_args.compression_ratio)
+        logger.info(
+            f"Calculated n_experts to prune: {n_experts_to_prune} from compression_ratio: {cluster_args.compression_ratio}"
+        )
 
     pruned_model_dir = get_pruned_model_dir(
-        results_dir, n_experts_to_prune, total_experts, prune_args, reap_args.seed, obs_args.renormalize_router_weights
+        results_dir,
+        n_experts_to_prune,
+        total_experts,
+        prune_args,
+        reap_args.seed,
+        obs_args.renormalize_router_weights,
     )
     if (
         pruned_model_dir.exists()
@@ -230,25 +268,23 @@ def main():
         )
         logger.info("pruning completed.")
 
-        # smoke test
         if reap_args.smoke_test:
-            logger.info("Running smoke test on the merged model...")
+            logger.info("Running smoke test on the pruned model...")
             try:
                 smoke_test(model, tokenizer)
             except Exception as e:
                 logger.error(f"Smoke test failed: {e}")
-                pass
 
         tokenizer.save_pretrained(pruned_model_dir)
         logger.info("Pruning completed.")
 
-    # eval
     if reap_args.do_eval and pruned_model_dir.exists():
         remove_hook_from_module(model, recurse=True)
         model.to("cpu")
         del model
         del observer_data
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         gc.collect()
         model_args.model_name = str(pruned_model_dir)
         run_evaluate(model_args, pruned_model_dir / "eval", eval_args, reap_args.seed)

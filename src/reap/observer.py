@@ -19,7 +19,13 @@ from reap.metrics import (
     OnlineStatsTracker,
     get_distance_fn,
 )
-from reap.pruning_metrics import initialize_pruning_state, update_pruning_state
+from reap.pruning_metrics import (
+    initialize_pruning_state,
+    resolve_compute_device,
+)
+from reap.kernels.backend import select_observe_backend
+from reap.kernels.observe import observe_moe_batch
+from reap.kernels.weight_cache import free_cache
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -27,18 +33,14 @@ logger = logging.getLogger(__name__)
 
 _ACT_FN_MAP = {
     "silu": F.silu,
-    "swiglu": F.silu,  # SwiGLU: act(gate) * up; act_fn returns the gate activation
+    "swiglu": F.silu,
     "gelu": F.gelu,
     "relu": F.relu,
 }
 
 
 def _resolve_act_fn(config: Any) -> callable:
-    """Return the expert-MLP gate activation from ``config.hidden_act``.
-
-    All supported MoE targets (Qwen3, Llama4, LFM2, Mixtral) use SwiGLU/silu.
-    The ``* up`` half of SwiGLU is applied by the caller.
-    """
+    """Return the expert-MLP gate activation from ``config.hidden_act``."""
     name = str(getattr(config, "hidden_act", None) or "silu").lower()
     try:
         return _ACT_FN_MAP[name]
@@ -54,47 +56,45 @@ def compute_fused_expert_activations(
     top_k: int,
     act_fn: callable,
 ):
-    """Phase-1 bmm "grouped" (routed-only) activation computation for fused
-    expert layouts (``gate_up_proj`` / ``down_proj`` stacked on dim 0).
+    """Layout-normalized fused expert activations (routed-only).
 
-    Shared by :class:`MoETransformerObserver` and
-    :class:`reap.layerwise_observer.LayerwiseMoEObserver` so the two observers
-    cannot drift apart. This is the bridge implementation replaced by the FREA
-    Triton kernel in the kernels epic (#13).
-
-    Returns ``(activations, selected_experts, router_logits)`` where
-    ``activations[e]`` is non-zero only at positions routed to expert ``e``.
+    Uses F4 weight stacks so Llama4 bmm and Qwen/LFM2 linear layouts both work.
+    Kept for tests / external callers; observers go through :func:`observe_moe_batch`.
     """
-    router = getattr(module, adapter.router_attr())
-    router_logits = router(flat_input)  # (total_tokens, num_experts)
-    # Some routers (Qwen3.5/3.6 ``Qwen3_5MoeTopKRouter``) return a tuple
-    # ``(logits, scores, indices)``; unwrap to the logits tensor. (The logits
-    # are already softmax-normalized there, which is fine: top-k selection is
-    # unchanged and the router-logit similarity merging metric is only used
-    # when ``record_pruning_metrics_only=False``.)
-    if isinstance(router_logits, tuple):
-        router_logits = router_logits[0]
-    _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
-    selected_experts = selected_experts.to(flat_input.device)
-    exps = module.experts
-    gup = exps.gate_up_proj  # (E, 2*I, H): rows [0:I]=gate, [I:2I]=up
-    dp = exps.down_proj        # (E, H, I)
-    inter = gup.shape[1] // 2
-    activations = torch.zeros(
-        (num_experts, *flat_input.shape),
+    from reap.kernels.router import extract_router_logits, f5_router
+    from reap.kernels.weight_cache import get_stacked_expert_weights
+    from reap.kernels.bmm import (
+        routed_expert_activations_grouped,
+        materialize_sparse_activations,
+    )
+
+    router = getattr(module, adapter.router_attr(), None) or getattr(
+        module, "router", None
+    ) or getattr(module, "gate", None)
+    if router is None:
+        raise ValueError("No router on MoE module")
+    router_logits = extract_router_logits(router, flat_input)
+    pairs = f5_router(router_logits, top_k, norm_topk_prob=False)
+    stacked = get_stacked_expert_weights(module, adapter, device=flat_input.device)
+    pair_out = routed_expert_activations_grouped(
+        flat_input,
+        pairs,
+        stacked["W_gate"],
+        stacked["W_up"],
+        stacked["W_down"],
+        act_fn=act_fn,
+    )
+    activations = materialize_sparse_activations(
+        pair_out,
+        pairs.pair_token_idx,
+        pairs.pair_expert_idx,
+        num_experts,
+        flat_input.shape[0],
+        flat_input.shape[1],
         device=flat_input.device,
         dtype=flat_input.dtype,
     )
-    for e in range(num_experts):
-        mask = (selected_experts == e).any(dim=-1)  # (total_tokens,)
-        if not bool(mask.any()):
-            continue
-        xe = flat_input[mask]                       # (n_e, H)
-        g = F.linear(xe, gup[e, :inter])             # (n_e, I) gate
-        u = F.linear(xe, gup[e, inter:])            # (n_e, I) up
-        h = act_fn(g) * u                            # SwiGLU
-        activations[e, mask] = F.linear(h, dp[e])   # (n_e, H) down
-    return activations, selected_experts, router_logits
+    return activations, pairs.selected_experts, router_logits
 
 
 class BaseTransformerObserverHookConfig:
@@ -123,33 +123,24 @@ class BaseTransformerObserver(ABC):
 
     @abstractmethod
     def _hook_factory(self, module: nn.Module, layer_number: int) -> callable:
-        """
-        Factory method to create a hook function for the given module.
-        This method should be implemented by subclasses to define how the
-        hook function should behave.
-        """
         raise NotImplementedError("Subclasses must implement _hook_factory method.")
 
     def report_state(self) -> dict[str, Any]:
-        """
-        Method to report the current state of the observer. Can be overridden to inject
-        custom behaviours.
-        """
         return self.state
 
     def close_hooks(self):
-        """Close all hooks registered to the model."""
-        self.reset()  # Reset the state before closing hooks
+        self.reset()
         for hook in self.hooks:
             hook.remove()
         self.hooks = []
+        free_cache()
         logger.debug("All hooks closed for %s.", self.model.__class__.__name__)
 
     def reset(self):
-        """Reset the observer state."""
         del self.state
         gc.collect()
         self.state = {}
+        free_cache()
         logger.debug("Observer state reset for %s.", self.model.__class__.__name__)
 
     def save_state(self, file_path: str | pathlib.Path):
@@ -164,14 +155,12 @@ class BaseTransformerObserver(ABC):
         logger.info("State saved to %s", file_path)
 
     def _move_state_tensors_to_cpu(self):
-        """
-        Move all tensors in the state dictionary to CPU.
-        This is useful before saving the state to avoid GPU memory issues.
-        """
         for layer_number, layer_state in self.state.items():
             for key, value in layer_state.items():
                 if isinstance(value, torch.Tensor):
                     self.state[layer_number][key] = value.cpu()
+                elif isinstance(value, OnlineStatsTracker):
+                    value.to(torch.device("cpu"))
 
     def _validate_hook_config(self):
         if self.hook_config is None:
@@ -181,16 +170,8 @@ class BaseTransformerObserver(ABC):
             and self.hook_config.module_class_name_to_hook_regex is None
         ):
             raise ValueError(
-                "At least one of 'module_n`ame_to_hook_regex' or "
-                "'module_type_to_hook_regex' must be provided in the hook config."
-            )
-        if (
-            self.hook_config.module_name_to_hook_regex is not None
-            and self.hook_config.module_class_name_to_hook_regex is not None
-        ):
-            logger.warning(
-                "Both 'module_name_to_hook_regex' and 'module_type_to_hook_regex' are "
-                "provided. Both conditions must be satisfied to hook the module."
+                "At least one of 'module_name_to_hook_regex' or "
+                "'module_class_name_to_hook_regex' must be provided in the hook config."
             )
 
     def _hook_model(self):
@@ -219,7 +200,6 @@ class BaseTransformerObserver(ABC):
 
     @classmethod
     def _get_registry_for_cls(cls) -> dict[str, type[BaseTransformerObserver]]:
-        """Helper to get the registry from the specific class 'cls'."""
         if not hasattr(cls, "_architecture_registry") or not isinstance(
             cls._architecture_registry, dict
         ):
@@ -232,16 +212,8 @@ class BaseTransformerObserver(ABC):
 
     @classmethod
     def register_implementation(cls, *arch_names: str):
-        """
-        Class method decorator to register a concrete observer implementation.
-        'cls' is the class on which this decorator's factory is called (e.g.,
-        MoEExpertObserver) 'sub_cls' is the class being decorated
-        (e.g., Llama4MoEExpertObserver).
-        """
-
         def decorator(sub_cls: type[BaseTransformerObserver]):
             registry = cls._get_registry_for_cls()
-
             for name in arch_names:
                 if name in registry:
                     raise RuntimeError(
@@ -263,9 +235,7 @@ class BaseTransformerObserver(ABC):
     ) -> BaseTransformerObserver:
         registry = cls._get_registry_for_cls()
         model_cls_name = model.__class__.__name__
-
         specific_observer_cls = registry.get(model_cls_name)
-
         if specific_observer_cls:
             return specific_observer_cls(
                 model,
@@ -273,17 +243,13 @@ class BaseTransformerObserver(ABC):
                 return_rank_0_only=return_rank_0_only,
                 **kwargs,
             )
-        else:
-            raise ValueError(
-                "Unsupported architecture for "
-                f"{cls.__name__}: {model_cls_name}. "
-                "Registered architectures in "
-                f"{cls.__name__}._architecture_registry: "
-                f"{list(registry.keys())}"
-            )
-
-
-# --- MoE Transformer Observer ---------------------------------------------------------
+        raise ValueError(
+            "Unsupported architecture for "
+            f"{cls.__name__}: {model_cls_name}. "
+            "Registered architectures in "
+            f"{cls.__name__}._architecture_registry: "
+            f"{list(registry.keys())}"
+        )
 
 
 @dataclass
@@ -293,11 +259,12 @@ class MoETransformerObserverConfig(BaseTransformerObserverHookConfig):
     fused_experts: bool = False
     distance_measure: str = "angular"
     renormalize_router_weights: bool = False
-    record_pruning_metrics_only: bool = False
+    record_pruning_metrics_only: bool = True
+    observe_backend: str = "auto"
 
 
 class MoETransformerObserver(BaseTransformerObserver):
-    """MoE Transformer Observer for all methods including both pruning and merging."""
+    """MoE Transformer Observer for pruning and merging metrics."""
 
     def __init__(self, model, hook_config=None, adapter=None):
         self._current_attention_mask: Optional[torch.Tensor] = None
@@ -306,16 +273,6 @@ class MoETransformerObserver(BaseTransformerObserver):
 
     @contextmanager
     def set_attention_mask(self, attention_mask: Optional[torch.Tensor]):
-        """Temporarily set the attention mask for the current forward pass.
-
-        Use this as a context manager around each forward pass when using
-        batched inputs with padding, to ensure padding tokens are excluded
-        from statistics.
-
-        Args:
-            attention_mask: Tensor of shape (batch_size, seq_len) with 1 for real
-                tokens and 0 for padding tokens. Can be None for unbatched inputs.
-        """
         previous_attention_mask = self._current_attention_mask
         self._current_attention_mask = attention_mask
         try:
@@ -324,14 +281,9 @@ class MoETransformerObserver(BaseTransformerObserver):
             self._current_attention_mask = previous_attention_mask
 
     def clear_attention_mask(self):
-        """Clear the attention mask after forward pass."""
         self._current_attention_mask = None
 
     def report_state(self) -> dict[str, Any]:
-        """
-        Method to report the current state of the observer. Can be overridden to inject
-        custom behaviours.
-        """
         return {
             layer_num: {
                 k: v.mean if isinstance(v, OnlineStatsTracker) else v
@@ -340,17 +292,11 @@ class MoETransformerObserver(BaseTransformerObserver):
             for layer_num, layer_state in self.state.items()
         }
 
-    def _initialize_state(self, hidden_dim: int, num_experts: int):
-        # hidden_dim is taken from the hook input (args[0]) rather than the
-        # module output, because some MoE blocks (e.g. Qwen3.5/3.6
-        # ``Qwen3_5MoeSparseMoeBlock``) return a single tensor instead of a
-        # ``(hidden_states, router_logits)`` tuple, so ``output[0]`` is not a
-        # reliable shape source.
-        device = "cpu"
+    def _initialize_state(self, hidden_dim: int, num_experts: int, device=None):
+        device = resolve_compute_device(device)
         layer_state = initialize_pruning_state(num_experts, device=device)
 
         if not self.hook_config.record_pruning_metrics_only:
-            # per routed token normalized states
             layer_state["ttm_similarity_matrix"] = OnlineStatsTracker(
                 shape=(num_experts, num_experts),
                 count_shape=(num_experts, num_experts),
@@ -363,21 +309,18 @@ class MoETransformerObserver(BaseTransformerObserver):
                 device=device,
                 dtype=torch.float32,
             )
-            # HC-SMoE
             layer_state["characteristic_activation"] = OnlineStatsTracker(
                 shape=(num_experts, hidden_dim),
                 count_shape=1,
                 device=device,
                 dtype=torch.float32,
             )
-            # SubMoE
             layer_state["online_characteristic_activation_dist"] = OnlineStatsTracker(
                 shape=(num_experts, num_experts),
                 count_shape=1,
                 device=device,
                 dtype=torch.float32,
             )
-            # per total token normalized states -> MC-SMoE
             layer_state["router_logit_similiarity"] = OnlineStatsTracker(
                 shape=(num_experts, num_experts),
                 count_shape=1,
@@ -388,9 +331,8 @@ class MoETransformerObserver(BaseTransformerObserver):
         return layer_state
 
     def _hook_factory(self, module: nn.Module, layer_number: int) -> callable:
-        distance_fn = get_distance_fn("cosine") # always use cosine for online dist. metrics
+        distance_fn = get_distance_fn("cosine")
 
-        # Read num_experts / top_k from the adapter-driven layer config.
         if self.adapter is None:
             raise RuntimeError(
                 "MoETransformerObserver requires an adapter (pass adapter=...)"
@@ -400,148 +342,108 @@ class MoETransformerObserver(BaseTransformerObserver):
         layer_cfg = self.adapter.get_layer_config(layer, self.model.config)
         num_experts = layer_cfg.num_experts
         top_k = layer_cfg.top_k
+        fused = layer_cfg.fused_experts
+        backend = select_observe_backend(
+            getattr(self.hook_config, "observe_backend", "auto")
+        )
+        act_fn = _resolve_act_fn(self.model.config)
+        compute_routed_ca = not self.hook_config.record_pruning_metrics_only
 
         @torch.no_grad()
         def _hook_fn(module, args, output):
-            input = args[0]  # (batch_size, seq_len, hidden_dim)
+            input = args[0]
             device = input.device
             batch_size, sequence_length, hidden_dim = input.shape
             if layer_number not in self.state:
-                self.state[layer_number] = self._initialize_state(hidden_dim, num_experts)
-            flat_input = input.view(-1, hidden_dim)  # total_seq_len, hidden
+                self.state[layer_number] = self._initialize_state(
+                    hidden_dim, num_experts, device=device
+                )
 
+            flat_input = input.view(-1, hidden_dim)
             attention_mask = self._current_attention_mask
-            if attention_mask is not None:
-                # Flatten mask to match flat_input: (batch_size * seq_len,)
-                flat_mask = attention_mask.view(-1).bool().to(device)
-            else:
-                # No mask provided - treat all tokens as valid
-                flat_mask = None
-
-            if self.hook_config.fused_experts:
-                # Fused experts (Llama4 / LFM2 / Qwen3.5/3.6): per-expert
-                # activations computed from the stacked gate_up_proj / down_proj
-                # weights via the shared helper (Phase-1 bmm "grouped" pattern,
-                # routed-only) -- a bridge until the FREA kernel (docs/kernels/
-                # Phase 3) replaces it.
-                act_fn = _resolve_act_fn(self.model.config)
-                activations, selected_experts, router_logits = (
-                    compute_fused_expert_activations(
-                        module, self.adapter, flat_input, num_experts, top_k, act_fn,
-                    )
-                )
-
-            else:  # loop based MoE execution
-                if not isinstance(output, tuple) or len(output) < 2:
-                    raise ValueError(
-                        f"Expected output of module {module.__class__.__name__} "
-                        f"at layer {layer_number} to be a tuple of at least length "
-                        f"2 for the non-fused (loop) observer path, got "
-                        f"{type(output).__name__}."
-                    )
-                *_, router_logits = output  # (total_tokens, num_experts)
-                _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
-                activations = torch.zeros(
-                    (num_experts, *flat_input.shape),
-                    device=device,
-                    dtype=flat_input.dtype,
-                )
-                for idx, expert in enumerate(module.experts):
-                    activations[idx] = expert(flat_input).to(
-                        device
-                    )  # (num_experts, total_seq_len, hidden_dim)
-
-            del flat_input
-            
-            pruning_batch = update_pruning_state(
-                self.state[layer_number],
-                activations=activations,
-                selected_experts=selected_experts,
-                router_logits=router_logits,
-                num_experts=num_experts,
-                valid_token_mask=flat_mask,
-                renormalize_router_weights=self.hook_config.renormalize_router_weights,
+            flat_mask = (
+                attention_mask.view(-1).bool().to(device)
+                if attention_mask is not None
+                else None
             )
 
-            # Merging critera
+            batch_out = observe_moe_batch(
+                self.state[layer_number],
+                module,
+                self.adapter,
+                flat_input,
+                num_experts=num_experts,
+                top_k=top_k,
+                act_fn=act_fn,
+                valid_token_mask=flat_mask,
+                renormalize_router_weights=self.hook_config.renormalize_router_weights,
+                backend=backend,
+                record_pruning_metrics_only=self.hook_config.record_pruning_metrics_only,
+                compute_routed_ca=compute_routed_ca,
+                fused=fused,
+                batch_size=batch_size,
+                sequence_length=sequence_length,
+            )
+
             if not self.hook_config.record_pruning_metrics_only:
+                activations = batch_out["activations"]
+                selected_experts = batch_out["selected_experts"]
+                router_logits = batch_out["router_logits"]
+                expert_frequency = batch_out["expert_frequency"]
+                pairwise = batch_out["pairwise_expert_frequency"]
+                num_tokens = batch_out["num_tokens"]
+
                 ttm_similarity_matrix = ttm_online(
-                    pruning_batch.activations,
-                    pruning_batch.selected_experts,
+                    activations,
+                    selected_experts,
                     distance_callable=distance_fn,
                     num_experts=num_experts,
-                    pairwise_expert_frequency=pruning_batch.pairwise_expert_frequency,
+                    pairwise_expert_frequency=pairwise,
                 )
-
-                # ttm_similarity_matrix with pairwise frequency counts
                 self.state[layer_number]["ttm_similarity_matrix"].update(
-                    ttm_similarity_matrix, pruning_batch.pairwise_expert_frequency
+                    ttm_similarity_matrix, pairwise
                 )
                 del ttm_similarity_matrix
 
-                routed_characteristic_activation = get_routed_characteristic_activation(
-                    pruning_batch.activations,
-                    pruning_batch.selected_experts,
-                    pruning_batch.expert_frequency,
+                routed_ca = get_routed_characteristic_activation(
+                    activations,
+                    selected_experts,
+                    expert_frequency,
                     device,
                     hidden_dim,
                     num_experts,
                 )
-
-                # routed_characteristic_activation with expert frequency counts
-                expert_freq_expanded = pruning_batch.expert_frequency.unsqueeze(-1).expand(
+                expert_freq_expanded = expert_frequency.unsqueeze(-1).expand(
                     (-1, hidden_dim)
                 )
                 self.state[layer_number]["routed_characteristic_activation"].update(
-                    routed_characteristic_activation, expert_freq_expanded
+                    routed_ca, expert_freq_expanded
                 )
-                del expert_freq_expanded, routed_characteristic_activation
+                del expert_freq_expanded, routed_ca
 
-                online_characteristic_activation_dist = ca_dist_online(
-                    pruning_batch.activations,
-                    distance_callable=distance_fn,
-                ).to(device="cpu")
-
-                # online_characteristic_activation_dist with expert frequency counts
+                online_ca_dist = ca_dist_online(
+                    activations, distance_callable=distance_fn
+                )
                 self.state[layer_number]["online_characteristic_activation_dist"].update(
-                    online_characteristic_activation_dist, pruning_batch.num_tokens
+                    online_ca_dist, num_tokens
                 )
-                del online_characteristic_activation_dist
+                del online_ca_dist
 
-                # router logit similarity -> must align with distance_fn shape expectations
-                # dim 0 "batch" dim, dims 1,2 expert pairwise, dim 3 token logits
-                router_logit_sim = (
-                    distance_fn(
-                        pruning_batch.router_logits.permute(1, 0).view(
-                            1, num_experts, 1, -1
-                        ),  # 1, num_experts, 1, logits
-                        pruning_batch.router_logits.permute(1, 0).view(
-                            1, 1, num_experts, -1
-                        ),  # 1, 1, num_experts, logits
-                    )
-                    .squeeze()
-                    .to(device="cpu")
-                )  # yields (num_experts, num_experts)
-
-                # router_logit_similarity with total tokens count
+                router_logit_sim = distance_fn(
+                    router_logits.permute(1, 0).view(1, num_experts, 1, -1),
+                    router_logits.permute(1, 0).view(1, 1, num_experts, -1),
+                ).squeeze()
                 self.state[layer_number]["router_logit_similiarity"].update(
-                    router_logit_sim, pruning_batch.num_tokens
+                    router_logit_sim, num_tokens
                 )
                 del router_logit_sim
 
-                # characteristic_activation with total tokens count
                 self.state[layer_number]["characteristic_activation"].update(
-                    pruning_batch.activations.mean(dim=1), pruning_batch.num_tokens
+                    activations.mean(dim=1), num_tokens
                 )
 
-            # --- CLEAN UP -------------------------------------------------------------
-            del (
-                activations,
-                selected_experts,
-                router_logits,
-                pruning_batch,
-            )
-            gc.collect()
+            # Keep GPU free of large transients; do not force CPU on metrics.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         return _hook_fn
-
