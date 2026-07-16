@@ -1,128 +1,158 @@
-# REAP Custom Kernels — Design & Implementation Guide
+# REAP Observation Kernels — Current Status & Design
 
-> Parent docs index: [../index.md](../index.md) · Runtime backends:
-> [../gpu-and-backends.md](../gpu-and-backends.md) · Implementation:
-> `src/reap/kernels/`
+> Parent docs: [../index.md](../index.md) · [../setup.md](../setup.md) ·
+> [../gpu-and-backends.md](../gpu-and-backends.md)  
+> Implementation: `src/reap/kernels/`
 
-This directory is the **design reference** for observation acceleration
-(routed expert activation + saliency). Each document is a self-contained
-module following **Separation of Concerns (SoC)**: one phase, one kernel, or
-one cross-cutting topic per file. Files cross-reference rather than
-duplicating content.
+This directory documents the **observation acceleration stack** (routed expert
+activation + saliency). Design history lives in the numbered phase files; this
+README is the **authoritative current status** of the code on `main`.
 
-**Status note:** production code ships a **GPU-resident PyTorch** path
-(grouped bmm / FREA / F2 with optional `torch.compile`). Custom Triton kernel
-bodies remain design targets; correctness does not depend on Triton.
+## Current status (code, not aspiration)
 
-## Why kernels exist
+| Component | Code | Status |
+| --- | --- | --- |
+| **F3** prune-only metrics default | `args.ObserverArgs.record_pruning_metrics_only=True` | **Shipped** + `tests/test_pruning_metrics_only_contract.py` |
+| **F4** weight cache | `kernels/weight_cache.py` | **Shipped** (layout-normalized linear stacks) |
+| **F5** router + pairs | `kernels/router.py` + `triton_softmax.py` | **Shipped** (PyTorch topk/CSR; **Triton** softmax when eligible) |
+| **bmm** grouped routed MLP | `kernels/bmm.py` | **Shipped** — parity oracle / Mac default |
+| **FREA** SwiGLU | `kernels/frea.py` + `triton_frea.py` | **Shipped** (**Triton** `@triton.jit` + PyTorch fallback) |
+| **F2** saliency reduce | `pruning_metrics.update_pruning_state_routed` + `triton_reduce.py` | **Shipped** (**Triton** atomics + PyTorch `index_add_` / Welford) |
+| Unified observe entry | `kernels/observe.py` → `observe_moe_batch` | **Shipped** (both full + layerwise observers) |
+| Backend select | `kernels/backend.py` · CLI `--observe-backend` | **Shipped** (`auto\|loop\|bmm\|frea\|f2`) |
+| Status CLI | `reap kernels` | **Shipped** |
 
-REAP's pruning saliency is computed from **activations of routed experts**
-during a calibration forward pass over a dataset. On a 128- or 256-expert MoE,
-the stock HuggingFace MoE block runs a **Python `for` loop over every expert**
-(`for idx, expert in enumerate(module.experts)`), launching hundreds of small
-matmuls per layer and materializing a full `(E, T, H)` activation tensor — while
-REAP's saliency only depends on the **~6% of `(expert, token)` pairs that are
-routed** (`top_k / E`). The kernels eliminate that loop and that materialization.
+**Triton is real** (`@triton.jit` in `triton_softmax.py`, `triton_frea.py`,
+`triton_reduce.py`). Imports are **lazy** so Mac/CPU installs work without the
+`triton` package. On this machine without CUDA, runtime uses **PyTorch
+fallbacks** (`bmm` path). On EC2 with `uv pip install -e '.[cuda]'`,
+`--observe-backend auto` prefers `f2` and can launch Triton.
 
-## Target hardware & environment
+There is **no** dependency on `torch.compile` for correctness.
 
-| | Dev | EC2 |
+## Package map
+
+```txt
+src/reap/kernels/
+  observe.py           # observe_moe_batch (single entry for both observers)
+  backend.py           # select_observe_backend, triton_status
+  weight_cache.py      # F4
+  router.py            # F5 API (pairs + CSR)
+  bmm.py               # grouped PyTorch FREA math
+  frea.py              # dispatch → Triton or bmm
+  f2.py                # dispatch → update_pruning_state_routed
+  triton_utils.py      # capability detection, REAP_DISABLE_TRITON
+  triton_softmax.py    # F5 Triton softmax
+  triton_frea.py       # FREA Triton SwiGLU
+  triton_reduce.py     # F2 Triton scatter
+```
+
+## How a routed observe step runs
+
+```txt
+flat_input (T, H)
+  → extract_router_logits
+  → F5: softmax (Triton|PyTorch) + topk + sort pairs by expert (CSR)
+  → F4: W_gate/up (E,I,H), W_down (E,H,I)  [linear convention]
+  → FREA: SwiGLU on pairs only (Triton|grouped linear) → (n_pairs, H)
+  → F2: scatter norms/weights (Triton|index_add) + Welford means (always PyTorch)
+```
+
+Default CLI backends:
+
+| `--observe-backend` | Behavior |
+| --- | --- |
+| `auto` | `f2` if Triton **runtime** OK, else `bmm` |
+| `bmm` | Always PyTorch grouped path |
+| `frea` | Try Triton FREA; fallback bmm |
+| `f2` | Try Triton FREA + reduce; fallback PyTorch |
+| `loop` | Legacy dense/loop path (parity) |
+
+```bash
+reap kernels                          # print Triton readiness
+export REAP_DISABLE_TRITON=1          # force PyTorch
+reap prune layerwise --observe-backend bmm ...
+```
+
+### Triton eligibility (gates)
+
+| Kernel | Needs |
+| --- | --- |
+| Softmax | CUDA + triton package; `E ≤ 1024` for single-tile path |
+| FREA | CUDA + triton; SiLU; `H ≥ 16` and `I ≥ 16`; weights on CUDA |
+| F2 reduce | CUDA + triton; typically `H ≥ 16` for Triton path |
+| Always | On failure → PyTorch (debug log `Triton … fallback`) |
+
+Tiny unit-test models (H=8) **intentionally** stay on PyTorch.
+
+## Expected impact (projections vs loop baseline)
+
+Reference: Qwen3-30B-A3B-class (E=128, top_k=8, H=2048, I=768, T=8192).
+Wall-clock is **projected** until measured on EC2 (`08-expected-improvements.md`).
+
+| Stage | Expert FLOPs vs loop | Peak act mem vs ~8.6 GB `(E,T,H)` | Observe wall-clock (proj.) |
+| --- | --- | --- | --- |
+| F4 | ~same | +~1.2 GB weight cache (temporary) | ~1× alone |
+| F5 | n/a (router) | MB-scale pairs | small absolute; enables CSR |
+| **bmm** | **~16× less** | **GB → ~MB** | **~10–15×** |
+| **FREA Triton** | same as bmm | same as bmm | **~15–25×** vs loop; modest over bmm |
+| **F2** | n/a | no big act re-read | helps total **~20–30×** vs loop |
+
+Does **not** speed up: original HF forward (attention + MoE still run), prune
+topk/save, clustering. Observer still **recomputes** experts for metrics
+(double expert work vs invasive fusion).
+
+## Document index (phase design + history)
+
+Numbered docs are design notes. Prefer this README + code for “what runs today.”
+Stale line numbers in old snippets may not match `main`; trust `src/reap/kernels/`.
+
+| Doc | Phase | Concern | Status vs code |
+| --- | --- | --- | --- |
+| [00-cost-model.md](00-cost-model.md) | — | Loop baseline costs | **Historical baseline** (loop path still available via `--observe-backend loop`) |
+| [01-f3-dead-metric-audit.md](01-f3-dead-metric-audit.md) | 0 | Prune-only metrics contract | **Landed** (default `True` + contract tests) |
+| [02-bmm-baseline.md](02-bmm-baseline.md) | 1 | Grouped routed PyTorch | **Landed** as `bmm.py` (grouped form, not naive weight-gather) |
+| [03-f5-router-fusion.md](03-f5-router-fusion.md) | 2 | Softmax + topk + pairs | **Landed** (`router.py` + Triton softmax) |
+| [04-frea-kernel.md](04-frea-kernel.md) | 3 | Routed SwiGLU | **Landed** (`triton_frea.py` + bmm fallback) |
+| [05-f2-saliency-accumulator.md](05-f2-saliency-accumulator.md) | 4 | Saliency reduce | **Landed** (pair scatter + Welford; not full in-kernel Welford) |
+| [06-f4-weight-stacking.md](06-f4-weight-stacking.md) | 5 | Weight cache | **Landed** (`weight_cache.py`, linear + bmm layouts) |
+| [07-validation-strategy.md](07-validation-strategy.md) | — | Tests | **Partial** — see tests list below |
+| [08-expected-improvements.md](08-expected-improvements.md) | — | Perf projections | Reference (unmeasured wall-clock) |
+
+## Tests (actual files)
+
+| Test | What |
+| --- | --- |
+| `tests/test_pruning_metrics_only_contract.py` | F3 contract |
+| `tests/test_kernel_parity_bmm.py` | loop vs bmm/frea metrics on tiny Qwen3 |
+| `tests/test_f4_weight_cache.py` | F4 shapes / Llama transpose |
+| `tests/test_triton_kernels.py` | softmax/F5/FREA/reduce; CUDA cases `@requires_triton` |
+| `tests/test_cli.py` | includes `reap kernels` |
+
+```bash
+uv run pytest tests/test_triton_kernels.py tests/test_kernel_parity_bmm.py -q
+uv run reap kernels
+```
+
+## Fallback discipline
+
+Never call a Triton kernel without a PyTorch path. Dispatch helpers:
+
+- `triton_utils.triton_runtime_available()` / `prefer_triton_for(tensor)`
+- `select_observe_backend(...)`
+- Per-kernel try/except → `log_triton_fallback(...)`
+
+## Environment
+
+| | Dev (Apple Silicon) | EC2 |
 |---|---|---|
-| Machine | Apple Silicon (M-series) | `g6e.2xlarge` |
-| GPU | MPS (no CUDA, no Triton) | NVIDIA L40S, sm_89, 46 GB |
-| What runs | pure-PyTorch fallbacks, parity tests | Triton kernels, benchmarks |
-| Repo venv | `.venv` (python 3.12, torch 2.7.1, transformers 4.55) | same |
+| GPU | MPS / CPU — **no Triton launch** | NVIDIA CUDA + optional Triton |
+| What runs | `bmm` / loop, parity tests | `auto`→`f2`, Triton when eligible |
+| Install | `uv pip install -e .` | `uv pip install -e '.[cuda]'` |
+| transformers | `>=5.5` (fused Qwen default) | same |
 
-Every Triton kernel ships with a **pure-PyTorch fallback** (selected when
-`torch.cuda.is_available()` is false or `triton` is unavailable) so the whole
-pipeline stays runnable on the Mac for control-flow and parity, and only the
-fast path is gated to EC2.
+## Related
 
-## Reference model
-
-Concrete numbers throughout this guide use **Qwen3-30B-A3B** (the realistic
-single-L40S target):
-
-| Config | Value |
-|---|---|
-| `num_hidden_layers` | 48 |
-| `num_experts` (E) | 128 |
-| `num_experts_per_tok` (top_k) | 8 |
-| `hidden_size` (H) | 2048 |
-| `moe_intermediate_size` (I) | 768 |
-| routed fraction (top_k / E) | 6.25 % |
-
-256-expert variants (Qwen3.5/3.6 large) are called out where the factor changes.
-
-## Document index
-
-| Doc | Phase | Concern | Status |
-|---|---|---|---|
-| [`00-cost-model.md`](00-cost-model.md) | — | The current bottleneck: quantified | reference (partially historical) |
-| [`01-f3-dead-metric-audit.md`](01-f3-dead-metric-audit.md) | 0 | Prerequisite contract: prune consumes routed-only metrics | **landed** (`record_pruning_metrics_only=True` default + contract tests) |
-| [`02-bmm-baseline.md`](02-bmm-baseline.md) | 1 | Pure-PyTorch bmm baseline (parity oracle, MPS-runnable) | **landed** (`reap.kernels.bmm` / `--observe_backend bmm`) |
-| [`03-f5-router-fusion.md`](03-f5-router-fusion.md) | 2 | Fused router softmax + topk + gather-index builder | **landed** (`reap.kernels.router`) |
-| [`04-frea-kernel.md`](04-frea-kernel.md) | 3 | FREA: fused routed expert activation (headline kernel) | **landed** (PyTorch + `torch.compile` on CUDA; `--observe_backend frea`) |
-| [`05-f2-saliency-accumulator.md`](05-f2-saliency-accumulator.md) | 4 | F2: fused online saliency accumulator (all consumed metrics) | **landed** (`update_pruning_state_routed` / `--observe_backend f2`) |
-| [`06-f4-weight-stacking.md`](06-f4-weight-stacking.md) | 5 | F4: expert weight pre-stacking cache | **landed** (`reap.kernels.weight_cache`, layout-normalized) |
-| [`07-validation-strategy.md`](07-validation-strategy.md) | — | Parity + benchmark harness | **partial** (parity tests in `tests/test_kernel_parity_*.py`) |
-| [`08-expected-improvements.md`](08-expected-improvements.md) | — | Performance & memory projections | reference |
-
-Implementation package: `src/reap/kernels/`.
-
-## Phase dependency graph
-
-```
-            ┌─────────────────────────────────────────────┐
-            │  Phase 0 — F3 dead-metric audit + default     │
-            │  (makes "routed-only" load-bearing)           │
-            └──────────────────────┬──────────────────────┘
-                                   │ unlocks (proves correctness contract)
-                                   ▼
-            ┌─────────────────────────────────────────────┐
-            │  Phase 1 — bmm baseline (parity oracle)       │
-            │  pure PyTorch, runs on MPS                    │
-            └──────────────────────┬──────────────────────┘
-                                   │ reference for every Triton kernel
-            ┌──────────────────────┴──────────────────────┐
-            ▼                                               ▼
- ┌────────────────────┐                         ┌────────────────────────┐
- │ Phase 5 — F4       │                         │ Phase 2 — F5 router    │
- │ weight stacking    │                         │ softmax+topk+gather    │
- │ (feeds FREA tiles) │                         └───────────┬────────────┘
- └─────────┬──────────┘                                       │
-           │                                                  ▼
-           │                                    ┌────────────────────────┐
-           └─────────────►─────────────────────►│ Phase 3 — FREA          │
-                                                │ fused routed activation │
-                                                └───────────┬────────────┘
-                                                            │
-                                                            ▼
-                                                ┌────────────────────────┐
-                                                │ Phase 4 — F2           │
-                                                │ fused saliency accum.  │
-                                                └────────────────────────┘
-```
-
-Phases 2–4 are **CUDA/Triton-gated** (no Mac execution); Phase 1 is the
-Mac-runnable oracle they must match.
-
-## Tracking
-
-Implementation is tracked in GitHub issue
-[`#13`](https://github.com/egesabanci/reap-cuda/issues/13) (epic). Prerequisite
-issues: [`#4`](https://github.com/egesabanci/reap-cuda/issues/4) (fused
-Qwen3.5/3.6 support), [`#3`](https://github.com/egesabanci/reap-cuda/issues/3)
-(layerwise merge path).
-
-## Conventions
-
-- **Line references** use the format `src/reap/<file>.py:<line>`. They are
-  accurate against `main` at the time of writing (commit `5ba965e`); re-resolve
-  with `git grep` before editing.
-- **Parity contract**: a kernel is correct iff its per-layer output state
-  matches the bmm baseline (Phase 1) **bit-for-bit** (within fp32 accumulation
-  tolerance) on a tiny `Qwen3MoeForCausalLM`. See `07-validation-strategy.md`.
-- **Fallback discipline**: every kernel site calls a `_select_backend()` helper
-  that returns `"triton"`, `"bmm"`, or `"loop"` based on capability. Never call
-  a Triton kernel directly without the fallback.
+- User setup: [../setup.md](../setup.md)
+- Runtime backends: [../gpu-and-backends.md](../gpu-and-backends.md)
+- Metrics keys: [../observation-and-metrics.md](../observation-and-metrics.md)
