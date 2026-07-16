@@ -230,7 +230,7 @@ def test_estimate_frea_shared_bytes_known_shape():
 
 
 def test_choose_frea_blocks_respects_tight_shared_mem(monkeypatch):
-    # Simulate L4-like 99 KiB default (and opt-in) limit
+    # Simulate L4 opt-in budget (99 KiB); default on L4 is 48 KiB, opt-in 99 KiB
     def _smem(device=None, prefer_optin=False):
         return 101376
 
