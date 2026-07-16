@@ -276,12 +276,15 @@ def smoke_test(model: torch.nn.Module, tokenizer: AutoTokenizer):
         return_tensors="pt",
         add_generation_prompt=True,
         tokenize=True,
+        return_dict=True,
         # enable_thinking=False,
-    ).to(model.device)
+    )
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
     outputs = model.generate(
-        inputs,
+        **inputs,
         max_new_tokens=50,
         do_sample=True,
+        pad_token_id=tokenizer.pad_token_id,
     )
     response = tokenizer.batch_decode(outputs, skip_special_tokens=False)
     logger.info("Smoke test response: %s", response[0])
