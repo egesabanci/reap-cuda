@@ -12,7 +12,7 @@ the end.
 | `uv` (recommended) | Or plain `pip` |
 | **Dev (Mac / CPU)** | Unit tests + CLI help; no NVIDIA kernels |
 | **EC2 / NVIDIA GPU** | Real MoE runs; Triton optional via `[cuda]` extra |
-| Disk / network | HuggingFace model + calibration dataset on first run |
+| Disk / network | HuggingFace model + calibration data (or local `--dataset-path` offline) |
 
 Versions pinned in `pyproject.toml`: `torch>=2.10,<2.15`, `transformers>=5.5,<6`, `datasets>=3.6,<4`.
 
@@ -210,6 +210,25 @@ uv run reap prune full \
 
 Full policy: [residency.md](residency.md).
 
+### Offline / air-gapped calibration
+
+`--dataset` is still the **processor id** (column mapping). Point
+`--dataset-path` at a local arrow/json/dir (or use composite `name:N@/path`).
+With `HF_HUB_OFFLINE=1`, hub loads fail with a path hint unless you pass a
+local path.
+
+```bash
+uv run reap prune full \
+  -m /data/models/LFM2-8B-A1B \
+  -d theblackcat102/evol-codealpaca-v1 \
+  --dataset-path /data/datasets/evol-codealpaca-calib-200 \
+  --artifacts-dir /data/reap-artifacts \
+  --residency gpu_full \
+  --batches-per-category 8 --batch-size 1
+```
+
+Details: [calibration.md](calibration.md).
+
 ### Prune (layerwise — single GPU)
 
 ```bash
@@ -259,8 +278,9 @@ uv run pytest tests/test_triton_kernels.py tests/test_kernel_parity_bmm.py -q
 # On CUDA host: also runs @requires_triton cases
 uv run pytest tests/test_triton_kernels.py -q
 
-# Weight residency + EC2-findings hermetic suite + CLI
-uv run pytest tests/test_residency.py tests/test_run_findings_fixes.py tests/test_cli.py -q
+# Weight residency + EC2-findings + offline data + CLI
+uv run pytest tests/test_residency.py tests/test_run_findings_fixes.py \
+  tests/test_dataset_loading.py tests/test_cli.py -q
 ```
 
 ## 8. Doc map (everything else)
@@ -270,6 +290,7 @@ uv run pytest tests/test_residency.py tests/test_run_findings_fixes.py tests/tes
 | Module map & invariants | [architecture.md](architecture.md) |
 | FREA probe / L4 throughput | [frea-throughput.md](frea-throughput.md) |
 | Phase-by-phase prune/merge | [pipeline.md](pipeline.md) |
+| **Calibration / offline datasets** | **[calibration.md](calibration.md)** |
 | **Weight residency / low-RAM hosts** | **[residency.md](residency.md)** |
 | Backends + activation device policy | [gpu-and-backends.md](gpu-and-backends.md) |
 | Kernel **design** (SoC phases) | [kernels/README.md](kernels/README.md) |

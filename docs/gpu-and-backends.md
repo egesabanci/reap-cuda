@@ -158,7 +158,8 @@ reap prune full \
 
 - [frea-throughput.md](frea-throughput.md) — probe, tiles, env vars
 - [residency.md](residency.md) — weight load/save
+- [calibration.md](calibration.md) — offline `--dataset-path`, composite specs
 - [kernels/README.md](kernels/README.md)
 - [observation-and-metrics.md](observation-and-metrics.md)
 - [layerwise.md](layerwise.md)
-- Field reports: `run-findings.md`, `run-findings-2.md` (repo root)
+- Field reports: `run-findings.md` … `run-findings-4.md` (repo root)

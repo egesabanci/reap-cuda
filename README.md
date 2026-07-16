@@ -269,11 +269,16 @@ Legacy scripts (`reap-prune`, `reap-layerwise`, `reap-merge`,
 
 | Mode | Example |
 | --- | --- |
-| Single dataset | `--dataset theblackcat102/evol-codealpaca-v1` |
-| Composite | `--dataset "ds_a:64,ds_b[code]:64"` |
+| Single (hub) | `--dataset theblackcat102/evol-codealpaca-v1` |
+| Offline local | `--dataset theblackcat102/evol-codealpaca-v1 --dataset-path /data/…` |
+| Composite | `--dataset "ds_a:64,ds_b[code]:64"` (`:N` = **batch** count) |
+| Composite offline | `name:N@/local/path` and/or shared `--dataset-path` root |
 | Cached observations | `--dataset combined` (requires prior `.pt`) |
 
-See [docs/calibration.md](docs/calibration.md).
+`--dataset` always selects the **field-mapping processor** (columns must match);
+`--dataset-path` only chooses the files. Offline env vars
+`HF_HUB_OFFLINE` / `HF_DATASETS_OFFLINE` need a local path or they fail with a
+hint. Full rules: [docs/calibration.md](docs/calibration.md).
 
 ## Technical Docs
 

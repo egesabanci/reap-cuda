@@ -34,7 +34,7 @@ and bounce forever.
 | 0. Residency | Resolve / preflight / maybe delegate to layerwise | `residency` |
 | 1. Setup | Seed, create `artifacts/<model>/<dataset>/` | `pipeline.create_results_directory` |
 | 2. Load | `load_causal_lm` with `plan_load(gpu_full|cpu_full)` | `residency`, transformers / accelerate |
-| 3. Calibrate | Tokenized batches from HF (or composite / combined cache) | `data`, `pipeline.record_activations` |
+| 3. Calibrate | Tokenized batches from HF hub, `--dataset-path`, composite (`load_composite_category_batches`), or `combined` cache | `data`, `pipeline.record_activations` |
 | 4. Observe | Forward hooks on every MoE block; saliency on GPU | `observer`, `kernels.observe` |
 | 5. Persist stats | Optional `.pt` under category dirs | `observer.save_state` |
 | 6. Rank | Per-layer lowest saliency → experts to drop | `prune._resolve_saliency` |
@@ -130,6 +130,7 @@ artifacts/
 
 ## Related
 
+- [calibration.md](calibration.md) — datasets, offline path, composite specs
 - [residency.md](residency.md)
 - [observation-and-metrics.md](observation-and-metrics.md)
 - [pruning.md](pruning.md)

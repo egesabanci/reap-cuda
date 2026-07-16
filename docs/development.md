@@ -31,7 +31,8 @@ Hermetic suite (no Hub downloads):
 | Kernels / contract | `test_kernel_parity_bmm.py`, `test_pruning_metrics_only_contract.py`, `test_f4_weight_cache.py`, `test_triton_kernels.py` |
 | Weight residency | `test_residency.py` (heuristics, plans, stream_save, delegation) |
 | EC2 run-findings | `test_run_findings_fixes.py` (router, F4 bound, FREA tiles, probe CLI, smoke, artifacts) |
-| CLI | `test_cli.py` (mocked pipelines; residency / frea-backend wiring) |
+| Dataset / offline | `test_dataset_loading.py` (composite `@path`, columns, offline guards, path threading) |
+| CLI | `test_cli.py` (mocked pipelines; residency / frea-backend / dataset-path wiring) |
 
 ## Project layout (src)
 
@@ -84,6 +85,13 @@ docs/residency.md
 3. Always leave a correct PyTorch fallback
 4. Document ops in `docs/frea-throughput.md` and update `gpu-and-backends.md`
 5. Extend `tests/test_run_findings_fixes.py` / `test_triton_kernels.py`
+
+### New calibration dataset
+
+1. Processor class in `data.py` + `DATASET_REGISTRY`
+2. Optional `_PROCESSOR_REQUIRED_COLUMNS` for offline column checks
+3. Hermetic test in `tests/test_dataset_loading.py` if field map is non-trivial
+4. Document in `docs/calibration.md`
 
 ## Coding conventions
 

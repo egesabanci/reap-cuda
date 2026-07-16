@@ -49,7 +49,7 @@ critical on low host-RAM instances (e.g. g6.xlarge). See [residency.md](residenc
 | [Architecture](architecture.md) | Module boundaries, data flow, invariants |
 | [Pipeline](pipeline.md) | End-to-end prune and merge execution phases |
 | [Model Adapters](model-adapters.md) | Supported families, layout detection, slicing contract |
-| [Calibration](calibration.md) | Datasets, composite specs, local `--dataset-path` |
+| [Calibration](calibration.md) | Datasets, composite `@path`, offline path, batch counts |
 | [Observation and Metrics](observation-and-metrics.md) | Observers, saliency state, prune vs merge metrics |
 | [GPU and Backends](gpu-and-backends.md) | Activation/device policy, observe backends, F4/F5/FREA/F2 |
 | [**FREA Throughput**](frea-throughput.md) | `--frea-backend`, probe, L4 SM erratum (48/99 KiB), run 3–4 |

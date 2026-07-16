@@ -59,7 +59,8 @@ Typer / HfArgumentParser
   -> resolve_residency / preflight; maybe delegate to layerwise_prune
   -> create_results_directory(artifacts/<model>/<dataset>/)
   -> load_causal_lm(plan_load(gpu_full|cpu_full)) + tokenizer
-  -> load_category_batches / composite dataset
+  -> load_category_batches / load_composite_category_batches
+       (hub | --dataset-path | composite @path)
   -> MoETransformerObserver hooks
        for each batch: model(**batch)
          hook -> observe_moe_batch (backend)

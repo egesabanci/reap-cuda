@@ -93,19 +93,28 @@ reap prune full --frea-backend triton    # experiment / big-SM GPUs
 
 Full story + L4 SM erratum: [frea-throughput.md](frea-throughput.md).
 
-### `--dataset-path` / `--artifacts-dir`
+### `--dataset` / `--dataset-path` / `--artifacts-dir`
 
 | Flag | Meaning |
 | --- | --- |
-| `--dataset-path PATH` | Local arrow/json/jsonl/dir; offline load. `--dataset` still selects the field-mapping processor. |
-| `--artifacts-dir PATH` | Root for pruned/merged models and observations (else `REAP_ARTIFACTS_DIR` / `./artifacts`). |
+| `--dataset` / `-d` | Hub id, composite `name:N_batches,...` (optional `@path`), or `combined` |
+| `--dataset-path PATH` | Offline arrow/json/dir. **Processor is still `--dataset`** (must match columns). Composite: `@path` per component or `{path}/<short_name>` |
+| `--artifacts-dir PATH` | Root for pruned/merged models and observations (else `REAP_ARTIFACTS_DIR` / `./artifacts`) |
+
+Composite trailing `N` is a **batch count**, not sample count.
 
 ```bash
 reap prune full \
   -d theblackcat102/evol-codealpaca-v1 \
   --dataset-path /data/datasets/evol-codealpaca-calib-200 \
   --artifacts-dir /data/reap-artifacts
+
+# Composite offline
+reap prune full \
+  -d "theblackcat102/evol-codealpaca-v1:64@/data/evol,open-r1/Mixture-of-Thoughts[code]:32@/data/mot"
 ```
+
+Full data rules: [calibration.md](calibration.md).
 
 ### `--residency` (all prune/merge subcommands)
 
