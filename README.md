@@ -225,9 +225,9 @@ Full policy, heuristics, delegation (full↔layerwise), and env knobs:
 
 | `--frea-backend` | Role |
 | --- | --- |
-| `auto` | Probe Triton vs cuBLAS once per shape; keep winner (default) |
-| `triton` | Force Triton tiles when shared mem allows |
-| `pytorch` | Force cuBLAS grouped path (often best throughput on L4/T4) |
+| `auto` | Probe Triton vs cuBLAS once per shape; keep winner (default; L4 → pytorch) |
+| `triton` | Force Triton when tiles fit (L4 max often 128×64, not 128×128) |
+| `pytorch` | Force cuBLAS grouped path (usually best throughput on L4/T4) |
 
 ```bash
 reap prune layerwise --observe-backend bmm ...

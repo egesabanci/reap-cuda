@@ -1,5 +1,9 @@
 # Run Findings — REAP prune on LiquidAI/LFM2.5-8B-A1B
 
+> **Later errata:** L4 shared mem is **48 KiB default / 99 KiB opt-in** (not 99/164).
+> Probe + four-run synthesis: `run-findings-3.md`, `run-findings-4.md`,
+> `docs/frea-throughput.md`.
+
 End-to-end instrumented prune run on the LFM2.5-8B-A1B MoE with the REAP CUDA
 codebase, plus every issue, gap, and kernel problem surfaced during testing.
 

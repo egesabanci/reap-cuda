@@ -1,9 +1,11 @@
 # FREA Throughput vs Memory
 
-Operational guide for the **FREA** (fused routed expert activation) stage after
-the LFM2.5 + L4 EC2 runs. Complements the design notes in
-[kernels/04-frea-kernel.md](kernels/04-frea-kernel.md) and the device policy in
+Operational guide for the **FREA** (fused routed expert activation) stage.
+Complements [kernels/04-frea-kernel.md](kernels/04-frea-kernel.md) and
 [gpu-and-backends.md](gpu-and-backends.md).
+
+Grounded in four instrumented LFM2.5-8B-A1B runs on an **NVIDIA L4**
+(`run-findings.md` … `run-findings-4.md`).
 
 ## Two orthogonal knobs
 
@@ -12,12 +14,8 @@ the LFM2.5 + L4 EC2 runs. Complements the design notes in
 | `--observe-backend` | Coarse path: `loop` / `bmm` / `frea` / `f2` / `auto` | [gpu-and-backends.md](gpu-and-backends.md) |
 | **`--frea-backend`** | **Which FREA implementation** when the coarse path uses FREA | this page |
 
-When `--observe-backend` is `bmm` or `loop`, FREA is not used (or only as part
-of a non-Triton path). When it is `auto` / `frea` / `f2`, FREA runs under:
-
 ```bash
 --frea-backend auto|triton|pytorch   # default: auto
-# or
 export REAP_FREA_BACKEND=auto|triton|pytorch
 ```
 
@@ -25,9 +23,9 @@ export REAP_FREA_BACKEND=auto|triton|pytorch
 
 | Mode | Behavior |
 | --- | --- |
-| **`auto` (default)** | One-shot **profitability probe**: warm-up then time Triton vs cuBLAS grouped PyTorch on the first dense batch for this `(device, H, I)`. Memoize the winner for the process. Tiny batches (`n_pairs < 16`) use PyTorch **without** memoizing so a later dense batch can still probe. |
-| **`triton`** | Always try the Triton SwiGLU kernel when tiles fit shared memory; fall back to PyTorch only on unsupported shapes / launch failure. |
-| **`pytorch`** | Always use `routed_expert_activations_grouped` (per-expert `F.linear` / cuBLAS). Max throughput on many L4/T4-class GPUs. |
+| **`auto` (default)** | One-shot **profitability probe**: warm-up then time Triton vs cuBLAS grouped PyTorch on the first dense batch for `(device, H, I)`. Memoize the winner. Tiny batches (`n_pairs < 16`) use PyTorch **without** memoizing so a later dense batch can still probe. |
+| **`triton`** | Always try Triton when tiles fit shared memory; fall back only on unsupported shapes / launch failure. |
+| **`pytorch`** | Always `routed_expert_activations_grouped` (per-expert `F.linear` / cuBLAS). Often max throughput on L4/T4. |
 
 ### Static tile floor (no probe)
 
@@ -35,84 +33,124 @@ export REAP_FREA_BACKEND=auto|triton|pytorch
 export REAP_FREA_PROBE=0   # with --frea-backend auto
 ```
 
-If the largest tiles that fit are below `128` on **both** H and I, treat Triton
-as unprofitable and use PyTorch. Prefer the empirical probe (default) over this
-heuristic on mixed hardware.
+If the largest tiles that fit have **both** `BLOCK_H` and `BLOCK_I` below 128,
+treat Triton as unprofitable and use PyTorch. Prefer the empirical probe on
+mixed hardware.
 
-## Why this exists (L4 lesson)
+## Shared-memory limits (measured, not guessed)
 
-On NVIDIA L4 (~99 KiB default shared mem / block):
+Code queries `torch.cuda.get_device_properties` — never hardcodes SKUs. Typical
+values from EC2 runs:
 
-1. Natural **128×128** FREA tiles need ~136 KiB → launch failed → PyTorch fallback
-   (fast cuBLAS) → observe ~**949 tok/s**.
-2. After auto-tiling, Triton **launched** with smaller tiles → correct, less peak
-   VRAM (~0.75 GiB), but **~2.3× slower** observe (~415 tok/s) because many more
-   tile iterations beat fusion gains.
-3. Feasibility alone is not profitability. **`auto` probe** picks the faster
-   path per host/shape without hardcoding SKUs.
+| GPU class | Default `shared_memory_per_block` | Opt-in `shared_memory_per_block_optin` | 128×128 FREA (~140 KiB)? |
+| --- | ---: | ---: | --- |
+| **L4 / T4-class (AD104)** | **48 KiB** (49 152 B) | **99 KiB** (101 376 B) | **No** — opt-in max is 99 KiB |
+| **A100 / L40S-class** | larger default | often **~164 KiB** | **Yes**, via opt-in when needed |
 
-On large-SM GPUs (or with opt-in ~164 KiB), 128×128 can fit and Triton often
-wins on both speed and memory.
+> **Erratum:** Earlier notes (and closed issue #28 title) said “L4 ≈ 99 KiB
+> default / 164 KiB opt-in.” That is **wrong for L4**. Correct: **48 KiB
+> default / 99 KiB opt-in**. The 164 KiB opt-in is for A100/L40S-class dies, not
+> consumer AD104. See `run-findings-4.md` §3 and the erratum comment on #28.
 
-## Shared-memory tiles (hardware-agnostic)
+`estimate_frea_shared_bytes(16, 128, 128) ≈ 143 360 B (~140 KiB)` → cannot fit
+on L4 even with full opt-in.
+
+### What opt-in still does on L4
+
+With opt-in, `choose_frea_block_sizes(h=2048, i=1792)` typically returns
+**(128, 64, 16)** instead of **(128, 32, 16)** under the 48 KiB default — larger
+I-tile, fewer I-loop iterations. Triton opts into dynamic SM automatically
+(`cudaFuncSetAttribute` via the launcher); no explicit user code is required.
+
+Measured (forced `--frea-backend triton` on L4, LFM2.5 shapes):
+
+| Tiles | Observe | Throughput |
+| --- | ---: | ---: |
+| ~128×32 (pre-opt-in era) | 98 s | 415 tok/s |
+| **128×64 (opt-in)** | **74 s** | **550 tok/s** (+33% Triton-side) |
+| PyTorch (probe default) | **40 s** | **1 022 tok/s** |
+
+So opt-in **helps Triton on L4** but **does not beat cuBLAS**. On A100/L40S,
+128×128 can fit and the probe should be re-evaluated.
+
+## Why the probe exists (four-run summary)
+
+Same model/calib on L4 (LFM2.5-8B-A1B, 100 examples, 0.5 prune, `gpu_full`):
+
+| Run | FREA path | Observe | Peak GPU | Note |
+| --- | --- | ---: | ---: | --- |
+| 1 | PyTorch (Triton failed to launch) | 43 s / 949 tok/s | 17.0 GiB | F4 cache leak era |
+| 2 | Triton (small tiles) | 98 s / 415 tok/s | 16.3 GiB | Feasible but slow |
+| **3** | **Probe → PyTorch** | **40 s / 1 022 tok/s** | **16.3 GiB** | **Default after #24–#32** |
+| 4 | Force Triton + opt-in 128×64 | 74 s / 550 tok/s | 16.3 GiB | Proves probe correct |
+
+Memory win (~0.75 GiB vs run 1) is from **F4 single-entry cache**, not from
+running FREA on Triton.
+
+Probe line (run 3):
+
+```text
+INFO FREA profitability probe: triton=0.0481s pytorch=0.0062s -> pytorch (reason=ok)
+```
+
+## Shared-memory tile selection (code)
 
 Implementation: `choose_frea_block_sizes` in `triton_frea.py`.
 
-1. Query `shared_memory_per_block` and, when useful,
-   `shared_memory_per_block_optin` (Ampere/Ada ~164 KiB).
-2. Walk candidates `(128, 64, 32, 16)` for `BLOCK_H` / `BLOCK_I` until the
-   estimate fits (plus a small safety margin).
-3. On launch `out of resource: shared memory`, disable opt-in and retry once;
-   permanent disable memo avoids re-attempting a doomed config thousands of times.
+1. Prefer **opt-in** budget when larger than default; else default.
+2. Walk `(128, 64, 32, 16)` for `BLOCK_H` / `BLOCK_I` until estimate fits
+   (+ safety margin).
+3. Optional larger `BLOCK_N` when H/I tiles are small, re-checked against SM.
+4. On launch SM OOM: set `_USE_SMEM_OPTIN=False`, retry with default budget;
+   permanent disable memo for hard failures.
 
-**“Tile fit”** = chosen block sizes fit this GPU’s per-block shared memory so the
-kernel can launch. See also the FREA design doc.
+**“Tile fit”** = chosen block sizes fit this GPU’s per-block shared-memory
+limit so the kernel can launch.
 
 ## Observability
 
-At end of observe (full and layerwise):
-
 ```text
 INFO Triton usage summary: frea: N Triton / M PyTorch; f2_reduce: …
+INFO FREA profitability probe: triton=…s pytorch=…s -> pytorch|triton
 ```
 
-First fallback per component is **WARNING**; further at DEBUG.  
-`reap kernels` only shows package/runtime readiness — use the run summary for
+First fallback per component: **WARNING**; further at DEBUG.  
+`reap kernels` = package/runtime readiness only — use the run summary for
 “did FREA actually run?”
-
-Probe log line:
-
-```text
-INFO FREA profitability probe: triton=0.0123s pytorch=0.0056s -> pytorch (reason=ok)
-```
 
 ## Recommended settings
 
-| Goal | Suggested flags |
+| Goal | Flags |
 | --- | --- |
 | Default / mixed hosts | `--observe-backend auto --frea-backend auto` |
-| Max observe throughput on L4/T4 | `--frea-backend pytorch` |
-| Force Triton / min intermediate memory | `--frea-backend triton` |
-| Bring-up without Triton | `--observe-backend bmm` |
-| Offline calib + big disk | `--dataset-path … --artifacts-dir …` ([cli.md](cli.md)) |
+| Max observe throughput on L4/T4 | `--frea-backend pytorch` (or trust `auto`) |
+| Force Triton (debug / A100 experiment) | `--frea-backend triton` |
+| Bring-up without Triton at all | `--observe-backend bmm` |
+| Offline + big disk | `--dataset-path … --artifacts-dir …` |
 
 ## Env vars
 
 | Variable | Role |
 | --- | --- |
-| `REAP_FREA_BACKEND` | Same as `--frea-backend` (overrides process default if set) |
-| `REAP_FREA_PROBE` | `0` / `false` → disable empirical probe; use tile-floor heuristic under `auto` |
-| `REAP_DISABLE_TRITON` | Disable all Triton kernels (softmax / FREA / F2) |
+| `REAP_FREA_BACKEND` | Same as `--frea-backend` |
+| `REAP_FREA_PROBE` | `0` / `false` → static tile-floor under `auto` (no timing) |
+| `REAP_DISABLE_TRITON` | Disable all Triton (softmax / FREA / F2) |
 | `REAP_OBSERVE_BACKEND` | Coarse backend if CLI omits `--observe-backend` |
 
-## Field reports
+## Field reports (repo root)
 
-- `run-findings.md` — first LFM2.5 run (FREA silent fallback, F4 OOM, router)
-- `run-findings-2.md` — post-fix re-run (full Triton, throughput/memory tradeoff)
+| File | Content |
+| --- | --- |
+| `run-findings.md` | First run: router crash, F4 OOM, silent FREA fallback |
+| `run-findings-2.md` | Triton launches; throughput regression; some SM wording outdated |
+| `run-findings-3.md` | Probe recovers throughput; memory via F4 LRU |
+| `run-findings-4.md` | Forced Triton; **L4 SM erratum**; opt-in 128×64 confirmed |
+
+Prefer **run-findings-4** for shared-mem numbers.
 
 ## Related
 
 - [gpu-and-backends.md](gpu-and-backends.md)
 - [kernels/04-frea-kernel.md](kernels/04-frea-kernel.md)
 - [cli.md](cli.md)
-- [residency.md](residency.md) — weight placement (orthogonal)
+- [residency.md](residency.md)

@@ -24,8 +24,10 @@ y = linear(h, W_down[e])        # W_down[e]: (H, I)
 
 - One launch **per expert** with `n_e > 0` tokens (CSR segment from F5 / native router)
 - Tiled SwiGLU in fp32 accum, write back model dtype
-- **Tiles:** `choose_frea_block_sizes` walks 128→16 for H/I to fit device shared
-  mem (default + optional Ampere/Ada **opt-in** ~164 KiB)
+- **Tiles:** `choose_frea_block_sizes` walks 128→16 for H/I against live SM
+  budgets (`shared_memory_per_block` and `_optin` when larger). Examples:
+  L4 opt-in **99 KiB** → often **128×64** for large MoEs; **128×128 needs ~140 KiB**
+  and only fits on GPUs with larger opt-in (e.g. A100/L40S ~164 KiB).
 - **Gates:** CUDA + triton package; SiLU only; `H ≥ 16`, `I ≥ 16`; weights on CUDA
 - On any failure → **automatic** grouped PyTorch fallback (`log_triton_fallback`,
   WARN once then DEBUG; permanent memo for hard SM failures)
@@ -42,8 +44,9 @@ Tiny models in unit tests (H=8) always use PyTorch.
 
 Env: `REAP_FREA_BACKEND`, `REAP_FREA_PROBE=0` (static tile-floor instead of probe).
 
-See [frea-throughput.md](../frea-throughput.md) for the L4 lesson (Triton can
-launch yet be **slower** than cuBLAS when tiles shrink).
+See [frea-throughput.md](../frea-throughput.md): on L4, Triton can launch with
+opt-in tiles yet remain **~1.9× slower** than cuBLAS; the probe correctly
+defaults to PyTorch.
 
 ## PyTorch path
 

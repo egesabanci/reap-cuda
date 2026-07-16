@@ -81,16 +81,17 @@ FREA (`auto`→`f2`, `frea`, or `f2`). Orthogonal to `--observe-backend`.
 
 | Value | Behavior |
 | --- | --- |
-| `auto` | Time Triton vs cuBLAS once per shape; keep the winner (default) |
-| `triton` | Force Triton when tiles fit shared mem |
-| `pytorch` | Force grouped `F.linear` (often fastest on L4/T4) |
+| `auto` | Time Triton vs cuBLAS once per shape; keep the winner (default; picks **pytorch** on L4 for large MoE shapes) |
+| `triton` | Force Triton when tiles fit (L4: often 128×64 with SM opt-in, not 128×128) |
+| `pytorch` | Force grouped `F.linear` (usually fastest on L4/T4) |
 
 ```bash
-reap prune full --frea-backend pytorch   # throughput on small-SM GPUs
-reap prune full --frea-backend triton    # force kernel / memory-lean path
+reap prune full --frea-backend auto      # recommended default
+reap prune full --frea-backend pytorch   # explicit L4 throughput
+reap prune full --frea-backend triton    # experiment / big-SM GPUs
 ```
 
-Full story: [frea-throughput.md](frea-throughput.md).
+Full story + L4 SM erratum: [frea-throughput.md](frea-throughput.md).
 
 ### `--dataset-path` / `--artifacts-dir`
 

@@ -1,5 +1,10 @@
 # Run Findings 2 — REAP prune on LiquidAI/LFM2.5-8B-A1B (post-fix re-run)
 
+> **Erratum (shared memory):** L4 limits are **48 KiB default / 99 KiB opt-in**,
+> not “99 KiB default / 164 KiB opt-in.” **128×128 FREA tiles cannot fit on L4.**
+> Corrected measurements: `run-findings-4.md` §3. Throughput conclusions below
+> still hold (Triton was slower than cuBLAS on this run).
+
 Second end-to-end instrumented prune run on the LFM2.5-8B-A1B MoE, this time
 against the **fixed codebase** (commits `b01176d` "resolve EC2 run-findings
 issues (#14–#23)" and `2150fdf` "tighten run-findings residual gaps"). The

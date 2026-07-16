@@ -1,5 +1,9 @@
 # run-findings-3 — REAP on LFM2.5-8B-A1B after the throughput-regression fixes (#24–#32)
 
+> **Erratum (shared memory + #28):** L4 is **48 KiB default / 99 KiB opt-in**
+> (not 99 / 164). Opt-in enables **128×64** tiles, not 128×128. Probe default
+> remains correct. Full correction: `run-findings-4.md` §3 and GH #28 comment.
+
 ## 1. Scope
 
 Third instrumented end-to-end REAP prune run on `LFM2.5-8B-A1B`, executed **after**
@@ -40,7 +44,7 @@ pulled for this run:
 | residency | `gpu_full` (`device_map="auto"`) |
 | seed | 42 |
 | env | `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, `REAP_ARTIFACTS_DIR=/data/reap-artifacts` |
-| GPU | NVIDIA L4 (23 GiB, 99 KiB default / ~164 KiB opt-in per-block shared mem, cc 8.9) |
+| GPU | NVIDIA L4 (23 GiB, **48 KiB default / 99 KiB opt-in** per-block shared mem, cc 8.9) |
 | stack | torch 2.13.0+cu130, transformers 5.14.1, triton 3.7.1 |
 
 ## 3. Outcome
@@ -97,11 +101,12 @@ the cached PyTorch decision with zero per-call timing overhead.
 ```
 INFO reap.kernels.triton_frea: FREA profitability probe: triton=0.0481s pytorch=0.0062s -> pytorch (reason=ok)
 ```
-On the L4, for this expert shape (H=2048, I=1792, 64×64 tiles forced by 99 KiB
-default shared mem), Triton is ~7.8× slower than the cuBLAS-backed PyTorch
-grouped path on a single layer — exactly the #24 finding. The probe correctly
-picked PyTorch and memoized it. The first FREA fallback is logged at WARNING
-(`frea`); the remaining 879 are at DEBUG per the #18 once-then-debug contract.
+On the L4, for this expert shape (H=2048, I=1792; opt-in would allow up to
+**128×64** tiles, not 128×128), Triton is ~7.8× slower than the cuBLAS-backed
+PyTorch grouped path on a single layer — exactly the #24 finding. The probe
+correctly picked PyTorch and memoized it. The first FREA fallback is logged at
+WARNING (`frea`); the remaining 879 are at DEBUG per the #18 once-then-debug
+contract.
 
 ### 5.2 Why memory is still 16.296 GiB with PyTorch FREA
 Run 1's 17.04 GiB peak came partly from F4 weight-cache accumulation across the
@@ -150,13 +155,11 @@ Coherent, on-task, correct reasoning. Same quality as run 2's checkpoint.
   `n_pairs<16` (`b64e427` hardening) so a sparse first batch doesn't stick the
   wrong choice. This is the single change that recovered throughput.
 - **#28 SM opt-in** (`triton_utils.py:device_shared_memory_bytes(prefer_optin=…)` +
-  `choose_frea_block_sizes` + safe retry on launch failure): the infrastructure
-  exists and would let 128×128 tiles fit on the L4 via the ~164 KiB opt-in, but
-  the probe means we never reach the Triton path on the L4 for this shape, so the
-  opt-in is not exercised here. It is exercised on big-shared-mem GPUs where
-  128×128 fits by default. Safe-retry sets `_USE_SMEM_OPTIN=False` and re-launches
-  with default-budget tiles if the opt-in launch hits "shared memory"/"out of
-  resource".
+  `choose_frea_block_sizes` + safe retry): uses the **device-reported** opt-in
+  budget (L4: 99 KiB → larger tiles like 128×64; **not** 128×128 / 164 KiB).
+  Run 3's probe never enters Triton, so opt-in is not exercised here; run 4
+  forces Triton and confirms opt-in (see `run-findings-4.md`). Safe-retry sets
+  `_USE_SMEM_OPTIN=False` and re-launches with default-budget tiles on SM OOM.
 - **#29** was implemented as the lighter small-tile occupancy tweak
   (`BLOCK_N=32` + `num_warps=8` when `block_h<=64`, with a shared-mem re-check
   from `b64e427`) rather than the full 2D-grid rewrite — sufficient given the
@@ -189,12 +192,9 @@ Both previously-failing tests now pass:
   memory win no longer requires running FREA on Triton.
 - **Correctness: unchanged.** Smoke ok; checkpoint loads independently and
   generates correct code.
-- **What we did *not* get on the L4:** the 128×128-tile Triton FREA path. The
-  probe correctly judged it unprofitable at 64×64 and the SM opt-in (#28) is
-  therefore not exercised here. On a GPU where 128×128 fits by default (or with
-  opt-in and the probe picks Triton), the memory win would come *with* Triton
-  throughput. On the L4 the probe picks the right answer: throughput now, memory
-  already won by the cache fix.
+- **What we did *not* get on the L4:** a Triton FREA path that beats cuBLAS.
+  128×128 is **impossible** on L4 (99 KiB opt-in max). Opt-in 128×64 still loses
+  (run 4). The probe picks PyTorch; memory win is from F4 LRU, not Triton.
 - **Cost of the probe:** one extra timed Triton launch + one extra timed
   PyTorch launch per distinct `(device, H, I)` per process. For a single-model
   run that is one probe total — negligible.
@@ -210,12 +210,9 @@ Both previously-failing tests now pass:
    That is by design (memory-constrained users opt in), but it's worth a
    one-line log note when the forced backend contradicts the probe's verdict so
    users aren't surprised. Minor.
-3. **SM opt-in (#28) is untested on the L4** because the probe never reaches
-   Triton here. If a user forces `--frea-backend triton` on the L4, the opt-in
-   path *will* be attempted (128×128 via 164 KiB); the safe-retry handles failure,
-   but no run in this session exercised it. A forced-`triton` run would be a
-   useful follow-up to confirm the opt-in actually engages and whether 128×128
-   then beats cuBLAS.
+3. **SM opt-in (#28) on L4** is exercised in **run 4** (forced `triton`): opt-in
+   engages, tiles **128×64**, +33% vs older small-tile Triton, still slower than
+   cuBLAS. 128×128 never fits on L4.
 4. **#29/#30 were implemented as occupancy tweaks, not the 2D-grid rewrites**
    originally proposed. Given the probe makes the rewrite lower-value on the L4,
    this is a reasonable scoping — but on a GPU where Triton *is* profitable at

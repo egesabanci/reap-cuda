@@ -7,11 +7,12 @@ Throughput vs memory on shared-mem-bound GPUs
 ---------------------------------------------
 * **auto** (default): one-shot empirical probe (Triton vs cuBLAS PyTorch) per
   ``(device, H, I)``, memoize the winner for the rest of the process.
-* **triton**: force Triton when tiles fit (may use SM opt-in for 128×128).
+* **triton**: force Triton when tiles fit (uses device SM default + opt-in;
+  on L4 that is typically up to 128×64 for large H/I — **not** 128×128).
 * **pytorch**: force grouped ``F.linear`` path (max throughput on many L4/T4s).
 
 Set via :func:`set_frea_backend`, env ``REAP_FREA_BACKEND``, or CLI
-``--frea-backend``.
+``--frea-backend``. Ops guide: ``docs/frea-throughput.md``.
 """
 
 from __future__ import annotations
@@ -103,8 +104,10 @@ def choose_frea_block_sizes(
 ) -> tuple[int, int, int] | None:
     """Pick largest power-of-two tiles that fit device shared memory.
 
-    Tries opt-in SM budget first (Ampere/Ada ~164 KiB) so 128×128 can fit on
-    L4/T4 when the runtime allows; falls back to the default per-block limit.
+    Tries the opt-in SM budget first when larger than the default (e.g. L4
+    99 KiB opt-in vs 48 KiB default; A100/L40S often ~164 KiB opt-in). Falls
+    back to the default per-block limit. 128×128 (~140 KiB) only fits when the
+    device reports enough opt-in budget — **not** on L4/T4-class.
     """
     if prefer_optin is None:
         prefer_optin = _USE_SMEM_OPTIN is not False

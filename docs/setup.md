@@ -91,17 +91,18 @@ reap prune layerwise --observe-backend bmm ...
 Coarse backend `auto`/`f2` still uses FREA. Control **which** FREA path:
 
 ```bash
-# Default: probe Triton vs cuBLAS once per shape (best on mixed hosts)
+# Default: probe Triton vs cuBLAS once per shape (on L4 → pytorch for large MoEs)
 --frea-backend auto
 
-# L4/T4: often want max observe throughput
+# Explicit max observe throughput on L4/T4
 --frea-backend pytorch
 
-# Force Triton tiles when you care about intermediate memory
+# Force Triton (debug / A100-class; slower on L4 even with SM opt-in)
 --frea-backend triton
 ```
 
-See [frea-throughput.md](frea-throughput.md).
+L4 shared mem is **48 KiB default / 99 KiB opt-in** (not 164 KiB). Details:
+[frea-throughput.md](frea-throughput.md).
 
 ## 4. Mental model of the codebase
 

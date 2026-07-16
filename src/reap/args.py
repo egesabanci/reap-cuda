@@ -173,9 +173,9 @@ class ObserverArgs:
         metadata={
             "help": (
                 "FREA expert-MLP path: auto|triton|pytorch. "
-                "auto times Triton vs cuBLAS PyTorch once per shape and keeps "
-                "the winner (throughput on L4/T4, memory on big-SM GPUs). "
-                "triton forces the Triton kernel when tiles fit; pytorch forces "
+                "auto times Triton vs cuBLAS once per shape and keeps the winner "
+                "(on L4/T4 typically pytorch; on large-SM GPUs often triton). "
+                "triton forces the kernel when tiles fit shared mem; pytorch forces "
                 "grouped F.linear."
             ),
             "choices": ["auto", "triton", "pytorch"],

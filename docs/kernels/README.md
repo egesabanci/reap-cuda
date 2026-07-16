@@ -87,8 +87,8 @@ reap prune full --frea-backend auto   # probe Triton vs cuBLAS for FREA
 
 Tiny unit-test models (H=8) **intentionally** stay on PyTorch.
 
-Ops detail for FREA tiles / probe / L4 tradeoff:
-**[../frea-throughput.md](../frea-throughput.md)**.
+Ops detail for FREA tiles / probe / L4 SM erratum (48 KiB default / 99 KiB
+opt-in, not 164 KiB): **[../frea-throughput.md](../frea-throughput.md)**.
 
 ## Expected impact (projections vs loop baseline)
 

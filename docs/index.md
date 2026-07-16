@@ -52,7 +52,7 @@ critical on low host-RAM instances (e.g. g6.xlarge). See [residency.md](residenc
 | [Calibration](calibration.md) | Datasets, composite specs, local `--dataset-path` |
 | [Observation and Metrics](observation-and-metrics.md) | Observers, saliency state, prune vs merge metrics |
 | [GPU and Backends](gpu-and-backends.md) | Activation/device policy, observe backends, F4/F5/FREA/F2 |
-| [**FREA Throughput**](frea-throughput.md) | `--frea-backend`, probe, tiles, L4 tradeoff |
+| [**FREA Throughput**](frea-throughput.md) | `--frea-backend`, probe, L4 SM erratum (48/99 KiB), run 3–4 |
 | [**Weight Residency**](residency.md) | `--residency`, auto heuristics, stream save, delegation |
 | [Pruning](pruning.md) | Saliency methods, ranking, `slice_experts`, config patch |
 | [Merging](merging.md) | Clustering, merge methods, skip layers, super-experts |

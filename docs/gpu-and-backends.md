@@ -23,11 +23,15 @@ This page is about **activation / kernel device policy** and observe backends.
 ### Triton hardware gates (model / SKU agnostic)
 
 - `prefer_triton_for` — CUDA + dtype + optional min numel.
-- **FREA tiles** — auto-scale to `shared_memory_per_block` and, when available,
-  **opt-in** `shared_memory_per_block_optin` (~164 KiB on Ampere/Ada) so 128×128
-  can fit on L4/T4; fail once → memoize → no re-spam.
+- **FREA tiles** — auto-scale to live `shared_memory_per_block` and, when larger,
+  **`shared_memory_per_block_optin`**. Typical measured limits:
+  - **L4/T4-class:** default **48 KiB**, opt-in **99 KiB** → max FREA tiles often
+    **128×64** for large H/I; **128×128 does not fit**.
+  - **A100/L40S-class:** opt-in often **~164 KiB** → **128×128** can fit.
+- Fail once on SM OOM → disable opt-in / memoize → no launch spam.
 - **`--frea-backend auto`** — profitability **probe** (Triton vs cuBLAS) per
-  shape; see [frea-throughput.md](frea-throughput.md).
+  shape; on L4 the probe correctly picks PyTorch for LFM2-scale shapes. See
+  [frea-throughput.md](frea-throughput.md).
 - End of observe: INFO **Triton usage summary** (`frea: N Triton / M PyTorch; …`).
 - **F2** accumulates saliency sums in **fp64** (matches docs / PyTorch path).
 
@@ -137,7 +141,7 @@ reap prune layerwise \
   --residency auto \
   --compression-ratio 0.5
 
-# L4 / g6.xlarge, small MoE that fits VRAM: GPU residency + probe (or force pytorch)
+# L4 / g6.xlarge, small MoE that fits VRAM: GPU residency + FREA auto (probe → pytorch)
 reap prune full \
   --model LiquidAI/LFM2.5-8B-A1B \
   --residency gpu_full \
@@ -145,6 +149,9 @@ reap prune full \
   --frea-backend auto \
   --dataset-path /data/datasets/evol-codealpaca-calib-200 \
   --artifacts-dir /data/reap-artifacts
+
+# Force Triton FREA only if you need to experiment (slower on L4; opt-in → ~128×64 tiles)
+# REAP_FREA_BACKEND=triton reap prune full ...
 ```
 
 ## Related

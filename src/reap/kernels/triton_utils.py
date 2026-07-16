@@ -81,11 +81,16 @@ def device_shared_memory_bytes(
 ) -> int | None:
     """Return per-block dynamic shared-memory limit (bytes) for *device*.
 
-    When *prefer_optin* is True and the device exposes
-    ``shared_memory_per_block_optin`` (Ampere/Ada often ~164 KiB), that larger
-    limit is returned so FREA can try 128×128 tiles. Triton/CUDA typically
-    opt-in when the kernel's declared shared mem exceeds the default. On launch
-    failure callers should fall back to the default limit.
+    When *prefer_optin* is True and the device exposes a larger
+    ``shared_memory_per_block_optin``, that value is returned so FREA can try
+    bigger tiles. Limits are **device-reported**, not hardcoded — examples:
+
+    * L4 (AD104): default ~48 KiB, opt-in ~99 KiB (128×128 FREA still too big)
+    * A100/L40S-class: opt-in often ~164 KiB (128×128 can fit)
+
+    Triton typically opts into dynamic SM via the launcher when the kernel
+    needs more than the static default. On launch failure, callers should
+    fall back to the default limit (see FREA safe-retry).
     """
     if not torch.cuda.is_available():
         return None
