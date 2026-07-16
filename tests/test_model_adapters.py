@@ -295,11 +295,15 @@ class Lfm2MoeExperts(nn.Module):
 class Lfm2MoeSparseMoeBlock(nn.Module):
     """Mock of the HF Lfm2MoeSparseMoeBlock (router at .gate, fused experts)."""
 
-    def __init__(self, num_experts=E, hidden=H, inter=H * 2):
+    def __init__(self, num_experts=E, hidden=H, inter=H * 2, use_expert_bias=True):
         super().__init__()
         self.num_experts = num_experts
         self.gate = nn.Linear(hidden, num_experts, bias=False)  # router
         self.experts = Lfm2MoeExperts(num_experts, hidden, inter)
+        # LFM2 per-expert router bias (config.use_expert_bias=True): (E,)
+        self.expert_bias = (
+            nn.Parameter(torch.zeros(num_experts)) if use_expert_bias else None
+        )
 
     def forward(self, x):
         return x, torch.zeros(self.num_experts, x.shape[0])
@@ -379,6 +383,10 @@ def test_lfm2_slice_experts_and_update_config():
     assert moe.experts.down_proj.shape[0] == 4
     assert moe.gate.out_features == 4
     assert moe.gate.weight.shape[0] == 4
+    # regression: expert_bias (use_expert_bias=True) must be sliced too, else the
+    # saved checkpoint won't match the patched config on reload.
+    assert moe.expert_bias is not None
+    assert moe.expert_bias.shape[0] == 4
     adapter.update_config(m.config, 4, K)
     assert m.config.num_experts == 4
     assert m.config.num_experts_per_tok == 2

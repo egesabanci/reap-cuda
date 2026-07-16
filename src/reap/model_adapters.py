@@ -612,6 +612,12 @@ class Lfm2MoeModelAdapter:
         if getattr(gate, "bias", None) is not None:
             gate.bias.data = gate.bias.data[keep_indices]
         gate.out_features = len(keep_indices)
+        # LFM2 per-expert bias (config.use_expert_bias=True): a (E,) parameter on
+        # the MoE block (``feed_forward.expert_bias``) added to the router logits.
+        # Must be sliced alongside the experts or the saved checkpoint won't match
+        # the patched config (num_experts) on reload.
+        if hasattr(moe, "expert_bias") and moe.expert_bias is not None:
+            moe.expert_bias.data = moe.expert_bias.data[keep_indices]
 
     def update_config(
         self,
