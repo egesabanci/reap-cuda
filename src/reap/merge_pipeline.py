@@ -49,7 +49,7 @@ from reap.cluster import (
     restricted_hierarchical_clustering,
     kmeans_clustering,
 )
-from reap.main import record_activations, dump_args_to_yaml, create_results_directory
+from reap.pipeline import record_activations, dump_args_to_yaml, create_results_directory
 from reap.merge import MergeMethod, MoEExpertMerger
 from reap.metrics import get_distance_fn
 from reap.model_adapters import infer_model_adapter
@@ -141,6 +141,7 @@ def cluster(
     data: dict[int, dict[str, Any]],
     num_clusters: int,
     cluster_args: ClusterArgs,
+    merge_args: MergeArgs,
     distance_measure: str,
     results_dir: pathlib.Path,
 ) -> dict[int, torch.Tensor]:
@@ -155,6 +156,17 @@ def cluster(
             data, include_last_layers=cluster_args.singleton_outlier_experts
         )
     for layer in tqdm(data, "Clustering experts..."):
+        # Honour skip_first/skip_last: skipped layers get identity clusters
+        if merge_args.skip_first and layer == min(data.keys()):
+            num_experts = len(data[layer]["expert_frequency"])
+            cluster_labels[layer] = torch.arange(num_experts)
+            logger.info(f"Skipping clustering for layer {layer} as per 'skip_first'.")
+            continue
+        if merge_args.skip_last and layer == max(data.keys()):
+            num_experts = len(data[layer]["expert_frequency"])
+            cluster_labels[layer] = torch.arange(num_experts)
+            logger.info(f"Skipping clustering for layer {layer} as per 'skip_last'.")
+            continue
         expert_prob = data[layer]["expert_frequency"] / data[layer]["total_tokens"]
         ttm_sim_matrix = None
         try:
@@ -305,7 +317,24 @@ def merge(
             f"No model adapter for {model.__class__.__name__}. REAP currently "
             "supports Qwen3-MoE, Llama4-MoE, and Mixtral-style architectures."
         )
-    model_attrs = adapter.expert_weight_attrs()
+    model_attrs = dict(adapter.expert_weight_attrs())
+    # Qwen3-MoE is fused under transformers>=5.x but the Qwen3 adapter's
+    # ``expert_weight_attrs()`` defaults to the non-fused layout; correct it
+    # from the live model so the merger uses ``_get_tensors_fused`` / the fused
+    # setter (Llama4 / LFM2 already report fused=True and are left untouched).
+    _moe_indices = adapter.identify_moe_layers(model)
+    if _moe_indices and (
+        adapter.get_layer_config(
+            adapter.layers(model)[_moe_indices[0]], model.config
+        ).fused_experts
+        and not model_attrs["fused"]
+    ):
+        model_attrs.update({
+            "fused": True,
+            "gate_proj": "gate_up_proj",
+            "up_proj": "gate_up_proj",
+            "down_proj": "down_proj",
+        })
     try:
         merge_method = MergeMethod(merge_args.merge_method)
     except ValueError:
@@ -405,17 +434,40 @@ def run_merge(
     results_dir: pathlib.Path,
 ) -> pathlib.Path:
     """Cluster -> merge -> save, given pre-collected observer data."""
-    total_experts = len(
+    experts_per_layer = len(
         observer_data[next(iter(observer_data))]["expert_frequency"]
     )
-    num_clusters = int(total_experts * (1 - cluster_args.compression_ratio))
+    num_layers = len(observer_data)
+
+    # Guard: skip_first/skip_last must not exclude every layer.
+    merged_layers = num_layers - int(merge_args.skip_first) - int(merge_args.skip_last)
+    if merged_layers <= 0:
+        raise ValueError(
+            "skip_first/skip_last exclude all layers; nothing to merge."
+        )
+
+    # Each merged layer is compressed by the configured ratio; skipped layers
+    # keep all experts (identity clusters), handled in cluster(). Using the
+    # per-layer formula (rather than redistributing a global cluster budget
+    # across merged layers) guarantees num_clusters <= experts_per_layer, so
+    # the underlying agglomerative clustering never receives an impossible
+    # cluster count (n_clusters > n_samples).
+    num_clusters = int(experts_per_layer * (1 - cluster_args.compression_ratio))
+    if num_clusters < 1:
+        raise ValueError(
+            f"compression_ratio {cluster_args.compression_ratio} yields 0 "
+            f"clusters (experts_per_layer={experts_per_layer})."
+        )
+
     logger.info(
         f"Calculated num_clusters: {num_clusters} (compression_ratio "
-        f"{cluster_args.compression_ratio}, {total_experts} experts/layer)"
+        f"{cluster_args.compression_ratio}, {experts_per_layer} experts/layer, "
+        f"{num_layers} layers, merged_layers={merged_layers}, "
+        f"skip_first={merge_args.skip_first}, skip_last={merge_args.skip_last})"
     )
 
     cluster_labels = cluster(
-        observer_data, num_clusters, cluster_args, obs_args.distance_measure, results_dir
+        observer_data, num_clusters, cluster_args, merge_args, obs_args.distance_measure, results_dir
     )
     logger.info("Clustering completed.")
 
