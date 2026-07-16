@@ -1,10 +1,18 @@
 # REAP Custom Kernels — Design & Implementation Guide
 
-This directory is the **authoritative design reference** for the custom Triton
-kernels that accelerate REAP's MoE pruning/merge calibration. Each document is
-a self-contained module following **Separation of Concerns (SoC)**: one phase,
-one kernel, or one cross-cutting topic per file. Files cross-reference each
-other rather than duplicating content.
+> Parent docs index: [../index.md](../index.md) · Runtime backends:
+> [../gpu-and-backends.md](../gpu-and-backends.md) · Implementation:
+> `src/reap/kernels/`
+
+This directory is the **design reference** for observation acceleration
+(routed expert activation + saliency). Each document is a self-contained
+module following **Separation of Concerns (SoC)**: one phase, one kernel, or
+one cross-cutting topic per file. Files cross-reference rather than
+duplicating content.
+
+**Status note:** production code ships a **GPU-resident PyTorch** path
+(grouped bmm / FREA / F2 with optional `torch.compile`). Custom Triton kernel
+bodies remain design targets; correctness does not depend on Triton.
 
 ## Why kernels exist
 
