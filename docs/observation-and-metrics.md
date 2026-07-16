@@ -93,9 +93,11 @@ Default for prune CLI is **pruning-only** (`True`). Merge commands force
 
 This section is about **metrics / saliency tensors**, not model weight placement.
 For weight load/save policy (`--residency`), see [residency.md](residency.md).
+For FREA kernel path choice (`--frea-backend`), see [frea-throughput.md](frea-throughput.md).
 
 - Create state on the **activation device** (CUDA when the block/model is there).
 - Reductions stay on that device (no per-batch `.cpu()` in hot path).
+- `ean_sum` / `weighted_ean_sum` / `weighted_freq` accumulate in **fp64** (F2 Triton and PyTorch).
 - `save_state` / report for disk moves tensors to CPU.
 - `OnlineStatsTracker.to(device)` follows incoming batch device.
 
@@ -119,6 +121,8 @@ with non-fused layouts, or accept routed/sparse semantics for fused models.
 ## Related
 
 - [residency.md](residency.md) — where **weights** live
+- [frea-throughput.md](frea-throughput.md) — FREA Triton vs PyTorch policy
+- [gpu-and-backends.md](gpu-and-backends.md)
 - [pruning.md](pruning.md)
 - [merging.md](merging.md)
 - [kernels/01-f3-dead-metric-audit.md](kernels/01-f3-dead-metric-audit.md)

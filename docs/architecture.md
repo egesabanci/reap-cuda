@@ -18,7 +18,7 @@ work is confined to the phases that need it.
 | `reap.layerwise_model_utils` | Block discovery, device moves, cleanup | Layerwise helpers |
 | `reap.pruning_metrics` | GPU-resident saliency state + dense/routed updates | Prune contract |
 | `reap.metrics` | Distance fns, Welford `OnlineStatsTracker`, merge helpers | Shared math |
-| `reap.kernels` | Backend select, F4 cache, F5 router, bmm/FREA/F2, `observe_moe_batch` | Model-agnostic tensors |
+| `reap.kernels` | Backend select, F4 cache, F5/native router, bmm/FREA/F2, FREA probe, `observe_moe_batch` | Model-agnostic tensors |
 | `reap.prune` / `layerwise_prune` | Orchestrate observe → rank → slice → save | `run()` + legacy `main()` |
 | `reap.merge_pipeline` / `layerwise_merge` | Observe (full metrics) → cluster → merge → save | Merge-only metrics |
 | `reap.cluster` / `restricted_cluster` | Hierarchical / k-means / MC-SMoE clustering | CPU (scipy/sklearn) |

@@ -38,6 +38,7 @@ critical on low host-RAM instances (e.g. g6.xlarge). See [residency.md](residenc
 | Architecture overview | [Architecture](architecture.md) |
 | How to run prune/merge | [CLI](cli.md) · [Pipeline](pipeline.md) |
 | Low-RAM / GPU weight placement | **[Weight residency](residency.md)** |
+| FREA speed vs memory on L4/T4 | **[FREA throughput](frea-throughput.md)** |
 | Kernels / backends | [GPU and Backends](gpu-and-backends.md) · [Kernels design](kernels/README.md) |
 
 ## Documentation map
@@ -48,9 +49,10 @@ critical on low host-RAM instances (e.g. g6.xlarge). See [residency.md](residenc
 | [Architecture](architecture.md) | Module boundaries, data flow, invariants |
 | [Pipeline](pipeline.md) | End-to-end prune and merge execution phases |
 | [Model Adapters](model-adapters.md) | Supported families, layout detection, slicing contract |
-| [Calibration](calibration.md) | Datasets, composite specs, batching |
+| [Calibration](calibration.md) | Datasets, composite specs, local `--dataset-path` |
 | [Observation and Metrics](observation-and-metrics.md) | Observers, saliency state, prune vs merge metrics |
 | [GPU and Backends](gpu-and-backends.md) | Activation/device policy, observe backends, F4/F5/FREA/F2 |
+| [**FREA Throughput**](frea-throughput.md) | `--frea-backend`, probe, tiles, L4 tradeoff |
 | [**Weight Residency**](residency.md) | `--residency`, auto heuristics, stream save, delegation |
 | [Pruning](pruning.md) | Saliency methods, ranking, `slice_experts`, config patch |
 | [Merging](merging.md) | Clustering, merge methods, skip layers, super-experts |
@@ -73,6 +75,9 @@ critical on low host-RAM instances (e.g. g6.xlarge). See [residency.md](residenc
 - **Weight residency**: default `auto` prefers GPU-mapped weights + stream save
   when the model fits VRAM but is large vs host RAM; layerwise uses disk
   offload instead of pinning the full model in host RAM ([residency.md](residency.md)).
+- **FREA profitability**: default `--frea-backend auto` probes Triton vs cuBLAS
+  per host/shape so shared-mem-bound GPUs do not silently pick a slower path
+  ([frea-throughput.md](frea-throughput.md)).
 - **Routed-only expert work** (backends `bmm` / `frea` / `f2`): no full
   `(E, T, H)` activation materialization on the prune path.
 - **Post-slice runnable modules**: fused `slice_experts` updates live

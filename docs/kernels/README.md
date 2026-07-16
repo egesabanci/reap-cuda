@@ -16,17 +16,19 @@ README is the **authoritative current status** of the code on `main`.
 | **F4** weight cache | `kernels/weight_cache.py` | **Shipped** (layout-normalized linear stacks) |
 | **F5** router + pairs | `kernels/router.py` + `triton_softmax.py` | **Shipped** (PyTorch topk/CSR; **Triton** softmax when eligible) |
 | **bmm** grouped routed MLP | `kernels/bmm.py` | **Shipped** — parity oracle / Mac default |
-| **FREA** SwiGLU | `kernels/frea.py` + `triton_frea.py` | **Shipped** (**Triton** `@triton.jit` + PyTorch fallback) |
-| **F2** saliency reduce | `pruning_metrics.update_pruning_state_routed` + `triton_reduce.py` | **Shipped** (**Triton** atomics + PyTorch `index_add_` / Welford) |
+| **FREA** SwiGLU | `kernels/frea.py` + `triton_frea.py` | **Shipped** (Triton + PyTorch; **`--frea-backend` probe**) |
+| **F2** saliency reduce | `pruning_metrics.update_pruning_state_routed` + `triton_reduce.py` | **Shipped** (**fp64** Triton atomics + PyTorch `index_add_` / Welford) |
 | Unified observe entry | `kernels/observe.py` → `observe_moe_batch` | **Shipped** (both full + layerwise observers) |
 | Backend select | `kernels/backend.py` · CLI `--observe-backend` | **Shipped** (`auto\|loop\|bmm\|frea\|f2`) |
-| Status CLI | `reap kernels` | **Shipped** |
+| FREA policy | `triton_frea.set_frea_backend` · CLI `--frea-backend` | **Shipped** (`auto\|triton\|pytorch`) |
+| Status CLI | `reap kernels` | **Shipped** (package/runtime; run summary is separate) |
 
 **Triton is real** (`@triton.jit` in `triton_softmax.py`, `triton_frea.py`,
 `triton_reduce.py`). Imports are **lazy** so Mac/CPU installs work without the
-`triton` package. On this machine without CUDA, runtime uses **PyTorch
-fallbacks** (`bmm` path). On EC2 with `uv pip install -e '.[cuda]'`,
-`--observe-backend auto` prefers `f2` and can launch Triton.
+`triton` package. On hosts without CUDA, runtime uses **PyTorch fallbacks**. On
+EC2 with `uv pip install -e '.[cuda]'`, `--observe-backend auto` prefers `f2`;
+**`--frea-backend auto`** then probes whether FREA-Triton or cuBLAS is faster
+on that GPU (see [frea-throughput.md](../frea-throughput.md)).
 
 There is **no** dependency on `torch.compile` for correctness.
 
@@ -51,11 +53,10 @@ src/reap/kernels/
 
 ```txt
 flat_input (T, H)
-  → extract_router_logits
-  → F5: softmax (Triton|PyTorch) + topk + sort pairs by expert (CSR)
-  → F4: W_gate/up (E,I,H), W_down (E,H,I)  [linear convention]
-  → FREA: SwiGLU on pairs only (Triton|grouped linear) → (n_pairs, H)
-  → F2: scatter norms/weights (Triton|index_add) + Welford means (always PyTorch)
+  → router: F5 softmax+topk  OR  native module router (bias/sigmoid families)
+  → F4: W_gate/up (E,I,H), W_down (E,H,I)  [linear convention; ≤1 cache entry]
+  → FREA: SwiGLU on pairs (Triton|grouped linear per --frea-backend) → (n_pairs, H)
+  → F2: scatter norms/weights fp64 (Triton|index_add) + Welford (always PyTorch)
 ```
 
 Default CLI backends:
@@ -64,14 +65,15 @@ Default CLI backends:
 | --- | --- |
 | `auto` | `f2` if Triton **runtime** OK, else `bmm` |
 | `bmm` | Always PyTorch grouped path |
-| `frea` | Try Triton FREA; fallback bmm |
-| `f2` | Try Triton FREA + reduce; fallback PyTorch |
+| `frea` | FREA stage (+ `--frea-backend` policy) |
+| `f2` | FREA + F2 reduce |
 | `loop` | Legacy dense/loop path (parity) |
 
 ```bash
-reap kernels                          # print Triton readiness
-export REAP_DISABLE_TRITON=1          # force PyTorch
+reap kernels                          # print Triton package/runtime readiness
+export REAP_DISABLE_TRITON=1          # force all kernels to PyTorch
 reap prune layerwise --observe-backend bmm ...
+reap prune full --frea-backend auto   # probe Triton vs cuBLAS for FREA
 ```
 
 ### Triton eligibility (gates)
@@ -79,11 +81,14 @@ reap prune layerwise --observe-backend bmm ...
 | Kernel | Needs |
 | --- | --- |
 | Softmax | CUDA + triton package; `E ≤ 1024` for single-tile path |
-| FREA | CUDA + triton; SiLU; `H ≥ 16` and `I ≥ 16`; weights on CUDA |
-| F2 reduce | CUDA + triton; typically `H ≥ 16` for Triton path |
-| Always | On failure → PyTorch (debug log `Triton … fallback`) |
+| FREA | CUDA + triton; SiLU; `H,I ≥ 16`; tiles fit shared mem; then **`--frea-backend`** |
+| F2 reduce | CUDA + triton; typically `H ≥ 16`; **fp64** accumulators |
+| Always | On failure → PyTorch (WARN once, then DEBUG; end-of-run INFO summary) |
 
 Tiny unit-test models (H=8) **intentionally** stay on PyTorch.
+
+Ops detail for FREA tiles / probe / L4 tradeoff:
+**[../frea-throughput.md](../frea-throughput.md)**.
 
 ## Expected impact (projections vs loop baseline)
 

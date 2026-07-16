@@ -28,9 +28,10 @@ Hermetic suite (no Hub downloads):
 | Adapters / slice | `test_model_adapters.py`, `test_fused_slice_forward.py` |
 | Observer / layerwise | `test_layerwise_*.py` |
 | Merge / skip layers | `test_merge_pipeline.py`, `test_skip_first_last.py` |
-| Kernels / contract | `test_kernel_parity_bmm.py`, `test_pruning_metrics_only_contract.py`, `test_f4_weight_cache.py` |
+| Kernels / contract | `test_kernel_parity_bmm.py`, `test_pruning_metrics_only_contract.py`, `test_f4_weight_cache.py`, `test_triton_kernels.py` |
 | Weight residency | `test_residency.py` (heuristics, plans, stream_save, delegation) |
-| CLI | `test_cli.py` (mocked pipelines; residency wiring) |
+| EC2 run-findings | `test_run_findings_fixes.py` (router, F4 bound, FREA tiles, probe CLI, smoke, artifacts) |
+| CLI | `test_cli.py` (mocked pipelines; residency / frea-backend wiring) |
 
 ## Project layout (src)
 
@@ -76,12 +77,21 @@ docs/residency.md
 3. Prefer `stream_save_pretrained` over manual CPU materialize
 4. Extend `tests/test_residency.py` + document in `docs/residency.md`
 
+### FREA / Triton policy changes
+
+1. Prefer policy in `triton_frea.py` (`set_frea_backend`, probe, tile choose) over pipeline branches
+2. Keep launches SKU-agnostic (query SM; probe timings)
+3. Always leave a correct PyTorch fallback
+4. Document ops in `docs/frea-throughput.md` and update `gpu-and-backends.md`
+5. Extend `tests/test_run_findings_fixes.py` / `test_triton_kernels.py`
+
 ## Coding conventions
 
 - Prefer `run(dataclasses...)` APIs over parsing inside libraries
 - Keep architecture branches in adapters, not kernels
 - Do not `.to("cpu")` in observation hot paths
 - Do not force full-model `device_map="cpu"` on low-RAM GPU hosts — use residency
+- Do not assume Triton is faster than cuBLAS — use `--frea-backend auto` probe
 - Conventional Commits (`feat:`, `fix:`, `test:`, `docs:`, …)
 
 ## CLI smoke (no model)

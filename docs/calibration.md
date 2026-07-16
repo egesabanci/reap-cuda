@@ -11,6 +11,8 @@ and layerwise prepare helpers.
 | Source | CLI / args | Behavior |
 | --- | --- | --- |
 | Single HF dataset | `--dataset name` | Load split; tokenize via registered processor |
+| Local offline file/dir | `--dataset name --dataset-path PATH` | Load arrow/json/jsonl/dir from disk; processor still keyed by `--dataset` |
+| Path as dataset | `--dataset /path/to/local` if it exists | Treated as local load; default processor if unregistered |
 | Composite | `--dataset "a:4096,b[sub]:2048"` | Multi-source batch mix; results dir uses hash name |
 | Cached observations | `--dataset combined` | Skip data load; require existing `.pt` |
 
@@ -20,6 +22,15 @@ Also:
 - `--dataset-config` / `dataset_config_name` for HF configs
 - `--batch-size`, `--batches-per-category`, `--model-max-length`
 - `--truncate` for hard truncation policy in processors
+- `--artifacts-dir` / `REAP_ARTIFACTS_DIR` for output root (not calibration load)
+
+```bash
+# Offline EC2-style calib
+reap prune full \
+  -d theblackcat102/evol-codealpaca-v1 \
+  --dataset-path /data/datasets/evol-codealpaca-calib-200 \
+  --artifacts-dir /data/reap-artifacts
+```
 
 ## Composite dataset spec
 

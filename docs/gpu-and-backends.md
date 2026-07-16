@@ -4,64 +4,83 @@ REAP CUDA targets **GPU-first calibration**: saliency and expert activation work
 should run on the device holding the MoE weights, not bounce to CPU each batch.
 
 This page is about **activation / kernel device policy** and observe backends.
-**Where model weights are loaded and saved** (host vs GPU vs disk offload) is
-documented separately: **[residency.md](residency.md)** (`--residency`).
+**Where model weights are loaded and saved** is
+[residency.md](residency.md). **FREA throughput vs memory** (probe, CLI) is
+[frea-throughput.md](frea-throughput.md).
 
 ## Device policy
 
 | Data | Device |
 | --- | --- |
-| Model weights | Per `--residency` → `plan_load` ([residency.md](residency.md)): typically `device_map="auto"` (+ optional offload) or `"cpu"` |
+| Model weights | Per `--residency` → `plan_load` ([residency.md](residency.md)) |
 | Active block (layerwise schedule) | CUDA if available else CPU |
 | Hidden-state replay cache | **CPU** (layerwise memory trade-off) |
 | Pruning state / OnlineStatsTracker | Activation device (prefer CUDA) |
-| Saved `.pt` / checkpoints | CPU / disk (weights via stream save from GPU when residency allows) |
+| Saved `.pt` / checkpoints | CPU / disk (stream save when residency allows) |
 | Clustering (scipy/sklearn) | CPU |
 | Expert matmuls in observe backends | Same as activations (GPU) |
 
 ### Triton hardware gates (model / SKU agnostic)
 
-- `prefer_triton_for` checks CUDA + dtype + optional min numel.
-- **FREA** auto-scales tiles to device shared mem (default + Ampere/Ada **opt-in**
-  ~164 KiB when available so 128×128 can fit on L4/T4).
-- **`--frea-backend auto`** (default): one-shot **profitability probe** (Triton vs
-  cuBLAS PyTorch) per shape; memoize winner. Force with `triton` / `pytorch`,
-  or env `REAP_FREA_BACKEND` / `REAP_FREA_PROBE=0` for static tile-floor gate.
-- Shared-mem failures are memoized; end of observe logs **Triton usage summary**.
-- F2 scatter accumulates **fp64**; slightly higher `num_warps` on large H.
+- `prefer_triton_for` — CUDA + dtype + optional min numel.
+- **FREA tiles** — auto-scale to `shared_memory_per_block` and, when available,
+  **opt-in** `shared_memory_per_block_optin` (~164 KiB on Ampere/Ada) so 128×128
+  can fit on L4/T4; fail once → memoize → no re-spam.
+- **`--frea-backend auto`** — profitability **probe** (Triton vs cuBLAS) per
+  shape; see [frea-throughput.md](frea-throughput.md).
+- End of observe: INFO **Triton usage summary** (`frea: N Triton / M PyTorch; …`).
+- **F2** accumulates saliency sums in **fp64** (matches docs / PyTorch path).
 
-Native routers (sigmoid + `expert_bias`, etc.) use
-`f5_router_from_module` when `prefers_native_router` detects structural signals —
-not a hard-coded model list.
+Native routers (sigmoid + `expert_bias`, etc.) use `f5_router_from_module` when
+`prefers_native_router` detects **structural** signals (bias buffer,
+`use_expert_bias`, adapter flag / name) — not a SKU list.
 
-## Backend selection
+## Backend selection (coarse)
 
 ```python
 # reap.kernels.backend.select_observe_backend
 auto  -> "f2" if (triton importable and torch.cuda.is_available()) else "bmm"
 bmm   -> grouped routed PyTorch
-frea  -> FREA path (compile optional)
-f2    -> FREA compute + routed reductions
+frea  -> FREA path (+ --frea-backend policy)
+f2    -> FREA + F2 scatter reduce
 loop  -> legacy / parity
 ```
 
-Override:
-
 ```bash
 reap prune layerwise --observe-backend bmm
-# or
 export REAP_OBSERVE_BACKEND=bmm
+export REAP_DISABLE_TRITON=1   # all Triton kernels off
 ```
+
+## FREA sub-backend (fine)
+
+When the coarse backend uses FREA (`auto`→`f2`, `frea`, or `f2`):
+
+| `--frea-backend` | Meaning |
+| --- | --- |
+| `auto` (default) | Probe once; memoize faster of Triton vs PyTorch |
+| `triton` | Force Triton when tiles fit |
+| `pytorch` | Force cuBLAS grouped path |
+
+```bash
+reap prune full --observe-backend auto --frea-backend auto    # default
+reap prune full --frea-backend pytorch                        # L4 throughput
+reap prune full --frea-backend triton                         # force kernel
+export REAP_FREA_BACKEND=pytorch
+export REAP_FREA_PROBE=0   # auto without timing; static tile floor instead
+```
+
+Details, env vars, and the L4 tradeoff story: **[frea-throughput.md](frea-throughput.md)**.
 
 ## Pipeline of a routed observe step
 
 ```txt
 hidden flat_input (T, H)
-  -> router logits (T, E)          # F5 / extract_router_logits
-  -> top-k + pair CSR indices      # F5
-  -> stacked W_gate/up/down        # F4 (layout-normalized)
-  -> pair outputs (n_pairs, H)     # grouped bmm / FREA
-  -> scatter saliency              # F2 / update_pruning_state_routed
+  -> router                          # F5 softmax+topk OR native module router
+  -> top-k pairs + CSR indices
+  -> stacked W_gate/up/down          # F4 (layout-normalized; max 1 cache entry)
+  -> pair outputs (n_pairs, H)       # FREA (Triton|PyTorch per --frea-backend)
+  -> scatter saliency                # F2 fp64 reduce
 ```
 
 No full expert loop over all tokens; no persistent `(E, T, H)` on prune path.
@@ -71,64 +90,68 @@ No full expert loop over all tokens; no persistent `(E, T, H)` on prune path.
 - Non-fused: `torch.stack` of Linear weights → `(E, I, H)` / `(E, H, I)`
 - Fused linear (Qwen/LFM2): split `gate_up_proj` on dim 1
 - Fused bmm (Llama4): transpose native `(E, H, 2I)` into Linear form
-- Cached by `id(moe)`; free after layerwise block (and on observer close)
+- **At most one MoE** in `_STACK_CACHE` (full-observer OOM guard); free after
+  each `observe_moe_batch` / layerwise block / observer close
 
-## F5 router
+## F5 / native router
 
-- Softmax in fp32 for stability
-- Top-k on probabilities (monotone vs logits)
-- Optional renorm when `renormalize_router_weights` and model `norm_topk_prob`
-- Emits expert-sorted pair indices + CSR `expert_offsets` for coalesced work
+| Case | Path |
+| --- | --- |
+| Softmax MoEs (Qwen, Mixtral, …) | `f5_router` — Triton softmax when eligible + PyTorch topk/CSR |
+| Non-softmax / bias routers (e.g. LFM2) | `f5_router_from_module` — call model router; rebuild CSR |
 
 ## FREA / F2 / Triton
 
 | Name | Implementation |
 | --- | --- |
 | F5 softmax | Triton online row-softmax when `E ≤ 1024` and CUDA; else `F.softmax` |
-| FREA | Triton per-expert tiled SwiGLU (`triton_frea.py`) when `H,I ≥ 16` + SiLU; else grouped `F.linear` |
-| F2 | Triton atomic scatter of norms/weights (`triton_reduce.py`); Welford means stay PyTorch |
-| Force PyTorch | `REAP_DISABLE_TRITON=1` or `--observe-backend bmm` |
+| FREA | Triton tiled SwiGLU when supported; else grouped `F.linear`; policy via `--frea-backend` |
+| F2 | Triton fp64 atomic scatter; Welford means stay PyTorch |
+| Force all PyTorch | `REAP_DISABLE_TRITON=1` or `--observe-backend bmm` |
 
 ```bash
-reap kernels   # print Triton package/runtime + auto backend
+reap kernels   # package/runtime + auto coarse backend (not per-kernel probe)
 ```
 
-All Triton launches are **optional**: failures or unsupported shapes fall back
-to pure PyTorch automatically (debug log: `Triton … fallback → PyTorch`).
+Fallbacks log **WARNING** once per component, then DEBUG. Run summary at INFO.
 
 ## Why double compute?
 
 HF forward already runs the MoE block. The observer **recomputes** routed
-expert outputs for metrics. Invasive fusion into the model forward is a future
-optimization, not the current API surface.
+expert outputs for metrics. Invasive fusion into the model forward is future work.
 
 ## Recommended EC2 settings
 
 ```bash
-# First bring-up on L40S 46GB
+# Bring-up (safe, pure PyTorch observe math)
 reap prune layerwise \
   --model Qwen/Qwen3-30B-A3B \
-  --dataset theblackcat102/evol-codealpaca-v1 \
-  --batches-per-category 8 \
-  --batch-size 1 \
   --observe-backend bmm \
-  --observe-only
+  --batches-per-category 8 --batch-size 1 --observe-only
 
-# Production-ish
+# Production on L40S-class (large SM): auto FREA often picks Triton
 reap prune layerwise \
   --model Qwen/Qwen3-30B-A3B \
-  --prune-method reap \
-  --compression-ratio 0.5 \
   --observe-backend auto \
-  --batches-per-category 256
-```
+  --frea-backend auto \
+  --residency auto \
+  --compression-ratio 0.5
 
-Watch `torch.cuda.max_memory_allocated()`: peak should track **one block + F4
-stack**, not an extra multi-GB `(E,T,H)` per layer.
+# L4 / g6.xlarge, small MoE that fits VRAM: GPU residency + probe (or force pytorch)
+reap prune full \
+  --model LiquidAI/LFM2.5-8B-A1B \
+  --residency gpu_full \
+  --observe-backend auto \
+  --frea-backend auto \
+  --dataset-path /data/datasets/evol-codealpaca-calib-200 \
+  --artifacts-dir /data/reap-artifacts
+```
 
 ## Related
 
-- [residency.md](residency.md) — weight load/save (not saliency device)
+- [frea-throughput.md](frea-throughput.md) — probe, tiles, env vars
+- [residency.md](residency.md) — weight load/save
 - [kernels/README.md](kernels/README.md)
 - [observation-and-metrics.md](observation-and-metrics.md)
 - [layerwise.md](layerwise.md)
+- Field reports: `run-findings.md`, `run-findings-2.md` (repo root)

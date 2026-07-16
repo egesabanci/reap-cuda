@@ -13,11 +13,14 @@
 | Step | Implementation |
 |---|---|
 | Pair L2 norms | PyTorch or inside Triton reduce |
-| Scatter sum / weighted sum / weight sum | Triton `atomic_add` **or** `index_add_` |
-| Max activation | Triton `atomic_max` **or** `scatter_reduce` amax |
+| Scatter sum / weighted sum / weight sum | Triton **fp64** `atomic_add` **or** fp64 `index_add_` |
+| Max activation | Triton `atomic_max` **or** `scatter_reduce` amax (fp32) |
 | Cross-batch `ean_mean` / `reap` | **Welford in PyTorch** (exact match to historical OnlineStatsTracker) |
 | `routed_characteristic_activation` | Optional pair scatter when `compute_routed_ca` |
 | `pairwise_expert_frequency` | Still `freq_i + freq_j` from selected_experts (not co-routing) |
+
+**Contract:** `ean_sum` / `weighted_ean_sum` / `weighted_freq` are **fp64** on
+both Triton and PyTorch paths (avoids backend-dependent ranking drift).
 
 Design docs that described full in-kernel Welford are **aspirational**; shipping
 code keeps Welford in Python for parity and simplicity.

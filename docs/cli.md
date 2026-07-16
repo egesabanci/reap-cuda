@@ -61,15 +61,50 @@ reap prune full \
 | `--preserve-super-experts` | off | Compression |
 | `--preserve-outliers` | off | Compression |
 | `--observe-backend` | `auto` | Observer |
+| `--frea-backend` | `auto` | Observer |
 | `--pruning-metrics-only` / `--all-metrics` | pruning-only | Observer |
 | `--renorm-router` / `--no-renorm-router` | renorm on | Observer |
 | `--overwrite-observations` / `--keep-observations` | keep | Observer |
+| `--dataset-path` | unset | Data |
+| `--artifacts-dir` | `./artifacts` or env | Run |
 | `--observe-only` | off | Run |
 | `--smoke-test` / `--no-smoke-test` | smoke on | Run |
 | `--eval` / `--no-eval` | no eval | Run |
 | `--profile` / `--no-profile` | profile on | Run |
 | `--seed` | `42` | Run |
 | `--residency` | `auto` | Residency |
+
+### `--frea-backend` (all prune/merge subcommands)
+
+Controls the **FREA expert-MLP** implementation when the observe backend uses
+FREA (`auto`→`f2`, `frea`, or `f2`). Orthogonal to `--observe-backend`.
+
+| Value | Behavior |
+| --- | --- |
+| `auto` | Time Triton vs cuBLAS once per shape; keep the winner (default) |
+| `triton` | Force Triton when tiles fit shared mem |
+| `pytorch` | Force grouped `F.linear` (often fastest on L4/T4) |
+
+```bash
+reap prune full --frea-backend pytorch   # throughput on small-SM GPUs
+reap prune full --frea-backend triton    # force kernel / memory-lean path
+```
+
+Full story: [frea-throughput.md](frea-throughput.md).
+
+### `--dataset-path` / `--artifacts-dir`
+
+| Flag | Meaning |
+| --- | --- |
+| `--dataset-path PATH` | Local arrow/json/jsonl/dir; offline load. `--dataset` still selects the field-mapping processor. |
+| `--artifacts-dir PATH` | Root for pruned/merged models and observations (else `REAP_ARTIFACTS_DIR` / `./artifacts`). |
+
+```bash
+reap prune full \
+  -d theblackcat102/evol-codealpaca-v1 \
+  --dataset-path /data/datasets/evol-codealpaca-calib-200 \
+  --artifacts-dir /data/reap-artifacts
+```
 
 ### `--residency` (all prune/merge subcommands)
 
@@ -106,6 +141,9 @@ Extra flags:
 | `--save-intermediate` | off |
 | `--low-cpu-mem` / `--no-low-cpu-mem` | low mem on |
 | `--residency` | `auto` |
+| `--frea-backend` | `auto` |
+| `--dataset-path` | unset |
+| `--artifacts-dir` | env / `./artifacts` |
 
 With `--residency auto`, large models stay on the layerwise path; if the model
 fits VRAM and host RAM is tight, residency may resolve to `gpu_full` and
@@ -118,7 +156,8 @@ reap prune layerwise \
   -d theblackcat102/evol-codealpaca-v1 \
   --prune-method reap \
   --compression-ratio 0.5 \
-  --observe-backend bmm \
+  --observe-backend auto \
+  --frea-backend auto \
   --residency auto \
   --batches-per-category 64 \
   --batch-size 1
@@ -141,6 +180,9 @@ Force merge-criteria observation. Core options:
 | `--permute` | unset (`direct` \| `wm`) |
 | `--overwrite-merged` | keep |
 | `--residency` | `auto` |
+| `--frea-backend` | `auto` |
+| `--dataset-path` | unset |
+| `--artifacts-dir` | env / `./artifacts` |
 
 Layerwise merge adds the same layerwise flags as layerwise prune.
 
@@ -184,6 +226,8 @@ Prefer Typer for new docs and scripts.
 ## Related
 
 - [residency.md](residency.md)
+- [frea-throughput.md](frea-throughput.md)
+- [gpu-and-backends.md](gpu-and-backends.md)
 - [pipeline.md](pipeline.md)
 - [pruning.md](pruning.md)
 - [merging.md](merging.md)

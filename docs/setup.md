@@ -86,6 +86,23 @@ export REAP_DISABLE_TRITON=1
 reap prune layerwise --observe-backend bmm ...
 ```
 
+### FREA throughput vs memory (after kernels are enabled)
+
+Coarse backend `auto`/`f2` still uses FREA. Control **which** FREA path:
+
+```bash
+# Default: probe Triton vs cuBLAS once per shape (best on mixed hosts)
+--frea-backend auto
+
+# L4/T4: often want max observe throughput
+--frea-backend pytorch
+
+# Force Triton tiles when you care about intermediate memory
+--frea-backend triton
+```
+
+See [frea-throughput.md](frea-throughput.md).
+
 ## 4. Mental model of the codebase
 
 ```text
@@ -115,9 +132,14 @@ library dispatches:
 | --- | --- |
 | `auto` | `f2` if Triton runtime OK, else `bmm` |
 | `bmm` | Pure PyTorch grouped routed matmuls (parity / safest bring-up) |
-| `frea` | Try Triton FREA SwiGLU; fallback to bmm |
-| `f2` | Try Triton FREA + F2 reduce; fallback to PyTorch |
+| `frea` | FREA stage; policy via `--frea-backend` |
+| `f2` | FREA + F2 reduce; policy via `--frea-backend` |
 | `loop` | Legacy path (parity oracle) |
+
+| `--frea-backend` | Behavior |
+| --- | --- |
+| `auto` | Profitability probe (default) |
+| `triton` / `pytorch` | Force that path |
 
 ```bash
 # Recommended first real run on a single L40S-class GPU
@@ -196,6 +218,7 @@ uv run reap prune layerwise \
   --prune-method reap \
   --compression-ratio 0.5 \
   --observe-backend auto \
+  --frea-backend auto \
   --residency auto
 ```
 
@@ -207,7 +230,8 @@ uv run reap prune full \
   -d theblackcat102/evol-codealpaca-v1 \
   --prune-method reap \
   --compression-ratio 0.5 \
-  --residency auto
+  --residency auto \
+  --frea-backend auto
 ```
 
 ### Merge
@@ -221,8 +245,9 @@ uv run reap merge layerwise \
   --residency auto
 ```
 
-Artifacts: `artifacts/<model>/<dataset>/…`  
-Details: [pipeline.md](pipeline.md), [cli.md](cli.md), [residency.md](residency.md).
+Artifacts: `artifacts/<model>/<dataset>/…` (or `--artifacts-dir` / `REAP_ARTIFACTS_DIR`).  
+Details: [pipeline.md](pipeline.md), [cli.md](cli.md), [residency.md](residency.md),
+[frea-throughput.md](frea-throughput.md).
 
 ## 7. Tests related to kernels and residency
 
@@ -233,8 +258,8 @@ uv run pytest tests/test_triton_kernels.py tests/test_kernel_parity_bmm.py -q
 # On CUDA host: also runs @requires_triton cases
 uv run pytest tests/test_triton_kernels.py -q
 
-# Weight residency heuristics + CLI wiring (hermetic)
-uv run pytest tests/test_residency.py tests/test_cli.py -q
+# Weight residency + EC2-findings hermetic suite + CLI
+uv run pytest tests/test_residency.py tests/test_run_findings_fixes.py tests/test_cli.py -q
 ```
 
 ## 8. Doc map (everything else)
@@ -242,6 +267,7 @@ uv run pytest tests/test_residency.py tests/test_cli.py -q
 | Want… | Read |
 | --- | --- |
 | Module map & invariants | [architecture.md](architecture.md) |
+| FREA probe / L4 throughput | [frea-throughput.md](frea-throughput.md) |
 | Phase-by-phase prune/merge | [pipeline.md](pipeline.md) |
 | **Weight residency / low-RAM hosts** | **[residency.md](residency.md)** |
 | Backends + activation device policy | [gpu-and-backends.md](gpu-and-backends.md) |

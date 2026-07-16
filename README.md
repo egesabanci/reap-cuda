@@ -35,12 +35,14 @@ layerwise** calibration for 30B-class models on ~46 GB cards, and
 - **Adapter-based MoE support** — Qwen3 / Qwen3.5–3.6 / Llama4 / Mixtral / LFM2
 - **Weight residency** — `--residency auto|gpu_full|layerwise|cpu_full` avoids
   full-CPU pins when VRAM fits but host RAM is tight; stream-save from GPU
+- **FREA profitability** — `--frea-backend auto` probes Triton vs cuBLAS per
+  host/shape (L4-safe throughput); force `triton` or `pytorch` when needed
 - **GPU-first observation** — saliency stays on the compute device; routed-only
   backends avoid `(E, T, H)` activation materialization
 - **Layerwise mode** — one decoder block on GPU at a time for large MoEs
 - **Prune + merge** — REAP/EAN/frequency saliency; agglomerative / TIES / …
-- **Layout-normalized kernels package** — F4 weight cache, F5 router pairs,
-  grouped bmm / FREA / F2 (PyTorch GPU path; optional Triton)
+- **Layout-normalized kernels package** — F4 weight cache, F5 / native router,
+  grouped bmm / FREA / F2 (Triton when profitable; always safe fallbacks)
 - **Hermetic tests** — tiny in-memory models, mocked CLI dispatch (no Hub)
 
 ## Quick Start
@@ -216,15 +218,26 @@ Full policy, heuristics, delegation (full↔layerwise), and env knobs:
 | --- | --- |
 | `auto` | `f2` if CUDA+Triton available, else `bmm` |
 | `bmm` | Grouped routed-only matmuls (recommended first EC2 path) |
-| `frea` / `f2` | Same family; reductions fused into F2 path |
+| `frea` / `f2` | FREA expert MLP + (for `f2`) F2 scatter reduce |
 | `loop` | Legacy / parity oracle |
+
+**FREA sub-policy** (when using `auto`/`frea`/`f2`):
+
+| `--frea-backend` | Role |
+| --- | --- |
+| `auto` | Probe Triton vs cuBLAS once per shape; keep winner (default) |
+| `triton` | Force Triton tiles when shared mem allows |
+| `pytorch` | Force cuBLAS grouped path (often best throughput on L4/T4) |
 
 ```bash
 reap prune layerwise --observe-backend bmm ...
+reap prune full --observe-backend auto --frea-backend auto ...
+reap prune full --frea-backend pytorch   # prefer throughput on small-SM GPUs
 ```
 
-Saliency tensors stay on GPU until save. Design notes:
+Saliency tensors stay on GPU until save. Design / ops:
 [docs/gpu-and-backends.md](docs/gpu-and-backends.md),
+[docs/frea-throughput.md](docs/frea-throughput.md),
 [docs/kernels/](docs/kernels/README.md).
 
 ## CLI Reference
@@ -244,7 +257,8 @@ uv run reap merge full --help
 | `reap version` | — | Package version |
 
 Common flags: `-m/--model`, `-d/--dataset`, `--compression-ratio`,
-`--observe-backend`, `--residency`, `--observe-only`, `--eval`, `--seed`.
+`--observe-backend`, `--frea-backend`, `--residency`, `--dataset-path`,
+`--artifacts-dir`, `--observe-only`, `--eval`, `--seed`.
 
 Full flag tables: [docs/cli.md](docs/cli.md).
 
@@ -279,6 +293,7 @@ Maintainer documentation (SoC, one concern per file):
 | [Model adapters](docs/model-adapters.md) | Families, slice contract |
 | [Observation & metrics](docs/observation-and-metrics.md) | Saliency state |
 | [GPU & backends](docs/gpu-and-backends.md) | Device policy, F4/F5/FREA/Triton |
+| [**FREA throughput**](docs/frea-throughput.md) | `--frea-backend`, probe, tiles, L4 tradeoff |
 | [**Weight residency**](docs/residency.md) | `--residency`, auto heuristics, stream save, g6.xlarge |
 | [Pruning](docs/pruning.md) | Ranking and save |
 | [Merging](docs/merging.md) | Cluster + fuse |

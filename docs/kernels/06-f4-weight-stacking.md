@@ -15,7 +15,10 @@ get_stacked_expert_weights(moe, adapter, device=None, dtype=None)
 free_cache(moe|None)
 ```
 
-Cache key: `id(moe)`. Layerwise observer frees after each MoE block process.
+Cache key: `id(moe)`. **At most one MoE** is retained (`_MAX_CACHE_ENTRIES=1`)
+so the full-observer path cannot pin every layer’s stacks at once (L4 OOM
+guard). Layerwise free after each MoE block; `observe_moe_batch` also
+`free_cache(moe)` after each call.
 
 ## Layouts
 
@@ -30,7 +33,8 @@ Adapter provides `weight_convention` and `expert_weight_attrs(moe)`.
 ## Memory
 
 ~**1.2 GB/layer** bf16 for E=128, H=2048, I=768 (stack copy for non-fused;
-fused linear may share storage on splits). One layer at a time in layerwise mode.
+fused linear may share storage on splits). Only **one** layer’s stack is live
+in the full path; layerwise is already one block at a time.
 
 ## Correctness
 
