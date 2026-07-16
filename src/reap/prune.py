@@ -13,7 +13,7 @@ from accelerate.utils import set_seed
 from accelerate.hooks import remove_hook_from_module
 
 
-from reap.main import record_activations, smoke_test, create_results_directory
+from reap.pipeline import record_activations, smoke_test, create_results_directory
 from reap.args import (
     ReapArgs,
     ModelArgs,

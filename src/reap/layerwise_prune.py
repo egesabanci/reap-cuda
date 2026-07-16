@@ -51,7 +51,7 @@ from reap.layerwise_model_utils import cleanup_memory
 from reap.eval import run_evaluate
 from reap.prune import prune as prune_model
 from reap.prune import get_pruned_model_dir
-from reap.main import dump_args_to_yaml, create_results_directory
+from reap.pipeline import dump_args_to_yaml, create_results_directory
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)

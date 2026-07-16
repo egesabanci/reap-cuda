@@ -1,17 +1,15 @@
 from __future__ import annotations
-import logging
 import dataclasses
+import logging
 import pathlib
 import re
-import gc
 
 import yaml
 import torch
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
+from transformers import AutoTokenizer
 
 from accelerate.utils import set_seed
-from accelerate.hooks import remove_hook_from_module
 
 
 from reap.args import (
@@ -19,33 +17,14 @@ from reap.args import (
     ModelArgs,
     DatasetArgs,
     ObserverArgs,
-    ClusterArgs,
     EvalArgs,
-    MergeArgs,
 )
 from reap.data import load_category_batches, parse_composite_dataset_spec
 from reap.observer import MoETransformerObserver, MoETransformerObserverConfig
 from reap.model_adapters import infer_model_adapter
-from reap.eval import run_evaluate
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
-
-
-def parse_args() -> tuple[dataclasses.Dataclass]:
-    parser = HfArgumentParser(
-        (
-            ReapArgs,
-            ModelArgs,
-            DatasetArgs,
-            ObserverArgs,
-            ClusterArgs,
-            EvalArgs,
-            MergeArgs,
-        )
-    )
-    args = parser.parse_args_into_dataclasses()
-    return args
 
 
 def str_to_directory_name(s: str) -> str:
@@ -338,69 +317,3 @@ def dump_args_to_yaml(
         yaml.dump(serializable_args, f, default_flow_style=False)
     logger.info(f"Arguments saved to {output_path}")
 
-
-def main():
-    (
-        reap_args,
-        model_args,
-        ds_args,
-        obs_args,
-        cluster_args,
-        eval_args,
-        merge_args,
-    ) = parse_args()
-    set_seed(reap_args.seed)
-    results_dir = create_results_directory(model_args.model_name, ds_args.dataset_name)
-
-    model_name = model_args.model_name
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    # load model
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto",
-        torch_dtype="auto",
-        trust_remote_code=True,
-    )
-
-    # record activations or load previously recorded activations
-    logger.info(
-        f"Running observer to collect activation data for model {model_args.model_name} on dataset {ds_args.dataset_name}."
-    )
-    observer_data = record_activations(
-        model,
-        tokenizer,
-        reap_args,
-        model_args,
-        ds_args,
-        obs_args,
-        results_dir,
-    )
-    if reap_args.run_observer_only:
-        logger.info(
-            "Observer run completed. Exiting after collecting activation data since "
-            "`run_observer_only` is set to True."
-        )
-        return
-
-    # smoke test
-    if reap_args.smoke_test:
-        logger.info("Running smoke test on the model...")
-        try:
-            smoke_test(model, tokenizer)
-        except Exception as e:
-            logger.error(f"Smoke test failed: {e}")
-            pass
-
-    # eval
-    if reap_args.do_eval:
-        remove_hook_from_module(model, recurse=True)
-        model.to("cpu")
-        del model
-        del observer_data
-        torch.cuda.empty_cache()
-        gc.collect()
-        run_evaluate(model_args, results_dir / "eval", eval_args, reap_args.seed)
-
-
-if __name__ == "__main__":
-    main()
