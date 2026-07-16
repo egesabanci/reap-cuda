@@ -126,6 +126,20 @@ def _setup_observer(model, obs_args):
     )
 
 
+def _primary_device(model: torch.nn.Module) -> torch.device:
+    """Best-effort device for accelerate / device_map models."""
+    try:
+        dev = getattr(model, "device", None)
+        if isinstance(dev, torch.device):
+            return dev
+    except Exception:
+        pass
+    try:
+        return next(model.parameters()).device
+    except StopIteration:
+        return torch.device("cpu")
+
+
 def _profile_model(model, tokenizer, model_args, obs_args, observer):
     """Run a profiling forward pass to avoid OOM at inference time."""
     with torch.no_grad():
@@ -141,7 +155,9 @@ def _profile_model(model, tokenizer, model_args, obs_args, observer):
                 truncation=True,
                 max_length=model_max_length,
             )
-            tokenized = {k: v.to(model.device) for k, v in tokenized.items()}
+            tokenized = {
+                k: v.to(_primary_device(model)) for k, v in tokenized.items()
+            }
             for _ in range(2):
                 _ = model(**tokenized)
         except Exception as e:
@@ -152,20 +168,6 @@ def _profile_model(model, tokenizer, model_args, obs_args, observer):
         f"Model {model_args.model_name} successfully loaded and profiled at max length {model_max_length}."
     )
     observer.reset()
-
-
-def _primary_device(model: torch.nn.Module) -> torch.device:
-    """Best-effort device for accelerate / device_map models."""
-    try:
-        dev = getattr(model, "device", None)
-        if isinstance(dev, torch.device):
-            return dev
-    except Exception:
-        pass
-    try:
-        return next(model.parameters()).device
-    except StopIteration:
-        return torch.device("cpu")
 
 
 def record_activations(

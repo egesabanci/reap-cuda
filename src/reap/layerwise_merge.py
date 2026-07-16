@@ -183,6 +183,9 @@ def record_activations_layerwise_merge(
         else None
     )
 
+    from reap.kernels.triton_utils import log_triton_usage_summary, reset_triton_usage
+
+    reset_triton_usage()
     observer_data = observer.record_all_blocks(
         data_batches=data_batches,
         save_path=save_path,
@@ -196,6 +199,7 @@ def record_activations_layerwise_merge(
     )
     observer.save_state(output_file)
     observer.close_hooks()
+    log_triton_usage_summary()
 
     logger.info(f"Layerwise merge calibration complete. Saved to {output_file}")
     return observer_data

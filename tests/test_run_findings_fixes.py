@@ -100,6 +100,17 @@ def test_prefers_native_router_on_adapter_name():
     assert prefers_native_router(moe, _Lfm2LikeAdapter()) is True
 
 
+def test_prefers_native_router_false_for_plain_softmax_gate():
+    """Bare Linear gate without expert_bias must stay on F5 softmax path."""
+
+    class _Plain(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate = nn.Linear(8, 4, bias=False)
+
+    assert prefers_native_router(_Plain(), _SoftmaxAdapter()) is False
+
+
 def test_f5_router_from_module_uses_bias():
     torch.manual_seed(0)
     moe = _MoeWithBias()

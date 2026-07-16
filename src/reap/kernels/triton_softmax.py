@@ -30,8 +30,14 @@ def softmax_rows(logits: torch.Tensor) -> torch.Tensor:
         return logits.to(dtype=torch.float32)
 
     if prefer_triton_for(logits, min_numel=16) and triton_runtime_available():
+        t, e = logits.shape
+        block_e = min(next_power_of_2(e), 1024)
+        if block_e < e:
+            # Multi-tile online softmax not implemented; do not count as Triton ok.
+            log_triton_fallback(_COMPONENT, f"E={e} > BLOCK_E={block_e}")
+            return F.softmax(logits, dim=-1, dtype=torch.float32)
         try:
-            out = _softmax_triton(logits)
+            out = _softmax_triton(logits, block_e=block_e)
             record_triton_ok(_COMPONENT)
             return out
         except Exception as exc:  # pragma: no cover - device specific
@@ -39,7 +45,7 @@ def softmax_rows(logits: torch.Tensor) -> torch.Tensor:
     return F.softmax(logits, dim=-1, dtype=torch.float32)
 
 
-def _softmax_triton(logits: torch.Tensor) -> torch.Tensor:
+def _softmax_triton(logits: torch.Tensor, *, block_e: int) -> torch.Tensor:
     import triton
     import triton.language as tl
 
@@ -47,14 +53,6 @@ def _softmax_triton(logits: torch.Tensor) -> torch.Tensor:
     # Work in fp32 for stability (matches pruning_metrics).
     x = logits.contiguous()
     out = torch.empty(t, e, device=x.device, dtype=torch.float32)
-
-    # Cap block size for large expert counts (256/512 experts).
-    block_e = min(next_power_of_2(e), 1024)
-    if block_e < e:
-        # Fall back when E does not fit one block (rare for current MoEs ≤256).
-        # Multi-tile online softmax is possible but not required for targets.
-        log_triton_fallback(_COMPONENT, f"E={e} > BLOCK_E={block_e}")
-        return F.softmax(logits, dim=-1, dtype=torch.float32)
 
     @triton.jit
     def _kernel(

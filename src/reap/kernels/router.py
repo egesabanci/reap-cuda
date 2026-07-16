@@ -151,9 +151,12 @@ def prefers_native_router(moe, adapter) -> bool:
 
     Structural signals (no architecture name required):
     * adapter exposes ``prefer_native_router`` / ``prefer_native_router()``
+    * adapter name is a known non-softmax family (e.g. ``lfm2_moe``)
     * MoE has an ``expert_bias`` buffer (LFM2-style)
     * router has ``use_expert_bias=True``
-    * router.forward accepts an ``expert_bias`` kwarg
+
+    Does **not** treat a bare ``expert_bias`` kwarg in the signature as enough
+    (optional kwargs on softmax routers would false-positive).
     """
     flag = getattr(adapter, "prefer_native_router", None)
     if callable(flag):
@@ -171,15 +174,7 @@ def prefers_native_router(moe, adapter) -> bool:
     router = _resolve_router(moe, adapter)
     if router is None:
         return False
-    if bool(getattr(router, "use_expert_bias", False)):
-        return True
-    import inspect
-
-    try:
-        sig = inspect.signature(router.forward)
-    except (TypeError, ValueError):
-        return False
-    return "expert_bias" in sig.parameters
+    return bool(getattr(router, "use_expert_bias", False))
 
 
 def _router_weight_activation(moe, adapter) -> str:
@@ -241,9 +236,18 @@ def f5_router_from_module(
     router_logits_full, routing_weights, selected_experts = out[0], out[1], out[2]
 
     t, e = router_logits_full.shape
-    k = min(top_k, e)
     selected_experts = selected_experts.to(device)
     routing_weights = routing_weights.to(device)
+    # Use the router's actual top-k width (may differ from the requested top_k).
+    if selected_experts.ndim == 1:
+        selected_experts = selected_experts.unsqueeze(-1)
+        routing_weights = routing_weights.unsqueeze(-1)
+    k = int(selected_experts.shape[-1])
+    if routing_weights.shape != selected_experts.shape:
+        raise ValueError(
+            f"router weights shape {tuple(routing_weights.shape)} != "
+            f"selected_experts shape {tuple(selected_experts.shape)}"
+        )
 
     # Full (T, E) weights for merge-criteria metrics (prune-only ignores these).
     act = _router_weight_activation(moe, adapter)

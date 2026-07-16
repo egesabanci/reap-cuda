@@ -132,9 +132,9 @@ def frea_triton_activations(
     if not ok:
         log_triton_fallback(_COMPONENT, reason)
         # Permanent disable when shared-mem infeasible (avoids N failed launches).
-        if "shared mem" in reason or reason.startswith("disabled:"):
-            if not is_component_disabled(_COMPONENT) and "shared mem" in reason:
-                disable_component(_COMPONENT, reason)
+        # Skip re-disable when already memoized ("disabled: …").
+        if "shared mem" in reason and not is_component_disabled(_COMPONENT):
+            disable_component(_COMPONENT, reason)
         return routed_expert_activations_grouped(
             flat_input, router_pairs, W_gate, W_up, W_down, act_fn=act_fn
         )
