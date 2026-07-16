@@ -229,6 +229,18 @@ class Qwen3MoeModelAdapter:
             raise ValueError("Layer does not expose an mlp module.")
         return mlp
 
+    @staticmethod
+    def _is_fused_experts(experts) -> bool:
+        """True if experts is a fused module (stacked params on dim 0),
+        False if it is an iterable ModuleList."""
+        if experts is None:
+            return False
+        if isinstance(experts, nn.ModuleList):
+            return False
+        # Fused Qwen3MoeExperts (transformers>=5.x): gate_up_proj/down_proj
+        # are nn.Parameter tensors stacked on the expert axis.
+        return hasattr(experts, "gate_up_proj") and hasattr(experts, "down_proj")
+
     def get_layer_config(
         self,
         layer: Any,
@@ -268,7 +280,7 @@ class Qwen3MoeModelAdapter:
             top_k=top_k,
             norm_topk_prob=norm_topk_prob,
             adapter_name=self.adapter_name,
-            fused_experts=False,
+            fused_experts=self._is_fused_experts(getattr(moe, self.experts_attr(), None)),
         )
 
     # -- expert slicing (PyTorch, replaces prune.py non-fused branch) -----
@@ -279,8 +291,13 @@ class Qwen3MoeModelAdapter:
     ) -> None:
         """Slice the non-fused MoE module to only retain *keep_indices*."""
         all_experts = getattr(moe, self.experts_attr())
-        retained = nn.ModuleList([all_experts[i] for i in keep_indices])
-        setattr(moe, self.experts_attr(), retained)
+        if self._is_fused_experts(all_experts):
+            # Fused layout: stack weights on dim 0
+            all_experts.gate_up_proj.data = all_experts.gate_up_proj.data[keep_indices]
+            all_experts.down_proj.data = all_experts.down_proj.data[keep_indices]
+        else:
+            retained = nn.ModuleList([all_experts[i] for i in keep_indices])
+            setattr(moe, self.experts_attr(), retained)
 
         router = getattr(moe, self.router_attr())
         router.weight.data = router.weight.data[keep_indices, :]
@@ -304,6 +321,26 @@ class Qwen3MoeModelAdapter:
         top_k = min(top_k, num_experts)
         if hasattr(config, "num_experts_per_tok"):
             config.num_experts_per_tok = top_k
+
+
+class Qwen3_5MoeModelAdapter(Qwen3MoeModelAdapter):
+    """Qwen3.5/3.6-MoE adapter for the transformers>=5.x ``qwen3_5_moe`` family.
+
+    Shares the fused expert layout of :class:`Qwen3MoeModelAdapter` (stacked
+    ``gate_up_proj`` / ``down_proj`` ``nn.Parameter`` tensors) but targets the
+    ``Qwen3_5MoeSparseMoeBlock`` module class, whose router is a
+    ``Qwen3_5MoeTopKRouter`` (returning a ``(logits, scores, indices)`` tuple;
+    the observer unwraps it) and whose block additionally carries a
+    ``shared_expert`` + ``shared_expert_gate``. The shared expert is **not** a
+    routed expert and must survive pruning unchanged; :meth:`slice_experts`
+    only rewrites ``experts`` (``gate_up_proj``/``down_proj``) and the ``gate``
+    router, so the shared expert is preserved automatically.
+    """
+
+    adapter_name = "qwen3_5_moe"
+
+    def hook_regex(self) -> str:
+        return "Qwen3_5MoeSparseMoeBlock"
 
 
 class Llama4MoeModelAdapter:
@@ -438,7 +475,7 @@ class Lfm2MoeModelAdapter:
     expose neither ``gate`` nor ``experts``.
 
     Requires ``transformers>=5.2`` (``Lfm2MoeForCausalLM`` is not present in
-    the pinned ``transformers==4.55`` — see issue #4 / the LFM2 runtime note).
+    older releases — see issue #4 / the LFM2 runtime note).
     """
 
     adapter_name = "lfm2_moe"
@@ -683,6 +720,13 @@ def infer_model_adapter(
             return MixtralMoeModelAdapter()
 
         if any(
+            type(getattr(layer, "mlp", None)).__name__
+            == "Qwen3_5MoeSparseMoeBlock"
+            for layer in layers
+        ):
+            return Qwen3_5MoeModelAdapter()
+
+        if any(
             getattr(getattr(layer, "mlp", None), "experts", None)
             is not None
             for layer in layers
@@ -693,6 +737,10 @@ def infer_model_adapter(
         return None
 
     # Config-only inference (no model object).
+    if model_type in {"qwen3_5_moe", "qwen3_5_moe_text"} or any(
+        "Qwen3_5Moe" in str(a) for a in architectures
+    ):
+        return Qwen3_5MoeModelAdapter()
     if model_type in _LFM2_FAMILY_TYPES or any(
         str(a).startswith("Lfm2") and "Moe" in str(a) for a in architectures
     ):
@@ -718,6 +766,7 @@ __all__ = [
     "Llama4MoeModelAdapter",
     "MixtralMoeModelAdapter",
     "MoeLayerConfig",
+    "Qwen3_5MoeModelAdapter",
     "Qwen3MoeModelAdapter",
     "get_model_layers",
     "get_shared_expert",
