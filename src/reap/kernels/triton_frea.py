@@ -196,22 +196,25 @@ def _run_probe(
     *,
     act_fn: Callable,
 ) -> str:
-    """Time Triton vs PyTorch once; return ``triton`` or ``pytorch``."""
+    """Time Triton vs PyTorch once; return ``triton`` or ``pytorch``.
+
+    Does **not** memoize on tiny ``n_pairs`` (would stick the wrong choice for
+    the whole run when the first batch is sparse). Includes a warm-up Triton
+    launch so JIT compile time does not bias the probe toward PyTorch.
+    """
     key = _probe_key(flat_input, W_gate)
     if key in _PROBE_CHOICE:
         return _PROBE_CHOICE[key]
 
     n_pairs = int(router_pairs.pair_token_idx.numel())
-    # Tiny pair counts: launch overhead dominates — prefer PyTorch.
+    # Too few pairs: launch overhead dominates — skip probe *without* memoizing
+    # so a later denser batch can still probe.
     if n_pairs < 16:
-        choice = "pytorch"
-        _PROBE_CHOICE[key] = choice
         logger.info(
-            "FREA profitability probe: n_pairs=%d < 16 -> %s (skip timed probe)",
+            "FREA profitability probe deferred: n_pairs=%d < 16 (not memoized)",
             n_pairs,
-            choice,
         )
-        return choice
+        return "pytorch"
 
     ok, reason = _triton_frea_supported(
         flat_input, W_gate, act_fn=act_fn, require_profitable_tiles=False
@@ -219,6 +222,8 @@ def _run_probe(
     t_tr = float("inf")
     if ok:
         try:
+            # Warm-up (JIT + first-touch); not timed.
+            _ = _frea_triton_impl(flat_input, router_pairs, W_gate, W_up, W_down)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
             _ = _frea_triton_impl(flat_input, router_pairs, W_gate, W_up, W_down)
@@ -228,6 +233,10 @@ def _run_probe(
             logger.debug("FREA probe Triton failed: %s", exc)
             t_tr = float("inf")
 
+    # Warm-up PyTorch path too (allocator / autotune noise).
+    _ = routed_expert_activations_grouped(
+        flat_input, router_pairs, W_gate, W_up, W_down, act_fn=act_fn
+    )
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     _ = routed_expert_activations_grouped(
@@ -236,7 +245,7 @@ def _run_probe(
     torch.cuda.synchronize()
     t_py = time.perf_counter() - t0
 
-    # Prefer Triton on ties (memory win); require clear win for pytorch.
+    # Prefer Triton on ties / near-ties (memory win); require clear win for pytorch.
     if t_tr <= t_py * 1.05:
         choice = "triton" if t_tr < float("inf") else "pytorch"
     else:
@@ -244,7 +253,7 @@ def _run_probe(
 
     _PROBE_CHOICE[key] = choice
     logger.info(
-        "FREA profitability probe: triton=%.4fs pytorch=%.4fs -> %s (reason_ok=%s)",
+        "FREA profitability probe: triton=%.4fs pytorch=%.4fs -> %s (reason=%s)",
         t_tr if t_tr < float("inf") else -1.0,
         t_py,
         choice,
@@ -371,9 +380,17 @@ def _frea_triton_impl(
     if blocks is None:
         raise RuntimeError("FREA block selection failed after support check")
     block_h, block_i, block_n = blocks
-    # Prefer larger token tiles when H/I tiles are small (#29 occupancy).
-    if block_h <= 64 and block_i <= 64:
-        block_n = 32 if n_pairs >= 32 else block_n
+    # Prefer larger token tiles when H/I tiles are small (#29 occupancy), but
+    # re-check shared-mem with the larger BLOCK_N (estimate depends on it).
+    if block_h <= 64 and block_i <= 64 and n_pairs >= 32:
+        candidate_n = 32
+        smem = _smem_budget(
+            flat_input.device, prefer_optin=_USE_SMEM_OPTIN is not False
+        )
+        if smem is not None:
+            need = estimate_frea_shared_bytes(candidate_n, block_h, block_i)
+            if need + 2048 <= smem:
+                block_n = candidate_n
 
     @triton.jit
     def _expert_swiglu_kernel(

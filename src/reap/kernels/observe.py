@@ -176,13 +176,11 @@ def observe_moe_batch(
 
     stacked = get_stacked_expert_weights(moe, adapter, device=device)
     use_triton = backend in ("frea", "f2") and triton_runtime_available()
-    # FREA sub-backend (auto probe / force triton / force pytorch) — env or
-    # ObserverArgs.frea_backend via REAP_FREA_BACKEND set by CLI.
-    frea_backend = getattr(adapter, "_frea_backend", None)
+    # FREA sub-backend from process policy (CLI / set_frea_backend / env).
     try:
         from reap.kernels.triton_frea import get_frea_backend
 
-        frea_backend = frea_backend or get_frea_backend()
+        frea_backend = get_frea_backend()
     except Exception:
         frea_backend = "auto"
     pair_out = frea_activations(

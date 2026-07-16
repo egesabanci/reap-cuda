@@ -32,23 +32,21 @@ def frea_activations(
 ):
     """Return routed pair outputs ``(n_pairs, H)``."""
     backend = frea_backend or get_frea_backend()
-    if use_triton is None:
-        use_triton = (
-            triton_runtime_available()
-            and flat_input.is_cuda
-            and backend != "pytorch"
+    if backend == "pytorch" or use_triton is False:
+        return routed_expert_activations_grouped(
+            flat_input, router_pairs, W_gate, W_up, W_down, act_fn=act_fn
         )
-    if use_triton or backend == "auto":
-        return frea_activations_auto(
-            flat_input,
-            router_pairs,
-            W_gate,
-            W_up,
-            W_down,
-            act_fn=act_fn,
-            use_triton=True if backend != "pytorch" else False,
-            frea_backend=backend,
-        )
-    return routed_expert_activations_grouped(
-        flat_input, router_pairs, W_gate, W_up, W_down, act_fn=act_fn
+    # auto / triton: let triton_frea apply probe / force policy.
+    want = use_triton
+    if want is None:
+        want = triton_runtime_available() and flat_input.is_cuda
+    return frea_activations_auto(
+        flat_input,
+        router_pairs,
+        W_gate,
+        W_up,
+        W_down,
+        act_fn=act_fn,
+        use_triton=bool(want),
+        frea_backend=backend,
     )
