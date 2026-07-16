@@ -20,6 +20,7 @@ reap
 ├── merge
 │   ├── full
 │   └── layerwise
+├── kernels   # CUDA / Triton / auto-backend status (no model load)
 └── version
 ```
 
@@ -29,6 +30,15 @@ Global:
 | --- | --- |
 | `-v` / `--verbose` | DEBUG logging |
 | `-h` / `--help` | Help |
+
+## `reap version` / `reap kernels`
+
+```bash
+reap version    # package version (e.g. 0.1.0)
+reap kernels    # torch.cuda, Triton package/runtime, resolved auto backend
+```
+
+`kernels` loads no model — useful for EC2 bring-up before a long prune.
 
 ## `reap prune full`
 
@@ -130,7 +140,7 @@ disk offload). Orthogonal to full vs layerwise observe schedule.
 
 ```bash
 # Small-RAM GPU instance (model fits VRAM)
-reap prune full --residency gpu_full -m LiquidAI/LFM2-8B-A1B ...
+reap prune full --residency gpu_full -m LiquidAI/LFM2.5-8B-A1B ...
 
 # Explicit layerwise weights policy on layerwise CLI
 reap prune layerwise --residency auto -m Qwen/Qwen3-30B-A3B ...

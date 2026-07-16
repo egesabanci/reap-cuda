@@ -359,7 +359,7 @@ Example (g6-friendly explicit):
 
 ```bash
 uv run reap prune full \
-  --model LiquidAI/LFM2-8B-A1B \
+  --model LiquidAI/LFM2.5-8B-A1B \
   --dataset theblackcat102/evol-codealpaca-v1 \
   --prune-method reap \
   --compression-ratio 0.5 \

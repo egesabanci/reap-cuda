@@ -198,7 +198,7 @@ installs do not crash. See [gpu-and-backends.md](gpu-and-backends.md).
 ```bash
 # g6.xlarge-class: keep weights on GPU, stream-save (do not pin CPU)
 uv run reap prune full \
-  -m LiquidAI/LFM2-8B-A1B \
+  -m LiquidAI/LFM2.5-8B-A1B \
   -d theblackcat102/evol-codealpaca-v1 \
   --prune-method reap \
   --compression-ratio 0.5 \
@@ -219,7 +219,7 @@ local path.
 
 ```bash
 uv run reap prune full \
-  -m /data/models/LFM2-8B-A1B \
+  -m /data/models/LFM2.5-8B-A1B \
   -d theblackcat102/evol-codealpaca-v1 \
   --dataset-path /data/datasets/evol-codealpaca-calib-200 \
   --artifacts-dir /data/reap-artifacts \
