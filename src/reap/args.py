@@ -1,5 +1,4 @@
 from dataclasses import dataclass, field
-import os
 
 
 @dataclass
@@ -329,24 +328,9 @@ class MergeArgs:
             )
         },
     )
-    save_as_merged_model: bool = field(
-        default=False,
-        metadata={
-            "help": (
-                "Whether to save the merged model as a custom merged model. "
-                "If False, saves merged experts as separate experts."
-            )
-        },
-    )
 
 @dataclass
 class EvalArgs:
-    use_server: bool = field(
-        default=True,
-        metadata={
-            "help": "Whether to use a vllm server for evaluation. If False, uses hf backends."
-        },
-    )
     greedy: bool = field(
         default=True,
         metadata={
@@ -427,20 +411,6 @@ class EvalArgs:
         ],
         metadata={
             "help": "List of tasks to evaluate on using evalplus.",
-        },
-    )
-    server_log_file_name: str = field(
-        default="server.log"
-        if os.environ.get("SERVER_LOG_FILE_NAME") is None
-        else os.environ["SERVER_LOG_FILE_NAME"],
-        metadata={
-            "help": "Name of the log file for the evaluation server.",
-        },
-    )
-    vllm_port: int = field(
-        default=8000,
-        metadata={
-            "help": "Port number for vLLM serve"
         },
     )
     parallel_tasks: int = field(
