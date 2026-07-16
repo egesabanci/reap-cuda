@@ -97,6 +97,14 @@ def prune(
 
     pruned_model_dir.mkdir(parents=True, exist_ok=True)
     start = time.time()
+    # Strip accelerate's device_map dispatch hooks so save_pretrained takes the
+    # plain safetensors path (streams each shard straight from the GPU tensors
+    # via safetensors.safe_save_file, which handles CUDA tensors natively and
+    # cleans up between shards) instead of accelerate's get_state_dict_from_offload
+    # which materializes the entire state dict on CPU. On a low-RAM box (15GB RAM,
+    # 16GB model, 0 swap) the CPU-materializing path wedges the host. With hooks
+    # removed the save is GPU-streamed and CPU-light.
+    remove_hook_from_module(model, recurse=True)
     model.save_pretrained(pruned_model_dir)
     end = time.time()
     logger.info(
