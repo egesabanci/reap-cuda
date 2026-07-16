@@ -61,6 +61,11 @@ from reap.args import (
 from reap.data import load_category_batches
 from reap import data as reap_data
 from reap.kernels.backend import select_observe_backend
+from reap.kernels.triton_utils import (
+    format_triton_usage_summary,
+    reset_triton_usage,
+    triton_usage_snapshot,
+)
 from reap.model_adapters import infer_model_adapter
 from reap.pipeline import _setup_observer, smoke_test
 import re as _re
@@ -379,6 +384,7 @@ def main():
         # ---- Phase 5: observe (f2 Triton) ----
         obs_file = results_dir / "observations.pt"
         with phase("5_observe", backend=OBSERVE_BACKEND) as r:
+            reset_triton_usage()
             t0 = time.perf_counter()
             n_done = 0
             with torch.no_grad():
@@ -403,6 +409,12 @@ def main():
             observer.save_state(obs_file)
             observer.close_hooks()
             r["obs_state_file"] = str(obs_file)
+            # Triton usage summary (issue #18 fix): per-kernel ok/fallback counts.
+            snap = triton_usage_snapshot()
+            r["triton_usage"] = snap
+            summary = format_triton_usage_summary()
+            r["triton_usage_summary"] = summary
+            logger.info("Triton usage: %s", summary)
 
         # reload observer data (same path as record_activations)
         with phase("5b_load_observer_state") as r:
