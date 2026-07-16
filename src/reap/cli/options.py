@@ -38,7 +38,9 @@ DatasetName = Annotated[
         "-d",
         help=(
             "Calibration dataset id, composite spec "
-            "(name:N,...), or 'combined' for cached observations."
+            "(name:N_batches,... optional @local_path), "
+            "or 'combined' for cached observations. "
+            "Composite N is a batch count, not sample count."
         ),
         rich_help_panel="Data",
     ),

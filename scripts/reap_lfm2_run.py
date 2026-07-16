@@ -59,7 +59,6 @@ from reap.args import (
     ReapArgs,
 )
 from reap.data import load_category_batches
-from reap import data as reap_data
 from reap.kernels.backend import select_observe_backend
 from reap.kernels.triton_utils import (
     format_triton_usage_summary,
@@ -208,23 +207,31 @@ class GpuSampler(threading.Thread):
         self.f.close()
 
 
-# --------------------------- local dataset shim ----------------------------
-def _install_local_dataset_shim(n_examples: int):
-    """Make load_category_batches use the local 100-row arrow subset."""
+def _prepare_local_calib_path(n_examples: int, cache_dir: Path) -> Path:
+    """Materialize an N-row subset on disk for the real --dataset-path path.
+
+    Avoids monkeypatching ``_load_raw_dataset`` so instrumented runs exercise
+    the production offline loader end-to-end (#39).
+    """
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    subset_dir = cache_dir / f"evol_calib_{n_examples}"
+    if (subset_dir / "dataset_info.json").exists() or (
+        subset_dir / "state.json"
+    ).exists():
+        logger.info("Reusing local calib subset at %s", subset_dir)
+        return subset_dir
     full = Dataset.from_file(DATASET_ARROW)
-    local_ds = full.select(range(n_examples))
-    logger.info("Local dataset shim: %d examples (of %d) from %s",
-                len(local_ds), len(full), DATASET_ARROW)
-
-    _orig = reap_data._load_raw_dataset
-
-    def _shim(dataset_name, split, subset=None):
-        if dataset_name == "theblackcat102/evol-codealpaca-v1":
-            return local_ds
-        return _orig(dataset_name, split, subset=subset)
-
-    reap_data._load_raw_dataset = _shim
-    return local_ds
+    n = min(n_examples, len(full))
+    local_ds = full.select(range(n))
+    local_ds.save_to_disk(str(subset_dir))
+    logger.info(
+        "Wrote local calib subset: %d examples -> %s (from %s)",
+        n,
+        subset_dir,
+        DATASET_ARROW,
+    )
+    return subset_dir
 
 
 # --------------------------- main ------------------------------------------
@@ -293,8 +300,14 @@ def main():
         reap_args = ReapArgs(seed=SEED, profile=False, run_observer_only=False,
                              do_eval=False, smoke_test=True, residency=RESIDENCY)
         model_args = ModelArgs(model_name=MODEL_PATH)
-        ds_args = DatasetArgs(dataset_name="theblackcat102/evol-codealpaca-v1",
-                              split="train", dataset_config_name=None, shuffle=False)
+        local_calib = _prepare_local_calib_path(N_EXAMPLES, results_dir / ".calib")
+        ds_args = DatasetArgs(
+            dataset_name="theblackcat102/evol-codealpaca-v1",
+            split="train",
+            dataset_config_name=None,
+            shuffle=False,
+            dataset_path=str(local_calib),
+        )
         obs_args = ObserverArgs(
             batches_per_category=N_EXAMPLES,
             batch_size=BATCH_SIZE,
@@ -344,9 +357,9 @@ def main():
                         MODEL_PATH, r["adapter"], r["n_moe_layers"],
                         r["num_experts"], r["num_experts_per_tok"])
 
-        # ---- Phase 3: dataset load + tokenize (local 100) ----
+        # ---- Phase 3: dataset load + tokenize (real --dataset-path) ----
         with phase("3_dataset_load_tokenize") as r:
-            _install_local_dataset_shim(N_EXAMPLES)
+            r["dataset_path"] = ds_args.dataset_path
             category_data = load_category_batches(
                 dataset_name=ds_args.dataset_name,
                 split=ds_args.split,
@@ -358,6 +371,7 @@ def main():
                 truncate=obs_args.truncate,
                 batches_per_category=obs_args.batches_per_category,
                 batch_size=obs_args.batch_size,
+                dataset_path=ds_args.dataset_path,
             )
             batches = category_data["all"]
             r["n_batches"] = len(batches)

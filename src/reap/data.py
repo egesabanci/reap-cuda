@@ -106,31 +106,32 @@ class CompositeDatasetComponent:
     """A single component of a composite dataset specification.
 
     Attributes:
-        name: HuggingFace dataset name (e.g., "open-r1/Mixture-of-Thoughts").
-        split: HF dataset split to load (e.g., "train", "tool"). None means use
-               the default split from DatasetArgs.
-        subset: HF dataset config/subset name (e.g., "code", "math"). None means
-                do not pass a subset to ``load_dataset``.
-        num_batches: Number of batches to draw from this component.
+        name: HuggingFace dataset name / registry key for field mapping.
+        split: HF dataset split to load (e.g., "train", "tool").
+        subset: HF dataset config/subset name (e.g., "code"). None = default.
+        num_batches: Number of **calibration batches** (not raw samples).
+        local_path: Optional offline path for this component (``@/path`` in spec).
     """
 
     name: str
     split: str | None
     subset: str | None
     num_batches: int
+    local_path: str | None = None
 
 
-# Regex to parse a single component: <name>[<subset>](<split>):<num_batches>
+# Regex: <name>[<subset>](<split>):<num_batches>[@local_path]
 # Examples:
-#   "theblackcat102/evol-codealpaca-v1:4096"            -> name="theblackcat102/evol-codealpaca-v1", subset=None, split=None, num_batches=4096
-#   "open-r1/Mixture-of-Thoughts[code]:4096"            -> name="open-r1/Mixture-of-Thoughts", subset="code", split=None, num_batches=4096
-#   "SWE-bench/SWE-smith-trajectories(tool):4096"      -> name="SWE-bench/SWE-smith-trajectories", subset=None, split="tool", num_batches=4096
-#   "dataset[subset](split):4096"                      -> name="dataset", subset="subset", split="split", num_batches=4096
+#   "theblackcat102/evol-codealpaca-v1:4096"
+#   "open-r1/Mixture-of-Thoughts[code]:64"
+#   "SWE-bench/SWE-smith-trajectories(tool):64"
+#   "theblackcat102/evol-codealpaca-v1:64@/data/datasets/evol-calib"
 _COMPOSITE_COMPONENT_RE = re.compile(
-    r"^(?P<name>[^\[\]()[:,]+)"  # dataset name
+    r"^(?P<name>[^\[\]()[:,@]+)"  # dataset name
     r"(?:\[(?P<subset>[^\]]+)\])?"  # optional [subset]
     r"(?:\((?P<split>[^\)]+)\))?"  # optional (split)
-    r":(?P<num_batches>\d+)$"  # :num_batches (required for composite)
+    r":(?P<num_batches>\d+)"  # :num_batches (required for composite)
+    r"(?:@(?P<path>.+))?$"  # optional @local_path
 )
 
 
@@ -178,7 +179,8 @@ def parse_composite_dataset_spec(
                 return None
             raise ValueError(
                 f"Failed to parse composite dataset component {i}: '{part}'. "
-                f"Expected format: <dataset_name>[<subset>](<split>):<num_batches>. "
+                f"Expected format: <dataset_name>[<subset>](<split>):<num_batches>[@local_path]. "
+                f"Note: the trailing number is a **batch count**, not sample count. "
                 f"Full spec: '{spec}'"
             )
         name = m.group("name").strip()
@@ -189,12 +191,16 @@ def parse_composite_dataset_spec(
         if split is None:
             split = default_split
         num_batches = int(m.group("num_batches"))
+        local_path = m.group("path")
+        if local_path is not None:
+            local_path = local_path.strip()
         components.append(
             CompositeDatasetComponent(
                 name=name,
                 split=split,
                 subset=subset,
                 num_batches=num_batches,
+                local_path=local_path,
             )
         )
 
@@ -214,23 +220,62 @@ def parse_composite_dataset_spec(
     return components
 
 
+def _hub_offline() -> bool:
+    import os
+
+    for key in ("HF_HUB_OFFLINE", "HF_DATASETS_OFFLINE"):
+        if os.environ.get(key, "").strip().lower() in {"1", "true", "yes", "on"}:
+            return True
+    return False
+
+
+def _offline_path_hint() -> str:
+    return (
+        " If you have the data locally, pass --dataset-path <arrow|dir|json|jsonl> "
+        "(loads offline without the HuggingFace hub)."
+    )
+
+
 def _load_raw_dataset(dataset_name, split, subset=None):
     """Load a raw HuggingFace dataset, handling special cases like C4."""
+    import os
+
     try:
         if dataset_name == "allenai/c4":
-            file_url = "https://huggingface.co/datasets/allenai/c4/resolve/main/en/c4-train.00000-of-01024.json.gz"
-            return load_dataset(
-                "json", data_files={"train": file_url}, split="train", streaming=False
+            if _hub_offline():
+                raise RuntimeError(
+                    "allenai/c4 cannot be fetched from the network while "
+                    "HF_HUB_OFFLINE/HF_DATASETS_OFFLINE is set."
+                    + _offline_path_hint()
+                    + " Example: --dataset allenai/c4 --dataset-path /data/c4-shard.json.gz"
+                )
+            # Single public shard (not full C4). Prefer --dataset-path offline.
+            file_url = (
+                "https://huggingface.co/datasets/allenai/c4/resolve/main/"
+                "en/c4-train.00000-of-01024.json.gz"
             )
-        else:
-            load_kwargs = {}
-            if subset is not None:
-                load_kwargs = {"name": subset}
-            return load_dataset(dataset_name, split=split, **load_kwargs)
+            logger.warning(
+                "Loading allenai/c4 from a single remote train shard (not full C4). "
+                "For offline/air-gapped use, pass --dataset-path to a local file."
+            )
+            return load_dataset(
+                "json",
+                data_files={"train": file_url},
+                split=split if split else "train",
+                streaming=False,
+            )
+        load_kwargs = {}
+        if subset is not None:
+            load_kwargs = {"name": subset}
+        return load_dataset(dataset_name, split=split, **load_kwargs)
     except Exception as e:
-        raise RuntimeError(
-            f"Failed to load dataset '{dataset_name}' (subset={subset}, split={split}): {e}"
+        msg = (
+            f"Failed to load dataset '{dataset_name}' "
+            f"(subset={subset}, split={split}): {e}"
         )
+        if not _hub_offline():
+            msg += _offline_path_hint()
+        raise RuntimeError(msg) from e
 
 
 def _load_local_dataset(path: str, split: str = "train"):
@@ -246,38 +291,153 @@ def _load_local_dataset(path: str, split: str = "train"):
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("datasets package required for local load") from exc
 
-    # Single arrow shard
+    split_norm = (split or "train").strip()
+
+    # Single arrow / parquet shard
     if p.is_file() and p.suffix in {".arrow", ".parquet"}:
         if p.suffix == ".arrow":
+            # Arrow shards have no embedded split metadata.
+            if split_norm not in {"train", "all", ""}:
+                logger.warning(
+                    "Local .arrow file %s has no split metadata; loading the entire "
+                    "file and ignoring --split=%r. Use a DatasetDict on disk or "
+                    "parquet/json if you need real splits.",
+                    p,
+                    split,
+                )
             return Dataset.from_file(str(p))
-        return _ld("parquet", data_files=str(p), split=split)
+        return _ld("parquet", data_files=str(p), split=split_norm)
 
     # Directory of shards or HF dataset save_to_disk
     if p.is_dir():
-        # save_to_disk layout
-        if (p / "dataset_info.json").exists() or (p / "state.json").exists():
-            return Dataset.load_from_disk(str(p))
+        # save_to_disk layout (Dataset or DatasetDict)
+        if (p / "dataset_info.json").exists() or (p / "state.json").exists() or (
+            p / "dataset_dict.json"
+        ).exists():
+            loaded = Dataset.load_from_disk(str(p))
+            # DatasetDict has named splits
+            if isinstance(loaded, DatasetDict):
+                if split_norm in loaded:
+                    return loaded[split_norm]
+                if "train" in loaded and split_norm == "train":
+                    return loaded["train"]
+                raise ValueError(
+                    f"Local DatasetDict at {p} has splits {list(loaded.keys())}; "
+                    f"requested split={split_norm!r} not found."
+                )
+            if split_norm not in {"train", "all", ""}:
+                logger.warning(
+                    "Local Dataset at %s is a single split; ignoring --split=%r "
+                    "and loading all rows.",
+                    p,
+                    split,
+                )
+            return loaded
         arrows = sorted(p.glob("*.arrow"))
         if arrows:
-            # Concatenate shards
             parts = [Dataset.from_file(str(a)) for a in arrows]
             if len(parts) == 1:
-                return parts[0]
-            from datasets import concatenate_datasets
+                ds = parts[0]
+            else:
+                from datasets import concatenate_datasets
 
-            return concatenate_datasets(parts)
+                ds = concatenate_datasets(parts)
+            if split_norm not in {"train", "all", ""}:
+                logger.warning(
+                    "Local arrow directory %s has no split metadata; ignoring "
+                    "--split=%r and loading all rows.",
+                    p,
+                    split,
+                )
+            return ds
         jsons = sorted(list(p.glob("*.jsonl")) + list(p.glob("*.json")))
         if jsons:
-            return _ld("json", data_files=[str(j) for j in jsons], split=split)
+            return _ld("json", data_files=[str(j) for j in jsons], split=split_norm)
         raise ValueError(f"No loadable dataset files under {p}")
 
     if p.suffix in {".json", ".jsonl"}:
-        return _ld("json", data_files=str(p), split=split)
+        return _ld("json", data_files=str(p), split=split_norm)
 
     raise ValueError(
         f"Unsupported local dataset path {p} "
         "(expected .arrow/.parquet/.json/.jsonl or a directory)"
     )
+
+
+# Columns required by known processors (for offline validation).
+_PROCESSOR_REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
+    "theblackcat102/evol-codealpaca-v1": frozenset({"instruction", "output"}),
+    "euclaise/WritingPrompts_curated": frozenset({"prompt", "body"}),
+    "ise-uiuc/Magicoder-Evol-Instruct-110K": frozenset({"instruction", "response"}),
+    "Salesforce/xlam-function-calling-60k": frozenset({"query", "answers", "tools"}),
+}
+
+
+def _dataset_column_names(raw_ds) -> set[str]:
+    if hasattr(raw_ds, "column_names") and raw_ds.column_names is not None:
+        cols = raw_ds.column_names
+        if isinstance(cols, dict):
+            # DatasetDict — union of all splits
+            out: set[str] = set()
+            for v in cols.values():
+                out.update(v)
+            return out
+        return set(cols)
+    return set()
+
+
+def _validate_processor_columns(registry_key: str, raw_ds, path: str | None) -> None:
+    required = _PROCESSOR_REQUIRED_COLUMNS.get(registry_key)
+    if not required:
+        return
+    present = _dataset_column_names(raw_ds)
+    if not present:
+        return
+    missing = required - present
+    if missing:
+        where = f" at {path}" if path else ""
+        raise ValueError(
+            f"Dataset{where} has columns {sorted(present)} but processor "
+            f"{registry_key!r} requires {sorted(required)} "
+            f"(missing {sorted(missing)}). "
+            f"Set --dataset to a registered id whose field mapping matches, "
+            f"or register a processor. Supported: {list(DATASET_REGISTRY.keys())}."
+        )
+
+
+def resolve_component_dataset_path(
+    component: CompositeDatasetComponent,
+    global_path: str | None,
+) -> str | None:
+    """Resolve offline path for one composite component.
+
+    Priority:
+    1. Per-component ``@path`` from the composite spec
+    2. ``global_path / short_name`` if that exists
+    3. ``global_path`` itself when there is only one component or it is a file
+    """
+    import pathlib as _pl
+
+    if component.local_path:
+        return component.local_path
+    if not global_path:
+        return None
+    root = _pl.Path(global_path).expanduser()
+    short = component.name.split("/")[-1]
+    candidate = root / short
+    if candidate.exists():
+        return str(candidate)
+    if root.is_file() or (
+        root.is_dir()
+        and (
+            (root / "dataset_info.json").exists()
+            or (root / "state.json").exists()
+            or list(root.glob("*.arrow"))
+            or list(root.glob("*.json*"))
+        )
+    ):
+        return str(root)
+    return str(root)  # let _load_local_dataset raise FileNotFoundError
 
 
 def load_category_batches(
@@ -299,6 +459,10 @@ def load_category_batches(
     *dataset_path*, when set, loads arrow/json from disk (offline) instead of
     the HuggingFace hub. If *dataset_name* itself is an existing path and
     *dataset_path* is unset, that path is used as the local source.
+
+    Raises:
+        ValueError: unknown processor, or local columns incompatible with processor.
+        RuntimeError: hub load failure (message suggests ``--dataset-path``).
     """
     import os
     import pathlib as _pl
@@ -310,46 +474,46 @@ def load_category_batches(
     if path is not None:
         logger.info("Loading local dataset from %s", path)
         raw_ds = _load_local_dataset(path, split=split)
-        # Processor is still keyed by registry name when path is separate.
-        registry_key = dataset_name
-        if path == dataset_name or (
+        # Processor is always keyed by registry name (--dataset), never guessed
+        # from a filesystem path alone.
+        if dataset_name in DATASET_REGISTRY:
+            registry_key = dataset_name
+        elif path == dataset_name or (
             dataset_name
             and os.path.exists(dataset_name)
             and _pl.Path(dataset_name).resolve() == _pl.Path(path).resolve()
         ):
-            # Prefer a default processor when only a path is given.
-            registry_key = (
-                dataset_name
-                if dataset_name in DATASET_REGISTRY
-                else "theblackcat102/evol-codealpaca-v1"
+            raise ValueError(
+                f"Local path {path} was used as --dataset, but no DatasetProcessor "
+                f"is registered under that name. Pass a registered --dataset id for "
+                f"field mapping (e.g. theblackcat102/evol-codealpaca-v1 for "
+                f"instruction/output columns) and --dataset-path for the files. "
+                f"Supported: {list(DATASET_REGISTRY.keys())}."
             )
-            if dataset_name not in DATASET_REGISTRY:
-                logger.info(
-                    "No processor for path-as-name %s; using evol-codealpaca processor",
-                    dataset_name,
-                )
+        else:
+            raise ValueError(
+                f"No DatasetProcessor registered for {dataset_name!r}. "
+                f"Supported: {list(DATASET_REGISTRY.keys())}."
+            )
     else:
+        if _hub_offline() and dataset_name not in ("combined",):
+            raise RuntimeError(
+                f"Cannot load hub dataset {dataset_name!r} while "
+                f"HF_HUB_OFFLINE/HF_DATASETS_OFFLINE is set."
+                + _offline_path_hint()
+            )
         raw_ds = _load_raw_dataset(dataset_name, split, subset=subset)
         registry_key = dataset_name
 
-    # load dataset processor
     proc_cls = DATASET_REGISTRY.get(registry_key)
     if proc_cls is None:
-        # Fall back to evol-codealpaca (instruction/output) for unknown hub ids
-        # when a local path was provided with a processor-bearing --dataset.
-        if path is not None and "theblackcat102/evol-codealpaca-v1" in DATASET_REGISTRY:
-            logger.warning(
-                "No DatasetProcessor for %r; using evol-codealpaca mapping for local path",
-                registry_key,
-            )
-            proc_cls = DATASET_REGISTRY["theblackcat102/evol-codealpaca-v1"]
-        else:
-            raise ValueError(
-                f"No DatasetProcessor registered for '{registry_key}'. "
-                f"Supported: {list(DATASET_REGISTRY.keys())}"
-            )
+        raise ValueError(
+            f"No DatasetProcessor registered for '{registry_key}'. "
+            f"Supported: {list(DATASET_REGISTRY.keys())}."
+        )
 
-    # init processor & process dataset
+    _validate_processor_columns(registry_key, raw_ds, path)
+
     processor = proc_cls(
         dataset=raw_ds,
         tokenizer=tokenizer,
@@ -364,6 +528,70 @@ def load_category_batches(
         batches_per_category=batches_per_category,
     )
     return category_data_batches
+
+
+def load_composite_category_batches(
+    components: list[CompositeDatasetComponent],
+    *,
+    tokenizer,
+    model_max_length,
+    batch_size,
+    return_vllm_tokens_prompt: bool,
+    truncate: bool,
+    global_dataset_path: str | None = None,
+) -> dict:
+    """Load and concatenate batches for a composite dataset spec.
+
+    Honors per-component ``@path`` and a shared ``--dataset-path`` root.
+    """
+    import pathlib as _pl
+
+    if global_dataset_path and len(components) > 1:
+        # Require either per-component @paths or a directory root with subdirs.
+        root = _pl.Path(global_dataset_path).expanduser()
+        any_at = any(c.local_path for c in components)
+        if not any_at and root.is_file():
+            raise ValueError(
+                f"--dataset-path points to a single file ({root}) but the composite "
+                f"spec has {len(components)} components. Use one component, or a "
+                f"directory with one subfolder per component short name, or per-component "
+                f"paths: name:N@/local/path in the composite spec."
+            )
+
+    combined: list = []
+    for comp_idx, component in enumerate(components):
+        path = resolve_component_dataset_path(component, global_dataset_path)
+        if global_dataset_path and path is None and not component.local_path:
+            raise ValueError(
+                f"Could not resolve a local path for composite component "
+                f"{component.name!r} under --dataset-path={global_dataset_path!r}. "
+                f"Use name:N@/absolute/path or place data at "
+                f"{{dataset_path}}/{component.name.split('/')[-1]}."
+            )
+        logger.info(
+            "[%d/%d] Loading composite component %s split=%s batches=%d path=%s",
+            comp_idx + 1,
+            len(components),
+            component.name,
+            component.split,
+            component.num_batches,
+            path,
+        )
+        part = load_category_batches(
+            dataset_name=component.name,
+            split=component.split,
+            subset=component.subset,
+            tokenizer=tokenizer,
+            model_max_length=model_max_length,
+            split_by_category=False,
+            return_vllm_tokens_prompt=return_vllm_tokens_prompt,
+            truncate=truncate,
+            batches_per_category=component.num_batches,
+            batch_size=batch_size,
+            dataset_path=path,
+        )
+        combined.extend(part["all"])
+    return {"all": combined}
 
 
 # --- Base Dataset Processors --------------------------------------------------

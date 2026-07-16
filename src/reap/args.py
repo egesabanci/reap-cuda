@@ -78,10 +78,12 @@ class DatasetArgs:
             "help": (
                 "Name of the dataset to use. Can be a single HuggingFace dataset name "
                 "(e.g., 'theblackcat102/evol-codealpaca-v1') or a composite specification "
-                "with comma-separated entries of <dataset>[<subset>](<split>):<num_samples>. "
-                "Example: 'theblackcat102/evol-codealpaca-v1:4096,"
-                "open-r1/Mixture-of-Thoughts[code]:4096,"
-                "SWE-bench/SWE-smith-trajectories(tool):4096'. "
+                "with comma-separated entries of "
+                "<dataset>[<subset>](<split>):<num_batches>[@local_path]. "
+                "The trailing number is a **batch count** (not raw sample count). "
+                "Example: 'theblackcat102/evol-codealpaca-v1:64,"
+                "open-r1/Mixture-of-Thoughts[code]:64'. "
+                "Offline per-component path: 'name:64@/data/local_dir'. "
                 "Use 'combined' to load pre-recorded combined observation data."
             ),            
         },

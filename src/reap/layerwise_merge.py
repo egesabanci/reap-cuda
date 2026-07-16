@@ -44,7 +44,11 @@ from reap.args import (
     MergeArgs,
     LayerwiseArgs,
 )
-from reap.data import load_category_batches, parse_composite_dataset_spec
+from reap.data import (
+    load_category_batches,
+    load_composite_category_batches,
+    parse_composite_dataset_spec,
+)
 from reap.model_adapters import infer_model_adapter
 from reap.observer import MoETransformerObserverConfig
 from reap.layerwise_observer import LayerwiseMoEObserver
@@ -83,29 +87,25 @@ def prepare_calibration_batches(
         ds_args.dataset_name, default_split=ds_args.split
     )
 
+    global_path = getattr(ds_args, "dataset_path", None)
     if composite_components is not None:
-        all_batches = []
-        total_samples = sum(component.num_batches for component in composite_components)
+        total_batches = sum(c.num_batches for c in composite_components)
         logger.info(
             f"Composite dataset specified, using {len(composite_components)} "
-            f"components, {total_samples} total samples."
+            f"components, {total_batches} total **batches**."
         )
-        for component in composite_components:
-            category_data_batches = load_category_batches(
-                dataset_name=component.name,
-                split=component.split,
-                subset=component.subset,
-                tokenizer=tokenizer,
-                model_max_length=obs_args.model_max_length,
-                split_by_category=False,
-                return_vllm_tokens_prompt=obs_args.return_vllm_tokens_prompt,
-                truncate=obs_args.truncate,
-                batches_per_category=component.num_batches,
-                batch_size=obs_args.batch_size,
-                dataset_path=None,
-            )
-            for _category, batches in category_data_batches.items():
-                all_batches.extend(batches)
+        category_data_batches = load_composite_category_batches(
+            composite_components,
+            tokenizer=tokenizer,
+            model_max_length=obs_args.model_max_length,
+            batch_size=obs_args.batch_size,
+            return_vllm_tokens_prompt=obs_args.return_vllm_tokens_prompt,
+            truncate=obs_args.truncate,
+            global_dataset_path=global_path,
+        )
+        all_batches = []
+        for _category, batches in category_data_batches.items():
+            all_batches.extend(batches)
         return all_batches
 
     category_data_batches = load_category_batches(
@@ -119,7 +119,7 @@ def prepare_calibration_batches(
         truncate=obs_args.truncate,
         batches_per_category=obs_args.batches_per_category,
         batch_size=obs_args.batch_size,
-        dataset_path=getattr(ds_args, "dataset_path", None),
+        dataset_path=global_path,
     )
     all_batches: List[torch.Tensor] = []
     for _category, samples in category_data_batches.items():

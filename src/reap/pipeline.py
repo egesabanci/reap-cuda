@@ -19,7 +19,11 @@ from reap.args import (
     ObserverArgs,
     EvalArgs,
 )
-from reap.data import load_category_batches, parse_composite_dataset_spec
+from reap.data import (
+    load_category_batches,
+    load_composite_category_batches,
+    parse_composite_dataset_spec,
+)
 from reap.observer import MoETransformerObserver, MoETransformerObserverConfig
 from reap.model_adapters import infer_model_adapter
 
@@ -203,43 +207,27 @@ def record_activations(
         default_split=ds_args.split,
     )
     if composite_components is not None:
-        combined_batches = []
         total_batches = sum(c.num_batches for c in composite_components)
         logger.info(
             f"Composite dataset specified, overwriting given batches_per_category={obs_args.batches_per_category} "
-            f"with values in composite dataset spec."
+            f"with values in composite dataset spec "
+            f"({len(composite_components)} components, {total_batches} total **batches**)."
         )
-        logger.info(
-            f"Loading composite dataset with {len(composite_components)} "
-            f"components, {total_batches} total data batches."
-        )
-
-        for comp_idx, component in enumerate(composite_components):
-            comp_label = (
-                f"{component.name}"
-                f"{f'[{component.subset}]' if component.subset is not None else ''}"
-                f"[{component.split}]"
-            )
+        if dataset_path:
             logger.info(
-                f"[{comp_idx + 1}/{len(composite_components)}] Loading component: "
-                f"{comp_label} ({component.num_batches} batches)"
+                "Composite + --dataset-path=%s (per-component @path overrides; "
+                "or {path}/<short_name> subdirs)",
+                dataset_path,
             )
-            component_batches = load_category_batches(
-                dataset_name=component.name,
-                split=component.split,
-                subset=component.subset,
-                tokenizer=tokenizer,
-                model_max_length=obs_args.model_max_length,
-                split_by_category=False,
-                return_vllm_tokens_prompt=obs_args.return_vllm_tokens_prompt,
-                truncate=obs_args.truncate,
-                batches_per_category=component.num_batches,
-                batch_size=obs_args.batch_size,
-                dataset_path=None,
-            )
-            combined_batches.extend(component_batches["all"])
-
-        category_data_batches = {"all": combined_batches}
+        category_data_batches = load_composite_category_batches(
+            composite_components,
+            tokenizer=tokenizer,
+            model_max_length=obs_args.model_max_length,
+            batch_size=obs_args.batch_size,
+            return_vllm_tokens_prompt=obs_args.return_vllm_tokens_prompt,
+            truncate=obs_args.truncate,
+            global_dataset_path=dataset_path,
+        )
     else:
         category_data_batches = load_category_batches(
             dataset_name=ds_args.dataset_name,

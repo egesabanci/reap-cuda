@@ -10,26 +10,32 @@ and layerwise prepare helpers.
 
 | Source | CLI / args | Behavior |
 | --- | --- | --- |
-| Single HF dataset | `--dataset name` | Load split; tokenize via registered processor |
-| Local offline file/dir | `--dataset name --dataset-path PATH` | Load arrow/json/jsonl/dir from disk; processor still keyed by `--dataset` |
-| Path as dataset | `--dataset /path/to/local` if it exists | Treated as local load; default processor if unregistered |
-| Composite | `--dataset "a:4096,b[sub]:2048"` | Multi-source batch mix; results dir uses hash name |
+| Single HF dataset | `--dataset name` | Load split; tokenize via **registered** processor |
+| Local offline | `--dataset name --dataset-path PATH` | Load from disk; `--dataset` must be a registered processor id matching columns |
+| Composite | `--dataset "a:64,b[sub]:32"` | Trailing `N` is a **batch count**; optional `name:N@/local/path` |
+| Composite + path | `--dataset-path` + composite | Per-component `@path`, or `{path}/<short_name>` subdirs; multi-file path errors clearly |
 | Cached observations | `--dataset combined` | Skip data load; require existing `.pt` |
 
 Also:
 
-- `--split` (default `train`)
+- `--split` (default `train`) — for single `.arrow` files there is no split metadata (warns if not `train`)
 - `--dataset-config` / `dataset_config_name` for HF configs
 - `--batch-size`, `--batches-per-category`, `--model-max-length`
 - `--truncate` for hard truncation policy in processors
-- `--artifacts-dir` / `REAP_ARTIFACTS_DIR` for output root (not calibration load)
+- `--artifacts-dir` / `REAP_ARTIFACTS_DIR` for output root
+
+Offline / hub failures suggest `--dataset-path`. Column mismatches vs the processor raise before tokenization. No silent evol-codealpaca fallback.
 
 ```bash
-# Offline EC2-style calib
+# Offline EC2-style calib (processor id + local files)
 reap prune full \
   -d theblackcat102/evol-codealpaca-v1 \
   --dataset-path /data/datasets/evol-codealpaca-calib-200 \
   --artifacts-dir /data/reap-artifacts
+
+# Composite offline: per-component path
+reap prune full \
+  -d "theblackcat102/evol-codealpaca-v1:64@/data/evol,open-r1/Mixture-of-Thoughts[code]:32@/data/mot"
 ```
 
 ## Composite dataset spec
