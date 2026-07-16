@@ -214,22 +214,27 @@ See [docs/calibration.md](docs/calibration.md).
 
 Maintainer documentation (SoC, one concern per file):
 
-**[docs/index.md](docs/index.md)** — map of the full set.
+| Start here | |
+| --- | --- |
+| **[docs/setup.md](docs/setup.md)** | Install, CUDA/Triton, first run, how kernels attach |
+| **[docs/index.md](docs/index.md)** | Full documentation map |
+| **[docs/architecture.md](docs/architecture.md)** | Codebase structure and data flow |
 
 | Doc | Topic |
 | --- | --- |
+| [Setup](docs/setup.md) | Install + kernels usage |
 | [Architecture](docs/architecture.md) | Modules, data flow, invariants |
 | [Pipeline](docs/pipeline.md) | Phase-by-phase prune/merge |
 | [Model adapters](docs/model-adapters.md) | Families, slice contract |
 | [Observation & metrics](docs/observation-and-metrics.md) | Saliency state |
-| [GPU & backends](docs/gpu-and-backends.md) | Device policy, F4/F5/FREA |
+| [GPU & backends](docs/gpu-and-backends.md) | Device policy, F4/F5/FREA/Triton |
 | [Pruning](docs/pruning.md) | Ranking and save |
 | [Merging](docs/merging.md) | Cluster + fuse |
 | [Layerwise](docs/layerwise.md) | Block replay memory mode |
 | [CLI](docs/cli.md) | Command reference |
 | [Evaluation](docs/evaluation.md) | Smoke + lm-eval |
 | [Development](docs/development.md) | Tests and extension |
-| [Kernels design](docs/kernels/README.md) | Kernel phase docs |
+| [Kernels design](docs/kernels/README.md) | Kernel phase design docs |
 
 ## Repository Layout
 

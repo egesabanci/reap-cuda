@@ -26,10 +26,20 @@ Two memory modes share the same metrics and adapters:
 | **Full** | `reap prune full`, `reap merge full` | Whole model on GPU |
 | **Layerwise** | `reap prune layerwise`, `reap merge layerwise` | One decoder block on GPU |
 
+## Start here
+
+| Goal | Document |
+| --- | --- |
+| **Install, first run, enable Triton** | **[Setup](setup.md)** |
+| Architecture overview | [Architecture](architecture.md) |
+| How to run prune/merge | [CLI](cli.md) · [Pipeline](pipeline.md) |
+| Kernels / backends | [GPU and Backends](gpu-and-backends.md) · [Kernels design](kernels/README.md) |
+
 ## Documentation map
 
 | Document | Concern |
 | --- | --- |
+| [Setup](setup.md) | Install, CUDA/Triton, first prune, verification |
 | [Architecture](architecture.md) | Module boundaries, data flow, invariants |
 | [Pipeline](pipeline.md) | End-to-end prune and merge execution phases |
 | [Model Adapters](model-adapters.md) | Supported families, layout detection, slicing contract |
@@ -78,12 +88,15 @@ Requires `transformers>=5.5.0` for current fused Qwen defaults. Details:
 
 ```bash
 uv venv .venv --seed --python 3.12
+uv pip install --editable . pytest
 uv pip install -e '.[cuda]'   # optional triton on CUDA hosts
-uv pip install pytest
 uv run pytest tests/ -q
 uv run reap --help
+uv run reap kernels           # Triton / backend readiness
 uv run reap version
 ```
+
+Full walkthrough: [setup.md](setup.md).
 
 ## Related projects
 
