@@ -14,7 +14,7 @@ the end.
 | **EC2 / NVIDIA GPU** | Real MoE runs; Triton optional via `[cuda]` extra |
 | Disk / network | HuggingFace model + calibration dataset on first run |
 
-Versions pinned in `pyproject.toml`: `torch>=2.10`, `transformers>=5.5`.
+Versions pinned in `pyproject.toml`: `torch>=2.10,<2.15`, `transformers>=5.5,<6`, `datasets>=3.6,<4`.
 
 ## 2. Install (any machine)
 
