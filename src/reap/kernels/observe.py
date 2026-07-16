@@ -190,6 +190,11 @@ def observe_moe_batch(
         compute_routed_ca=compute_routed_ca,
     )
 
+    # Drop the F4 stacked-weight cache for this MoE so the full-observer path
+    # does not accumulate one entry per layer across batches (the layerwise
+    # path frees per block; the full path hooks every layer each batch).
+    free_cache(moe)
+
     result: dict[str, Any] = {
         "selected_experts": router_pairs.selected_experts,
         "router_logits": router_logits,
