@@ -46,6 +46,57 @@ def _resolve_act_fn(config: Any) -> callable:
         raise ValueError(f"Unsupported expert activation: {name!r}") from None
 
 
+def compute_fused_expert_activations(
+    module: nn.Module,
+    adapter,
+    flat_input: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    act_fn: callable,
+):
+    """Phase-1 bmm "grouped" (routed-only) activation computation for fused
+    expert layouts (``gate_up_proj`` / ``down_proj`` stacked on dim 0).
+
+    Shared by :class:`MoETransformerObserver` and
+    :class:`reap.layerwise_observer.LayerwiseMoEObserver` so the two observers
+    cannot drift apart. This is the bridge implementation replaced by the FREA
+    Triton kernel in the kernels epic (#13).
+
+    Returns ``(activations, selected_experts, router_logits)`` where
+    ``activations[e]`` is non-zero only at positions routed to expert ``e``.
+    """
+    router = getattr(module, adapter.router_attr())
+    router_logits = router(flat_input)  # (total_tokens, num_experts)
+    # Some routers (Qwen3.5/3.6 ``Qwen3_5MoeTopKRouter``) return a tuple
+    # ``(logits, scores, indices)``; unwrap to the logits tensor. (The logits
+    # are already softmax-normalized there, which is fine: top-k selection is
+    # unchanged and the router-logit similarity merging metric is only used
+    # when ``record_pruning_metrics_only=False``.)
+    if isinstance(router_logits, tuple):
+        router_logits = router_logits[0]
+    _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
+    selected_experts = selected_experts.to(flat_input.device)
+    exps = module.experts
+    gup = exps.gate_up_proj  # (E, 2*I, H): rows [0:I]=gate, [I:2I]=up
+    dp = exps.down_proj        # (E, H, I)
+    inter = gup.shape[1] // 2
+    activations = torch.zeros(
+        (num_experts, *flat_input.shape),
+        device=flat_input.device,
+        dtype=flat_input.dtype,
+    )
+    for e in range(num_experts):
+        mask = (selected_experts == e).any(dim=-1)  # (total_tokens,)
+        if not bool(mask.any()):
+            continue
+        xe = flat_input[mask]                       # (n_e, H)
+        g = F.linear(xe, gup[e, :inter])             # (n_e, I) gate
+        u = F.linear(xe, gup[e, inter:])            # (n_e, I) up
+        h = act_fn(g) * u                            # SwiGLU
+        activations[e, mask] = F.linear(h, dp[e])   # (n_e, H) down
+    return activations, selected_experts, router_logits
+
+
 class BaseTransformerObserverHookConfig:
     state_attr_name: str = "hook_state"
     hook_attr_name: str = "hooks"
@@ -289,11 +340,13 @@ class MoETransformerObserver(BaseTransformerObserver):
             for layer_num, layer_state in self.state.items()
         }
 
-    def _initialize_state(self, output: torch.Tensor, num_experts: int):
-        # get device and shape info
-        output_hidden_states = output[0]
+    def _initialize_state(self, hidden_dim: int, num_experts: int):
+        # hidden_dim is taken from the hook input (args[0]) rather than the
+        # module output, because some MoE blocks (e.g. Qwen3.5/3.6
+        # ``Qwen3_5MoeSparseMoeBlock``) return a single tensor instead of a
+        # ``(hidden_states, router_logits)`` tuple, so ``output[0]`` is not a
+        # reliable shape source.
         device = "cpu"
-        hidden_dim = output_hidden_states.shape[-1]
         layer_state = initialize_pruning_state(num_experts, device=device)
 
         if not self.hook_config.record_pruning_metrics_only:
@@ -350,16 +403,11 @@ class MoETransformerObserver(BaseTransformerObserver):
 
         @torch.no_grad()
         def _hook_fn(module, args, output):
-            if not len(output) >= 2:
-                raise ValueError(
-                    f"Expected output of module {module.__class__.__name__} at layer "
-                    f"{layer_number} to be a tuple of at least length 2, got {len(output)}."
-                )
             input = args[0]  # (batch_size, seq_len, hidden_dim)
             device = input.device
-            if layer_number not in self.state:
-                self.state[layer_number] = self._initialize_state(output, num_experts)
             batch_size, sequence_length, hidden_dim = input.shape
+            if layer_number not in self.state:
+                self.state[layer_number] = self._initialize_state(hidden_dim, num_experts)
             flat_input = input.view(-1, hidden_dim)  # total_seq_len, hidden
 
             attention_mask = self._current_attention_mask
@@ -370,37 +418,34 @@ class MoETransformerObserver(BaseTransformerObserver):
                 # No mask provided - treat all tokens as valid
                 flat_mask = None
 
-            activations = torch.zeros((num_experts, *flat_input.shape), device=device)
-
             if self.hook_config.fused_experts:
-                # Fused experts (Llama4 / LFM2): per-expert activations computed
-                # from the stacked gate_up_proj / down_proj weights. This is the
-                # Phase-1 bmm "grouped" pattern (routed-only) -- a bridge until the
-                # FREA kernel (docs/kernels/ Phase 3) replaces it. Validated
-                # bit-identical to Lfm2MoeExperts.forward for single-expert routing.
-                router = getattr(module, self.adapter.router_attr())
-                router_logits = router(flat_input)  # (total_tokens, num_experts)
-                _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
-                selected_experts = selected_experts.to(device)
-                exps = module.experts
-                gup = exps.gate_up_proj  # (E, 2*I, H): rows [0:I]=gate, [I:2I]=up
-                dp = exps.down_proj        # (E, H, I)
-                inter = gup.shape[1] // 2
+                # Fused experts (Llama4 / LFM2 / Qwen3.5/3.6): per-expert
+                # activations computed from the stacked gate_up_proj / down_proj
+                # weights via the shared helper (Phase-1 bmm "grouped" pattern,
+                # routed-only) -- a bridge until the FREA kernel (docs/kernels/
+                # Phase 3) replaces it.
                 act_fn = _resolve_act_fn(self.model.config)
-                for e in range(num_experts):
-                    mask = (selected_experts == e).any(dim=-1)  # (total_tokens,)
-                    if not bool(mask.any()):
-                        continue
-                    xe = flat_input[mask]                         # (n_e, H)
-                    g = F.linear(xe, gup[e, :inter])             # (n_e, I) gate
-                    u = F.linear(xe, gup[e, inter:])              # (n_e, I) up
-                    h = act_fn(g) * u                              # SwiGLU
-                    activations[e, mask] = F.linear(h, dp[e])    # (n_e, H) down
+                activations, selected_experts, router_logits = (
+                    compute_fused_expert_activations(
+                        module, self.adapter, flat_input, num_experts, top_k, act_fn,
+                    )
+                )
 
             else:  # loop based MoE execution
+                if not isinstance(output, tuple) or len(output) < 2:
+                    raise ValueError(
+                        f"Expected output of module {module.__class__.__name__} "
+                        f"at layer {layer_number} to be a tuple of at least length "
+                        f"2 for the non-fused (loop) observer path, got "
+                        f"{type(output).__name__}."
+                    )
                 *_, router_logits = output  # (total_tokens, num_experts)
                 _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
-                # selected_experts = selected_experts.to(device)
+                activations = torch.zeros(
+                    (num_experts, *flat_input.shape),
+                    device=device,
+                    dtype=flat_input.dtype,
+                )
                 for idx, expert in enumerate(module.experts):
                     activations[idx] = expert(flat_input).to(
                         device
