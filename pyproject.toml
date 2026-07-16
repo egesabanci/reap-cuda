@@ -7,18 +7,27 @@ requires-python = ">=3.12"
 dependencies = [
     "accelerate>=1.7.0",
     "datasets>=3.6.0, <4.0.0",
-    "torch==2.7.1",
-    "transformers==4.55.0",
+    "torch>=2.10.0",
+    "transformers>=5.5.0",
     "tqdm",
     "scipy>=1.13.0",
     "scikit-learn>=1.5.0",
     "pyyaml>=6.0",
 ]
 
+[project.optional-dependencies]
+eval = ["lm-eval>=0.4.5"]
+cuda = ["triton>=2.3"]
+
+[project.scripts]
+reap-prune = "reap.prune:main"
+reap-layerwise = "reap.layerwise_prune:main"
+reap-merge = "reap.merge_pipeline:main"
+reap-layerwise-merge = "reap.layerwise_merge:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
-
 [tool.ruff]
 line-length = 88
 select = ["SIM"]
