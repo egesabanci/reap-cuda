@@ -199,30 +199,17 @@ def record_activations_layerwise_merge(
     return observer_data
 
 
-def main():
-    parser = HfArgumentParser(
-        (
-            ReapArgs,
-            DatasetArgs,
-            ObserverArgs,
-            ModelArgs,
-            EvalArgs,
-            ClusterArgs,
-            MergeArgs,
-            LayerwiseArgs,
-        )
-    )
-    (
-        reap_args,
-        ds_args,
-        obs_args,
-        model_args,
-        eval_args,
-        cluster_args,
-        merge_args,
-        layerwise_args,
-    ) = parser.parse_args_into_dataclasses()
-
+def run(
+    reap_args: ReapArgs,
+    ds_args: DatasetArgs,
+    obs_args: ObserverArgs,
+    model_args: ModelArgs,
+    eval_args: EvalArgs,
+    cluster_args: ClusterArgs,
+    merge_args: MergeArgs,
+    layerwise_args: LayerwiseArgs,
+):
+    """Block-wise observe (merge metrics) → cluster → merge → save."""
     if cluster_args.singleton_super_experts and cluster_args.singleton_outlier_experts:
         raise ValueError(
             "Only one of singleton_super_experts or singleton_outlier_experts can be True."
@@ -287,7 +274,7 @@ def main():
 
     if reap_args.run_observer_only:
         logger.info("Observer run completed. Exiting (run_observer_only=True)")
-        return
+        return None
 
     logger.info("Starting merge pipeline from layerwise-calibrated observer data...")
     merged_dir = run_merge(
@@ -296,6 +283,43 @@ def main():
         cluster_args, merge_args, eval_args, results_dir,
     )
     logger.info(f"Layerwise merge complete. Model saved to {merged_dir}")
+    return merged_dir
+
+
+def main():
+    """CLI entry (HfArgumentParser). Prefer ``reap merge layerwise`` (Typer)."""
+    parser = HfArgumentParser(
+        (
+            ReapArgs,
+            DatasetArgs,
+            ObserverArgs,
+            ModelArgs,
+            EvalArgs,
+            ClusterArgs,
+            MergeArgs,
+            LayerwiseArgs,
+        )
+    )
+    (
+        reap_args,
+        ds_args,
+        obs_args,
+        model_args,
+        eval_args,
+        cluster_args,
+        merge_args,
+        layerwise_args,
+    ) = parser.parse_args_into_dataclasses()
+    run(
+        reap_args,
+        ds_args,
+        obs_args,
+        model_args,
+        eval_args,
+        cluster_args,
+        merge_args,
+        layerwise_args,
+    )
 
 
 if __name__ == "__main__":

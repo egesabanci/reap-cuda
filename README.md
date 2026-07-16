@@ -16,27 +16,55 @@ git clone https://github.com/egesabanci/reap-cuda && cd reap-cuda
 uv venv .venv --seed --python 3.12
 uv pip install --editable .
 
-# Standard prune (whole model on GPU — needs ~60 GB for 30B)
-reap-prune --model_name "Qwen/Qwen3-30B-A3B" \
-  --dataset_name "theblackcat102/evol-codealpaca-v1" \
-  --prune_method reap --compression_ratio 0.5
+# Typer CLI (preferred)
+reap --help
+reap prune --help
+reap merge --help
 
-# Memory-efficient block-wise prune (one block on GPU — works on 46 GB L40S)
-reap-layerwise --model_name "Qwen/Qwen3-30B-A3B" \
-  --dataset_name "theblackcat102/evol-codealpaca-v1" \
-  --prune_method reap --compression_ratio 0.5
+# Full-model prune (whole model on GPU — needs ~60 GB for 30B)
+reap prune full \
+  --model "Qwen/Qwen3-30B-A3B" \
+  --dataset "theblackcat102/evol-codealpaca-v1" \
+  --prune-method reap --compression-ratio 0.5
 
-# Merge pipeline (cluster experts → merge → save)
-reap-merge --model_name "Qwen/Qwen3-30B-A3B" \
-  --dataset_name "theblackcat102/evol-codealpaca-v1" \
-  --expert_sim characteristic_activation --cluster_method agglomerative \
-  --compression_ratio 0.5
+# Layerwise prune (one block on GPU — works on 46 GB L40S)
+reap prune layerwise \
+  --model "Qwen/Qwen3-30B-A3B" \
+  --dataset "theblackcat102/evol-codealpaca-v1" \
+  --prune-method reap --compression-ratio 0.5 \
+  --observe-backend bmm
 
-# Layerwise merge (one block on GPU; for 30B+ on a single L40S)
-reap-layerwise-merge --model_name "Qwen/Qwen3-30B-A3B" \
-  --dataset_name "theblackcat102/evol-codealpaca-v1" \
-  --expert_sim characteristic_activation --compression_ratio 0.5
+# Full-model merge (cluster → merge → save)
+reap merge full \
+  --model "Qwen/Qwen3-30B-A3B" \
+  --dataset "theblackcat102/evol-codealpaca-v1" \
+  --expert-sim characteristic_activation \
+  --cluster-method agglomerative \
+  --compression-ratio 0.5
+
+# Layerwise merge (30B+ on a single L40S)
+reap merge layerwise \
+  --model "Qwen/Qwen3-30B-A3B" \
+  --dataset "theblackcat102/evol-codealpaca-v1" \
+  --expert-sim characteristic_activation \
+  --compression-ratio 0.5
 ```
+
+### CLI map
+
+| Command | Memory mode | What it does |
+|---|---|---|
+| `reap prune full` | Whole model on GPU | Observe → prune → save |
+| `reap prune layerwise` | One block on GPU | Same, block-wise calib |
+| `reap merge full` | Whole model on GPU | Observe merge metrics → cluster → merge |
+| `reap merge layerwise` | One block on GPU | Same, block-wise calib |
+| `reap version` | — | Package version |
+
+Common flags: `--model` / `-m`, `--dataset` / `-d`, `--compression-ratio`,
+`--observe-backend {auto,loop,bmm,frea,f2}`, `--observe-only`, `--eval`.
+
+Legacy console scripts (`reap-prune`, `reap-layerwise`, `reap-merge`,
+`reap-layerwise-merge`) still work via HfArgumentParser.
 
 ## Supported Models
 
@@ -60,6 +88,7 @@ reap-layerwise-merge --model_name "Qwen/Qwen3-30B-A3B" \
 ## Architecture
 
 ```
+cli/                 — Typer CLI (reap prune|merge full|layerwise)
 pipeline.py          — Helpers: record_activations, _setup_observer, smoke_test
 model_adapters.py    — Layout-based adapters (weight convention + fused detection)
 observer.py          — Standard forward-hook observer (whole model on GPU)
@@ -68,10 +97,8 @@ pruning_metrics.py   — GPU-resident REAP/EAN/frequency saliency
 kernels/             — observe backends: loop | bmm | frea | f2 (F4 weight cache, F5 router)
 metrics.py           — Distance functions + OnlineStatsTracker (Welford/Kahan)
 
-prune.py             — Standard prune entrypoint
-layerwise_prune.py   — Layerwise prune entrypoint
-merge_pipeline.py    — Merge entrypoint (observer → cluster → merge → save)
-layerwise_merge.py   — Layerwise merge entrypoint
+prune.py / layerwise_prune.py     — Prune run() APIs (+ legacy scripts)
+merge_pipeline.py / layerwise_merge.py — Merge run() APIs (+ legacy scripts)
 cluster.py           — Hierarchical, k-means, MC-SMoE, restricted clustering
 merge.py             — Merge methods (frequency-weighted, average, TIES, MultiSLERP, ...)
 permute.py           — Weight permutation / matching for merge alignment

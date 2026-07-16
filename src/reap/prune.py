@@ -180,21 +180,16 @@ def get_pruned_model_dir(
     return pruned_model_dir
 
 
-def main():
-    parser = HfArgumentParser(
-        (
-            ReapArgs,
-            DatasetArgs,
-            ObserverArgs,
-            ModelArgs,
-            EvalArgs,
-            PruneArgs,
-            ClusterArgs,
-        )
-    )
-    reap_args, ds_args, obs_args, model_args, eval_args, prune_args, cluster_args = (
-        parser.parse_args_into_dataclasses()
-    )
+def run(
+    reap_args: ReapArgs,
+    ds_args: DatasetArgs,
+    obs_args: ObserverArgs,
+    model_args: ModelArgs,
+    eval_args: EvalArgs,
+    prune_args: PruneArgs,
+    cluster_args: ClusterArgs,
+) -> pathlib.Path | None:
+    """Full-model observe → prune → optional eval (whole model on GPU)."""
     set_seed(reap_args.seed)
     results_dir = create_results_directory(model_args.model_name, ds_args.dataset_name)
 
@@ -223,7 +218,7 @@ def main():
             "Observer run completed. Exiting after collecting activation data since "
             "`run_observer_only` is set to True."
         )
-        return
+        return None
 
     logger.info("Start of pruning")
     total_experts = len(
@@ -288,6 +283,27 @@ def main():
         gc.collect()
         model_args.model_name = str(pruned_model_dir)
         run_evaluate(model_args, pruned_model_dir / "eval", eval_args, reap_args.seed)
+
+    return pruned_model_dir
+
+
+def main():
+    """CLI entry (HfArgumentParser). Prefer ``reap prune full`` (Typer)."""
+    parser = HfArgumentParser(
+        (
+            ReapArgs,
+            DatasetArgs,
+            ObserverArgs,
+            ModelArgs,
+            EvalArgs,
+            PruneArgs,
+            ClusterArgs,
+        )
+    )
+    reap_args, ds_args, obs_args, model_args, eval_args, prune_args, cluster_args = (
+        parser.parse_args_into_dataclasses()
+    )
+    run(reap_args, ds_args, obs_args, model_args, eval_args, prune_args, cluster_args)
 
 
 if __name__ == "__main__":

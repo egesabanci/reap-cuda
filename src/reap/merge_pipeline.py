@@ -504,20 +504,16 @@ def run_merge(
     return merged_model_dir
 
 
-def main():
-    parser = HfArgumentParser(
-        (ReapArgs, ModelArgs, DatasetArgs, ObserverArgs, ClusterArgs, MergeArgs, EvalArgs)
-    )
-    (
-        reap_args,
-        model_args,
-        ds_args,
-        obs_args,
-        cluster_args,
-        merge_args,
-        eval_args,
-    ) = parser.parse_args_into_dataclasses()
-
+def run(
+    reap_args: ReapArgs,
+    model_args: ModelArgs,
+    ds_args: DatasetArgs,
+    obs_args: ObserverArgs,
+    cluster_args: ClusterArgs,
+    merge_args: MergeArgs,
+    eval_args: EvalArgs,
+):
+    """Full-model observe (merge metrics) → cluster → merge → save."""
     if cluster_args.singleton_super_experts and cluster_args.singleton_outlier_experts:
         raise ValueError(
             "Only one of singleton_super_experts or singleton_outlier_experts can be True."
@@ -553,9 +549,9 @@ def main():
     )
     if reap_args.run_observer_only:
         logger.info("Observer run completed. Exiting (run_observer_only=True).")
-        return
+        return None
 
-    run_merge(
+    return run_merge(
         model,
         tokenizer,
         observer_data,
@@ -567,6 +563,31 @@ def main():
         merge_args,
         eval_args,
         results_dir,
+    )
+
+
+def main():
+    """CLI entry (HfArgumentParser). Prefer ``reap merge full`` (Typer)."""
+    parser = HfArgumentParser(
+        (ReapArgs, ModelArgs, DatasetArgs, ObserverArgs, ClusterArgs, MergeArgs, EvalArgs)
+    )
+    (
+        reap_args,
+        model_args,
+        ds_args,
+        obs_args,
+        cluster_args,
+        merge_args,
+        eval_args,
+    ) = parser.parse_args_into_dataclasses()
+    run(
+        reap_args,
+        model_args,
+        ds_args,
+        obs_args,
+        cluster_args,
+        merge_args,
+        eval_args,
     )
 
 

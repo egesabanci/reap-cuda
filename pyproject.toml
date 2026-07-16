@@ -13,6 +13,8 @@ dependencies = [
     "scipy>=1.13.0",
     "scikit-learn>=1.5.0",
     "pyyaml>=6.0",
+    "typer>=0.12.0",
+    "rich>=13.0.0",
 ]
 
 [project.optional-dependencies]
@@ -20,6 +22,8 @@ eval = ["lm-eval>=0.4.5"]
 cuda = ["triton>=2.3"]
 
 [project.scripts]
+reap = "reap.cli.app:main"
+# Legacy console scripts (HfArgumentParser); prefer `reap …` Typer CLI.
 reap-prune = "reap.prune:main"
 reap-layerwise = "reap.layerwise_prune:main"
 reap-merge = "reap.merge_pipeline:main"

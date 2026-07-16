@@ -223,30 +223,17 @@ def record_activations_layerwise(
     return observer_data
 
 
-def main():
-    parser = HfArgumentParser(
-        (
-            ReapArgs,
-            DatasetArgs,
-            ObserverArgs,
-            ModelArgs,
-            EvalArgs,
-            PruneArgs,
-            ClusterArgs,
-            LayerwiseArgs,
-        )
-    )
-    (
-        reap_args,
-        ds_args,
-        obs_args,
-        model_args,
-        eval_args,
-        prune_args,
-        cluster_args,
-        layerwise_args,
-    ) = parser.parse_args_into_dataclasses()
-
+def run(
+    reap_args: ReapArgs,
+    ds_args: DatasetArgs,
+    obs_args: ObserverArgs,
+    model_args: ModelArgs,
+    eval_args: EvalArgs,
+    prune_args: PruneArgs,
+    cluster_args: ClusterArgs,
+    layerwise_args: LayerwiseArgs,
+):
+    """Block-wise observe → prune (one decoder block on GPU at a time)."""
     # Validation
     if prune_args.perserve_super_experts and prune_args.perserve_outliers:
         raise ValueError(
@@ -322,7 +309,7 @@ def main():
 
     if reap_args.run_observer_only:
         logger.info("Observer run completed. Exiting (run_observer_only=True)")
-        return
+        return None
 
     # Calculate number of experts to prune
     n_experts_to_prune = prune_args.n_experts_to_prune
@@ -423,7 +410,44 @@ def main():
             reap_args.seed,
         )
 
+    return pruned_model_dir
 
-# TODO(ivanl): unify with prune.py entrypoint
+
+def main():
+    """CLI entry (HfArgumentParser). Prefer ``reap prune layerwise`` (Typer)."""
+    parser = HfArgumentParser(
+        (
+            ReapArgs,
+            DatasetArgs,
+            ObserverArgs,
+            ModelArgs,
+            EvalArgs,
+            PruneArgs,
+            ClusterArgs,
+            LayerwiseArgs,
+        )
+    )
+    (
+        reap_args,
+        ds_args,
+        obs_args,
+        model_args,
+        eval_args,
+        prune_args,
+        cluster_args,
+        layerwise_args,
+    ) = parser.parse_args_into_dataclasses()
+    run(
+        reap_args,
+        ds_args,
+        obs_args,
+        model_args,
+        eval_args,
+        prune_args,
+        cluster_args,
+        layerwise_args,
+    )
+
+
 if __name__ == "__main__":
     main()
