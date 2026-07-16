@@ -29,7 +29,8 @@ Hermetic suite (no Hub downloads):
 | Observer / layerwise | `test_layerwise_*.py` |
 | Merge / skip layers | `test_merge_pipeline.py`, `test_skip_first_last.py` |
 | Kernels / contract | `test_kernel_parity_bmm.py`, `test_pruning_metrics_only_contract.py`, `test_f4_weight_cache.py` |
-| CLI | `test_cli.py` (mocked pipelines) |
+| Weight residency | `test_residency.py` (heuristics, plans, stream_save, delegation) |
+| CLI | `test_cli.py` (mocked pipelines; residency wiring) |
 
 ## Project layout (src)
 
@@ -37,10 +38,12 @@ Hermetic suite (no Hub downloads):
 src/reap/
   cli/           # Typer
   kernels/       # observe backends
+  residency.py   # weight load/save policy
   *.py           # pipeline modules
 tests/
 docs/            # this documentation
 docs/kernels/    # kernel design SoC docs
+docs/residency.md
 ```
 
 ## Extension checklist
@@ -66,11 +69,19 @@ docs/kernels/    # kernel design SoC docs
 3. Parity test vs `loop` or `bmm` on tiny Qwen3
 4. Note in `gpu-and-backends.md` and `docs/kernels/`
 
+### Weight residency changes
+
+1. Update `residency.py` heuristics / `LoadPlan` only — keep pipelines thin
+2. Preserve `_residency_resolved` when delegating full ↔ layerwise
+3. Prefer `stream_save_pretrained` over manual CPU materialize
+4. Extend `tests/test_residency.py` + document in `docs/residency.md`
+
 ## Coding conventions
 
 - Prefer `run(dataclasses...)` APIs over parsing inside libraries
 - Keep architecture branches in adapters, not kernels
 - Do not `.to("cpu")` in observation hot paths
+- Do not force full-model `device_map="cpu"` on low-RAM GPU hosts — use residency
 - Conventional Commits (`feat:`, `fix:`, `test:`, `docs:`, …)
 
 ## CLI smoke (no model)

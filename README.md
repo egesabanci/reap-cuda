@@ -26,18 +26,21 @@ activation statistics; low-saliency experts are removed (or clustered and fused)
 and the mutated model is saved as a standard transformers checkpoint.
 
 Use it for one-shot MoE compression on NVIDIA GPUs — including **single-GPU
-layerwise** calibration for 30B-class models on ~46 GB cards.
+layerwise** calibration for 30B-class models on ~46 GB cards, and
+**GPU-resident weights** on small-RAM hosts (e.g. g6.xlarge 16 GiB RAM + L4).
 
 ## Highlights
 
 - **Typer CLI** — `reap prune|merge` × `full|layerwise` with rich help panels
 - **Adapter-based MoE support** — Qwen3 / Qwen3.5–3.6 / Llama4 / Mixtral / LFM2
+- **Weight residency** — `--residency auto|gpu_full|layerwise|cpu_full` avoids
+  full-CPU pins when VRAM fits but host RAM is tight; stream-save from GPU
 - **GPU-first observation** — saliency stays on the compute device; routed-only
   backends avoid `(E, T, H)` activation materialization
 - **Layerwise mode** — one decoder block on GPU at a time for large MoEs
 - **Prune + merge** — REAP/EAN/frequency saliency; agglomerative / TIES / …
 - **Layout-normalized kernels package** — F4 weight cache, F5 router pairs,
-  grouped bmm / FREA / F2 (PyTorch GPU path; optional compile)
+  grouped bmm / FREA / F2 (PyTorch GPU path; optional Triton)
 - **Hermetic tests** — tiny in-memory models, mocked CLI dispatch (no Hub)
 
 ## Quick Start
@@ -74,6 +77,7 @@ uv run reap prune layerwise \
   --prune-method reap \
   --compression-ratio 0.5 \
   --observe-backend bmm \
+  --residency auto \
   --batches-per-category 64 \
   --batch-size 1
 ```
@@ -85,8 +89,28 @@ uv run reap prune full \
   --model Qwen/Qwen3-30B-A3B \
   --dataset theblackcat102/evol-codealpaca-v1 \
   --prune-method reap \
-  --compression-ratio 0.5
+  --compression-ratio 0.5 \
+  --residency auto
 ```
+
+### Small-RAM GPU host (e.g. g6.xlarge 16 GiB RAM + L4)
+
+When the model fits VRAM but is large vs host RAM, prefer **GPU-resident**
+weights — do **not** pin the full model on CPU:
+
+```bash
+uv run reap prune full \
+  --model LiquidAI/LFM2-8B-A1B \
+  --dataset theblackcat102/evol-codealpaca-v1 \
+  --prune-method reap \
+  --compression-ratio 0.5 \
+  --residency gpu_full \
+  --observe-backend bmm \
+  --batches-per-category 8 \
+  --batch-size 1
+```
+
+`--residency auto` usually picks `gpu_full` in this situation.
 
 ### Merge (cluster experts → fuse weights)
 
@@ -106,16 +130,17 @@ checkpoints, observer `.pt` files, optional eval outputs).
 
 | Step | What happens | Evidence |
 | --- | --- | --- |
-| 1. Load | HF model + tokenizer (`device_map` auto or CPU) | model class / config |
+| 0. Residency | Resolve `--residency` → load/save plan (GPU / offload / CPU) | log: `Residency resolved: …` |
+| 1. Load | HF model + tokenizer per plan (`device_map` auto / offload / cpu) | model class / config |
 | 2. Calibrate | Tokenize calibration batches (single or composite dataset) | batch count |
 | 3. Observe | Routed expert stats via hooks or block replay | observer `.pt` |
 | 4. Decide | Rank experts (prune) or cluster (merge) | saliency / labels |
 | 5. Mutate | `slice_experts` or in-place merge | live module shapes |
-| 6. Save | `save_pretrained` + tokenizer (+ clusters for merge) | safetensors |
+| 6. Save | Stream `save_pretrained` (hooks stripped; no full CPU dump) | safetensors |
 | 7. Validate | Optional smoke generate / lm-eval | logs / `eval/` |
 
 ```txt
-load → calibrate → observe → prune|merge → save → smoke|eval
+residency → load → calibrate → observe → prune|merge → stream-save → smoke|eval
 ```
 
 ## Supported Models
@@ -134,13 +159,39 @@ detection is runtime-based (`infer_model_adapter`). See
 
 ## Memory Modes
 
-| Command | Peak VRAM (order of magnitude) | Use when |
+Two orthogonal controls:
+
+### 1. Observe schedule (`full` vs `layerwise` subcommand)
+
+| Command | Peak VRAM during observe (order of magnitude) | Use when |
 | --- | --- | --- |
 | `reap prune full` / `reap merge full` | Whole model (~60 GB bf16 for 30B-class) | Multi-GPU / A100-80 / H100 |
 | `reap prune layerwise` / `reap merge layerwise` | One block (~1–2 GB + routed transients) | Single L40S 46 GB, 30B+ |
 
-Layerwise still **reloads the full model** for the final prune mutate/save step.
-Plan that separately from calibration VRAM.
+Layerwise still **reloads the full model** for the final prune mutate/save step
+(via `gpu_full` plan). Plan that VRAM separately from calibration.
+
+### 2. Weight residency (`--residency`)
+
+Where **parameters** live during load / save — critical on **low host RAM**:
+
+| Mode | Load | Save | Typical host |
+| --- | --- | --- | --- |
+| `auto` | Heuristic from host/GPU + model size | per resolved mode | Default |
+| `gpu_full` | `device_map="auto"` on GPU | Stream from device (no full CPU pin) | g6.xlarge-class 16 GiB RAM + GPU |
+| `layerwise` | `auto` + disk offload (not full CPU pin) | Reload `gpu_full` then stream | Large MoE, mid GPU |
+| `cpu_full` | `device_map="cpu"` | Normal | Ample host RAM / debug |
+
+```bash
+# Prefer GPU weights when model fits VRAM but is large vs RAM
+reap prune full --residency gpu_full ...
+
+# Or let auto pick (g6-like: → gpu_full)
+reap prune full --residency auto ...
+```
+
+Full policy, heuristics, delegation (full↔layerwise), and env knobs:
+**[docs/residency.md](docs/residency.md)**.
 
 ## Pruning Methods
 
@@ -193,7 +244,7 @@ uv run reap merge full --help
 | `reap version` | — | Package version |
 
 Common flags: `-m/--model`, `-d/--dataset`, `--compression-ratio`,
-`--observe-backend`, `--observe-only`, `--eval`, `--seed`.
+`--observe-backend`, `--residency`, `--observe-only`, `--eval`, `--seed`.
 
 Full flag tables: [docs/cli.md](docs/cli.md).
 
@@ -228,6 +279,7 @@ Maintainer documentation (SoC, one concern per file):
 | [Model adapters](docs/model-adapters.md) | Families, slice contract |
 | [Observation & metrics](docs/observation-and-metrics.md) | Saliency state |
 | [GPU & backends](docs/gpu-and-backends.md) | Device policy, F4/F5/FREA/Triton |
+| [**Weight residency**](docs/residency.md) | `--residency`, auto heuristics, stream save, g6.xlarge |
 | [Pruning](docs/pruning.md) | Ranking and save |
 | [Merging](docs/merging.md) | Cluster + fuse |
 | [Layerwise](docs/layerwise.md) | Block replay memory mode |
@@ -250,6 +302,7 @@ reap-cuda/
   src/reap/
     cli/               # Typer app
     kernels/           # observe backends
+    residency.py       # weight load/save policy
     model_adapters.py
     observer.py
     layerwise_*.py

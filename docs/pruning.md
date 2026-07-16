@@ -59,15 +59,25 @@ Shared experts remain.
 
 ## Saving
 
+Implemented as `stream_save_pretrained` in `reap.residency` (called from
+`prune_model`):
+
 1. `remove_hook_from_module(model, recurse=True)` so accelerate does not
    materialize a full CPU state dict.
-2. `model.save_pretrained` streams shards (CUDA tensors via safetensors).
-3. Tokenizer saved alongside.
+2. **No** `model.to("cpu")` — safetensors streams CUDA tensors shard-wise.
+3. `model.save_pretrained` writes shards under the pruned model dir.
+4. Tokenizer saved alongside.
+
+This avoids host OOM after a successful GPU prune on small-RAM instances.
+See [residency.md](residency.md#stream-save).
 
 ## Layerwise caveat
 
-Observe is memory-efficient; **mutate/save still reloads the full model** with
-`device_map="auto"`. Plan VRAM for that step separately from calibration.
+Observe is memory-efficient (block schedule + disk offload under residency
+`layerwise`); **mutate/save still reloads the full model** with
+`plan_load("gpu_full")` (`device_map="auto"`). Plan **VRAM** for that step
+separately from calibration. Do not confuse with host-RAM pin — that is what
+`--residency` avoids.
 
 ## Smoke test
 
@@ -76,6 +86,7 @@ Optional generate with chat template (`pipeline.smoke_test`). Enable with
 
 ## Related
 
+- [residency.md](residency.md)
 - [observation-and-metrics.md](observation-and-metrics.md)
 - [model-adapters.md](model-adapters.md)
 - [pipeline.md](pipeline.md)

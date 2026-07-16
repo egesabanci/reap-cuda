@@ -27,6 +27,16 @@ from reap.model_adapters import infer_model_adapter
 from reap.pruning_metrics import PRUNE_METHOD_KEY_MAP
 from reap.eval import run_evaluate
 from reap.merge_pipeline import get_super_expert_indices
+from reap.residency import (
+    estimate_model_bytes_from_config,
+    estimate_model_bytes_from_module,
+    load_causal_lm,
+    plan_load,
+    preflight_or_warn,
+    resolve_residency,
+    stream_save_pretrained,
+    validate_residency,
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -140,10 +150,7 @@ def prune(
 
     pruned_model_dir.mkdir(parents=True, exist_ok=True)
     start = time.time()
-    # Strip accelerate dispatch hooks so save streams GPU tensors via safetensors
-    # without materializing a full CPU state dict.
-    remove_hook_from_module(model, recurse=True)
-    model.save_pretrained(pruned_model_dir)
+    stream_save_pretrained(model, pruned_model_dir)
     end = time.time()
     logger.info(
         f"Pruned model saved to {pruned_model_dir} in {end - start:.2f} seconds"
@@ -188,21 +195,65 @@ def run(
     eval_args: EvalArgs,
     prune_args: PruneArgs,
     cluster_args: ClusterArgs,
+    *,
+    _residency_resolved: str | None = None,
 ) -> pathlib.Path | None:
-    """Full-model observe → prune → optional eval (whole model on GPU)."""
+    """Observe → prune → optional eval.
+
+    Honors ``reap_args.residency``. If resolved mode is ``layerwise``, delegates
+    to :func:`reap.layerwise_prune.run`.
+    """
+    if _residency_resolved is None:
+        residency = validate_residency(getattr(reap_args, "residency", "auto"))
+        model_bytes = estimate_model_bytes_from_config(model_args.model_name)
+        resolved, reason = resolve_residency(
+            residency,
+            model_bytes=model_bytes,
+            cli_prefers_layerwise=False,
+        )
+        logger.info("Residency resolved: %s (%s)", resolved, reason)
+        preflight_or_warn(resolved, model_bytes)
+    else:
+        resolved = validate_residency(_residency_resolved)
+        model_bytes = estimate_model_bytes_from_config(model_args.model_name)
+        logger.info("Residency (pre-resolved): %s", resolved)
+        preflight_or_warn(resolved, model_bytes)
+
+    if resolved == "layerwise":
+        from reap.args import LayerwiseArgs
+        from reap.layerwise_prune import run as run_layerwise
+
+        logger.info("Delegating to layerwise prune (residency=%s)", resolved)
+        return run_layerwise(
+            reap_args,
+            ds_args,
+            obs_args,
+            model_args,
+            eval_args,
+            prune_args,
+            cluster_args,
+            LayerwiseArgs(),
+            _residency_resolved=resolved,
+        )
+
     set_seed(reap_args.seed)
     results_dir = create_results_directory(model_args.model_name, ds_args.dataset_name)
 
     model_name = model_args.model_name
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto",
-        torch_dtype="auto",
-        trust_remote_code=True,
-    )
+    plan = plan_load("cpu_full" if resolved == "cpu_full" else "gpu_full")
+
+    model = load_causal_lm(model_name, plan)
+    try:
+        live_bytes = estimate_model_bytes_from_module(model)
+        logger.info("Loaded model weight footprint ~%.2f GiB", live_bytes / 1024**3)
+    except Exception:
+        pass
+
     logger.info(
-        f"Running observer to collect activation data for model {model_args.model_name} on dataset {ds_args.dataset_name}."
+        "Running observer to collect activation data for model %s on dataset %s.",
+        model_args.model_name,
+        ds_args.dataset_name,
     )
     observer_data = record_activations(
         model,
@@ -275,7 +326,7 @@ def run(
 
     if reap_args.do_eval and pruned_model_dir.exists():
         remove_hook_from_module(model, recurse=True)
-        model.to("cpu")
+        # Avoid model.to("cpu") on low-RAM hosts — drop references instead.
         del model
         del observer_data
         if torch.cuda.is_available():

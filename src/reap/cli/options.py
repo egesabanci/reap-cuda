@@ -83,6 +83,20 @@ ModelMaxLength = Annotated[
         rich_help_panel="Data",
     ),
 ]
+Residency = Annotated[
+    str,
+    typer.Option(
+        "--residency",
+        help=(
+            "Weight residency: auto | gpu_full | layerwise | cpu_full. "
+            "auto picks gpu_full when the model fits VRAM but is large vs host RAM "
+            "(e.g. ~16GB model on g6.xlarge). gpu_full: load/slice/save on GPU. "
+            "layerwise: block-wise observe + disk offload (not full CPU pin). "
+            "cpu_full: pin full model on CPU (needs ample RAM)."
+        ),
+        rich_help_panel="Residency",
+    ),
+]
 
 
 def build_reap_args(
@@ -93,6 +107,7 @@ def build_reap_args(
     run_observer_only: bool = False,
     do_eval: bool = False,
     smoke_test: bool = True,
+    residency: str = "auto",
 ) -> ReapArgs:
     return ReapArgs(
         seed=seed,
@@ -101,6 +116,7 @@ def build_reap_args(
         run_observer_only=run_observer_only,
         do_eval=do_eval,
         smoke_test=smoke_test,
+        residency=residency,
     )
 
 

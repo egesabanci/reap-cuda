@@ -69,6 +69,29 @@ reap prune full \
 | `--eval` / `--no-eval` | no eval | Run |
 | `--profile` / `--no-profile` | profile on | Run |
 | `--seed` | `42` | Run |
+| `--residency` | `auto` | Residency |
+
+### `--residency` (all prune/merge subcommands)
+
+Controls **where model weights live** during load and save (host RAM vs GPU vs
+disk offload). Orthogonal to full vs layerwise observe schedule.
+
+| Value | Behavior |
+| --- | --- |
+| `auto` | Pick from host/GPU memory + model-size estimate |
+| `gpu_full` | `device_map="auto"`; stream-save; no full CPU pin |
+| `layerwise` | Block observe; auto + disk offload; mutate/save via `gpu_full` plan |
+| `cpu_full` | Pin full model on CPU (needs ample host RAM) |
+
+```bash
+# Small-RAM GPU instance (model fits VRAM)
+reap prune full --residency gpu_full -m LiquidAI/LFM2-8B-A1B ...
+
+# Explicit layerwise weights policy on layerwise CLI
+reap prune layerwise --residency auto -m Qwen/Qwen3-30B-A3B ...
+```
+
+Full policy, heuristics, and full↔layerwise **delegation**: [residency.md](residency.md).
 
 ## `reap prune layerwise`
 
@@ -82,6 +105,12 @@ Extra flags:
 | `--batch-group-size` | unset (all batches) |
 | `--save-intermediate` | off |
 | `--low-cpu-mem` / `--no-low-cpu-mem` | low mem on |
+| `--residency` | `auto` |
+
+With `--residency auto`, large models stay on the layerwise path; if the model
+fits VRAM and host RAM is tight, residency may resolve to `gpu_full` and
+**delegate** to the full prune pipeline (avoids full-CPU pin). See
+[residency.md](residency.md).
 
 ```bash
 reap prune layerwise \
@@ -90,6 +119,7 @@ reap prune layerwise \
   --prune-method reap \
   --compression-ratio 0.5 \
   --observe-backend bmm \
+  --residency auto \
   --batches-per-category 64 \
   --batch-size 1
 ```
@@ -110,6 +140,7 @@ Force merge-criteria observation. Core options:
 | `--frequency-penalty` | on |
 | `--permute` | unset (`direct` \| `wm`) |
 | `--overwrite-merged` | keep |
+| `--residency` | `auto` |
 
 Layerwise merge adds the same layerwise flags as layerwise prune.
 
@@ -152,6 +183,7 @@ Prefer Typer for new docs and scripts.
 
 ## Related
 
+- [residency.md](residency.md)
 - [pipeline.md](pipeline.md)
 - [pruning.md](pruning.md)
 - [merging.md](merging.md)

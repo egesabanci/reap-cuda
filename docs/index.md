@@ -19,12 +19,16 @@ CLI (Typer)
   -> optional smoke / lm-eval
 ```
 
-Two memory modes share the same metrics and adapters:
+Two **observe schedules** share the same metrics and adapters:
 
-| Mode | Command family | VRAM footprint |
+| Mode | Command family | VRAM footprint (observe) |
 | --- | --- | --- |
 | **Full** | `reap prune full`, `reap merge full` | Whole model on GPU |
 | **Layerwise** | `reap prune layerwise`, `reap merge layerwise` | One decoder block on GPU |
+
+Separately, **weight residency** (`--residency auto|gpu_full|layerwise|cpu_full`)
+controls whether parameters are GPU-mapped, disk-offloaded, or CPU-pinned —
+critical on low host-RAM instances (e.g. g6.xlarge). See [residency.md](residency.md).
 
 ## Start here
 
@@ -33,6 +37,7 @@ Two memory modes share the same metrics and adapters:
 | **Install, first run, enable Triton** | **[Setup](setup.md)** |
 | Architecture overview | [Architecture](architecture.md) |
 | How to run prune/merge | [CLI](cli.md) · [Pipeline](pipeline.md) |
+| Low-RAM / GPU weight placement | **[Weight residency](residency.md)** |
 | Kernels / backends | [GPU and Backends](gpu-and-backends.md) · [Kernels design](kernels/README.md) |
 
 ## Documentation map
@@ -45,7 +50,8 @@ Two memory modes share the same metrics and adapters:
 | [Model Adapters](model-adapters.md) | Supported families, layout detection, slicing contract |
 | [Calibration](calibration.md) | Datasets, composite specs, batching |
 | [Observation and Metrics](observation-and-metrics.md) | Observers, saliency state, prune vs merge metrics |
-| [GPU and Backends](gpu-and-backends.md) | Device residency, observe backends, F4/F5/FREA/F2 |
+| [GPU and Backends](gpu-and-backends.md) | Activation/device policy, observe backends, F4/F5/FREA/F2 |
+| [**Weight Residency**](residency.md) | `--residency`, auto heuristics, stream save, delegation |
 | [Pruning](pruning.md) | Saliency methods, ranking, `slice_experts`, config patch |
 | [Merging](merging.md) | Clustering, merge methods, skip layers, super-experts |
 | [Layerwise Mode](layerwise.md) | Block replay, CPU activation cache, memory trade-offs |
@@ -64,6 +70,9 @@ Two memory modes share the same metrics and adapters:
   merge-criteria trackers.
 - **GPU-first saliency**: hot-path accumulators stay on the compute device;
   host transfer is deferred to save/report.
+- **Weight residency**: default `auto` prefers GPU-mapped weights + stream save
+  when the model fits VRAM but is large vs host RAM; layerwise uses disk
+  offload instead of pinning the full model in host RAM ([residency.md](residency.md)).
 - **Routed-only expert work** (backends `bmm` / `frea` / `f2`): no full
   `(E, T, H)` activation materialization on the prune path.
 - **Post-slice runnable modules**: fused `slice_experts` updates live

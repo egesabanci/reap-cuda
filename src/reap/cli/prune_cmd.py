@@ -44,6 +44,7 @@ def prune_full(
     batches_per_category: opt.BatchesPerCategory = 1024,
     model_max_length: opt.ModelMaxLength = 2048,
     seed: opt.Seed = 42,
+    residency: opt.Residency = "auto",
     observe_only: Annotated[
         bool,
         typer.Option(
@@ -143,6 +144,7 @@ def prune_full(
             run_observer_only=observe_only,
             do_eval=do_eval,
             smoke_test=smoke_test,
+            residency=residency,
         ),
         opt.build_dataset_args(
             dataset_name=dataset,
@@ -221,6 +223,7 @@ def prune_layerwise(
         ),
     ] = True,
     seed: opt.Seed = 42,
+    residency: opt.Residency = "auto",
     observe_only: Annotated[
         bool,
         typer.Option(
@@ -281,7 +284,11 @@ def prune_layerwise(
     ] = None,
     split: Annotated[str, typer.Option("--split", rich_help_panel="Data")] = "train",
 ) -> None:
-    """Prune with **one decoder block on GPU** (30B+ on a single L40S)."""
+    """Prune with **one decoder block on GPU** (30B+ on a single L40S).
+
+    With ``--residency auto|gpu_full``, small models that fit VRAM may run the
+    full GPU path instead of pinning weights in host RAM.
+    """
     from reap.layerwise_prune import run as run_layerwise_prune
 
     run_layerwise_prune(
@@ -291,6 +298,7 @@ def prune_layerwise(
             do_eval=do_eval,
             smoke_test=False,
             profile=False,
+            residency=residency,
         ),
         opt.build_dataset_args(
             dataset_name=dataset,

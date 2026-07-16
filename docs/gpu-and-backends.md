@@ -3,15 +3,19 @@
 REAP CUDA targets **GPU-first calibration**: saliency and expert activation work
 should run on the device holding the MoE weights, not bounce to CPU each batch.
 
+This page is about **activation / kernel device policy** and observe backends.
+**Where model weights are loaded and saved** (host vs GPU vs disk offload) is
+documented separately: **[residency.md](residency.md)** (`--residency`).
+
 ## Device policy
 
 | Data | Device |
 | --- | --- |
-| Model (full mode) | `device_map="auto"` (CUDA multi-GPU OK) |
-| Active block (layerwise) | CUDA if available else CPU |
+| Model weights | Per `--residency` → `plan_load` ([residency.md](residency.md)): typically `device_map="auto"` (+ optional offload) or `"cpu"` |
+| Active block (layerwise schedule) | CUDA if available else CPU |
 | Hidden-state replay cache | **CPU** (layerwise memory trade-off) |
 | Pruning state / OnlineStatsTracker | Activation device (prefer CUDA) |
-| Saved `.pt` / checkpoints | CPU / disk |
+| Saved `.pt` / checkpoints | CPU / disk (weights via stream save from GPU when residency allows) |
 | Clustering (scipy/sklearn) | CPU |
 | Expert matmuls in observe backends | Same as activations (GPU) |
 
@@ -109,6 +113,7 @@ stack**, not an extra multi-GB `(E,T,H)` per layer.
 
 ## Related
 
+- [residency.md](residency.md) — weight load/save (not saliency device)
 - [kernels/README.md](kernels/README.md)
 - [observation-and-metrics.md](observation-and-metrics.md)
 - [layerwise.md](layerwise.md)

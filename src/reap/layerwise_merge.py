@@ -208,8 +208,19 @@ def run(
     cluster_args: ClusterArgs,
     merge_args: MergeArgs,
     layerwise_args: LayerwiseArgs,
+    *,
+    _residency_resolved: str | None = None,
 ):
     """Block-wise observe (merge metrics) → cluster → merge → save."""
+    from reap.residency import (
+        estimate_model_bytes_from_config,
+        load_causal_lm,
+        plan_load,
+        preflight_or_warn,
+        resolve_residency,
+        validate_residency,
+    )
+
     if cluster_args.singleton_super_experts and cluster_args.singleton_outlier_experts:
         raise ValueError(
             "Only one of singleton_super_experts or singleton_outlier_experts can be True."
@@ -226,6 +237,40 @@ def run(
     if layerwise_args.batch_group_size is not None and layerwise_args.batch_group_size < 1:
         raise ValueError("layerwise batch_group_size must be at least 1 when provided.")
 
+    if _residency_resolved is None:
+        residency = validate_residency(getattr(reap_args, "residency", "auto"))
+        model_bytes = estimate_model_bytes_from_config(model_args.model_name)
+        resolved, reason = resolve_residency(
+            residency,
+            model_bytes=model_bytes,
+            cli_prefers_layerwise=True,
+        )
+        logger.info("Residency resolved: %s (%s)", resolved, reason)
+        preflight_or_warn(resolved, model_bytes)
+    else:
+        resolved = validate_residency(_residency_resolved)
+        model_bytes = estimate_model_bytes_from_config(model_args.model_name)
+        logger.info("Residency (pre-resolved): %s", resolved)
+        preflight_or_warn(resolved, model_bytes)
+
+    if resolved in ("gpu_full", "cpu_full"):
+        from reap.merge_pipeline import run as run_full_merge
+
+        logger.info(
+            "Delegating to full merge path (residency=%s) — avoids full-CPU pin",
+            resolved,
+        )
+        return run_full_merge(
+            reap_args,
+            model_args,
+            ds_args,
+            obs_args,
+            cluster_args,
+            merge_args,
+            eval_args,
+            _residency_resolved=resolved,
+        )
+
     set_seed(reap_args.seed)
     results_dir = create_results_directory(model_args.model_name, ds_args.dataset_name)
 
@@ -234,18 +279,15 @@ def run(
     logger.info(f"Loading tokenizer for {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 
-    # The merge pipeline always needs the model weights on hand to merge into,
-    # regardless of whether observer data is freshly recorded or loaded from
-    # cache. Load it once here (CPU, block-wise) so run_merge() can mutate it.
-    logger.info(f"Loading model {model_name} on CPU for layerwise processing...")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="cpu",
-        torch_dtype="auto",
-        trust_remote_code=True,
+    # Prefer auto+disk offload over pinning the entire model in host RAM.
+    offload_root = results_dir / ".offload"
+    plan = plan_load(
+        "layerwise",
+        offload_root=offload_root,
         low_cpu_mem_usage=layerwise_args.low_cpu_mem_usage,
     )
-    model.eval()
+    logger.info("Loading model for layerwise merge (%s)...", plan.reason)
+    model = load_causal_lm(model_name, plan)
     logger.info(f"Model loaded: {model.__class__.__name__}")
     num_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Total parameters: {num_params / 1e9:.2f}B")

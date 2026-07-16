@@ -100,6 +100,7 @@ CLI (Typer)  ──►  run() pipelines  ──►  observe  ──►  prune | 
 | --- | --- |
 | Commands | `src/reap/cli/` · [cli.md](cli.md) |
 | Orchestration | `prune.py`, `layerwise_*.py`, `merge_*.py` · [pipeline.md](pipeline.md) |
+| Weight residency | `residency.py` · [residency.md](residency.md) |
 | Model layouts | `model_adapters.py` · [model-adapters.md](model-adapters.md) |
 | Observation | `observer.py`, `kernels/observe.py` · [observation-and-metrics.md](observation-and-metrics.md) |
 | GPU / kernels | `kernels/` · [gpu-and-backends.md](gpu-and-backends.md) · [kernels/README.md](kernels/README.md) |
@@ -162,6 +163,30 @@ installs do not crash. See [gpu-and-backends.md](gpu-and-backends.md).
 
 ## 6. Common workflows
 
+### Weight residency (read this on small-RAM hosts)
+
+| Flag | When |
+| --- | --- |
+| `--residency auto` | Default; picks GPU vs offload vs CPU from memory + model size |
+| `--residency gpu_full` | Model fits VRAM; **host RAM is tight** (e.g. g6.xlarge 16 GiB + L4) |
+| `--residency layerwise` | Force block-wise observe + disk offload |
+| `--residency cpu_full` | Explicit full CPU pin (needs ample RAM — often OOMs at 16 GiB) |
+
+```bash
+# g6.xlarge-class: keep weights on GPU, stream-save (do not pin CPU)
+uv run reap prune full \
+  -m LiquidAI/LFM2-8B-A1B \
+  -d theblackcat102/evol-codealpaca-v1 \
+  --prune-method reap \
+  --compression-ratio 0.5 \
+  --residency gpu_full \
+  --observe-backend bmm \
+  --batches-per-category 8 \
+  --batch-size 1
+```
+
+Full policy: [residency.md](residency.md).
+
 ### Prune (layerwise — single GPU)
 
 ```bash
@@ -170,7 +195,8 @@ uv run reap prune layerwise \
   -d theblackcat102/evol-codealpaca-v1 \
   --prune-method reap \
   --compression-ratio 0.5 \
-  --observe-backend auto
+  --observe-backend auto \
+  --residency auto
 ```
 
 ### Prune (full model — multi-GPU / large VRAM)
@@ -180,7 +206,8 @@ uv run reap prune full \
   -m Qwen/Qwen3-30B-A3B \
   -d theblackcat102/evol-codealpaca-v1 \
   --prune-method reap \
-  --compression-ratio 0.5
+  --compression-ratio 0.5 \
+  --residency auto
 ```
 
 ### Merge
@@ -190,13 +217,14 @@ uv run reap merge layerwise \
   -m Qwen/Qwen3-30B-A3B \
   -d theblackcat102/evol-codealpaca-v1 \
   --expert-sim characteristic_activation \
-  --compression-ratio 0.5
+  --compression-ratio 0.5 \
+  --residency auto
 ```
 
 Artifacts: `artifacts/<model>/<dataset>/…`  
-Details: [pipeline.md](pipeline.md), [cli.md](cli.md).
+Details: [pipeline.md](pipeline.md), [cli.md](cli.md), [residency.md](residency.md).
 
-## 7. Tests related to kernels
+## 7. Tests related to kernels and residency
 
 ```bash
 # Always (CPU): fallbacks + dispatch
@@ -204,6 +232,9 @@ uv run pytest tests/test_triton_kernels.py tests/test_kernel_parity_bmm.py -q
 
 # On CUDA host: also runs @requires_triton cases
 uv run pytest tests/test_triton_kernels.py -q
+
+# Weight residency heuristics + CLI wiring (hermetic)
+uv run pytest tests/test_residency.py tests/test_cli.py -q
 ```
 
 ## 8. Doc map (everything else)
@@ -212,7 +243,8 @@ uv run pytest tests/test_triton_kernels.py -q
 | --- | --- |
 | Module map & invariants | [architecture.md](architecture.md) |
 | Phase-by-phase prune/merge | [pipeline.md](pipeline.md) |
-| Backends + device policy | [gpu-and-backends.md](gpu-and-backends.md) |
+| **Weight residency / low-RAM hosts** | **[residency.md](residency.md)** |
+| Backends + activation device policy | [gpu-and-backends.md](gpu-and-backends.md) |
 | Kernel **design** (SoC phases) | [kernels/README.md](kernels/README.md) |
 | Metrics / saliency keys | [observation-and-metrics.md](observation-and-metrics.md) |
 | Adapters / new models | [model-adapters.md](model-adapters.md) |

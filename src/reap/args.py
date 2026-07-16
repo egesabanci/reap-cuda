@@ -27,6 +27,19 @@ class ReapArgs:
             )
         },
     )
+    residency: str = field(
+        default="auto",
+        metadata={
+            "help": (
+                "Weight residency: auto | gpu_full | layerwise | cpu_full. "
+                "auto picks gpu_full when the model fits VRAM but is large vs host RAM "
+                "(e.g. ~16GB model on g6.xlarge). gpu_full keeps load/slice/save on GPU. "
+                "layerwise uses block-wise observe with disk offload instead of pinning "
+                "the full model in host RAM. cpu_full pins the full model on CPU."
+            ),
+            "choices": ["auto", "gpu_full", "layerwise", "cpu_full"],
+        },
+    )
 
 
 @dataclass

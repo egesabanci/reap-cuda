@@ -72,6 +72,7 @@ def merge_full(
     batches_per_category: opt.BatchesPerCategory = 1024,
     model_max_length: opt.ModelMaxLength = 2048,
     seed: opt.Seed = 42,
+    residency: opt.Residency = "auto",
     skip_first: Annotated[
         bool,
         typer.Option("--skip-first/--no-skip-first", rich_help_panel="Merge"),
@@ -134,6 +135,7 @@ def merge_full(
             run_observer_only=observe_only,
             do_eval=do_eval,
             smoke_test=False,
+            residency=residency,
         ),
         opt.build_model_args(model_name=model),
         opt.build_dataset_args(
@@ -213,6 +215,7 @@ def merge_layerwise(
         typer.Option("--low-cpu-mem/--no-low-cpu-mem", rich_help_panel="Layerwise"),
     ] = True,
     seed: opt.Seed = 42,
+    residency: opt.Residency = "auto",
     skip_first: Annotated[
         bool,
         typer.Option("--skip-first/--no-skip-first", rich_help_panel="Merge"),
@@ -267,6 +270,7 @@ def merge_layerwise(
             do_eval=do_eval,
             smoke_test=False,
             profile=False,
+            residency=residency,
         ),
         opt.build_dataset_args(
             dataset_name=dataset,

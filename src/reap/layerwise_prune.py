@@ -232,8 +232,23 @@ def run(
     prune_args: PruneArgs,
     cluster_args: ClusterArgs,
     layerwise_args: LayerwiseArgs,
+    *,
+    _residency_resolved: str | None = None,
 ):
-    """Block-wise observe → prune (one decoder block on GPU at a time)."""
+    """Block-wise observe → prune (one decoder block on GPU at a time).
+
+    Honors ``reap_args.residency``. If resolved to ``gpu_full`` / ``cpu_full``,
+    delegates to :func:`reap.prune.run` instead of pinning the full model on CPU.
+    """
+    from reap.residency import (
+        estimate_model_bytes_from_config,
+        load_causal_lm,
+        plan_load,
+        preflight_or_warn,
+        resolve_residency,
+        validate_residency,
+    )
+
     # Validation
     if prune_args.perserve_super_experts and prune_args.perserve_outliers:
         raise ValueError(
@@ -245,13 +260,45 @@ def run(
     ):
         raise ValueError("layerwise batch_group_size must be at least 1 when provided.")
 
+    if _residency_resolved is None:
+        residency = validate_residency(getattr(reap_args, "residency", "auto"))
+        model_bytes = estimate_model_bytes_from_config(model_args.model_name)
+        resolved, reason = resolve_residency(
+            residency,
+            model_bytes=model_bytes,
+            cli_prefers_layerwise=True,
+        )
+        logger.info("Residency resolved: %s (%s)", resolved, reason)
+        preflight_or_warn(resolved, model_bytes)
+    else:
+        resolved = validate_residency(_residency_resolved)
+        model_bytes = estimate_model_bytes_from_config(model_args.model_name)
+        logger.info("Residency (pre-resolved): %s", resolved)
+        preflight_or_warn(resolved, model_bytes)
+
+    if resolved in ("gpu_full", "cpu_full"):
+        from reap.prune import run as run_full
+
+        logger.info(
+            "Delegating to full prune path (residency=%s) — avoids full-CPU pin",
+            resolved,
+        )
+        return run_full(
+            reap_args,
+            ds_args,
+            obs_args,
+            model_args,
+            eval_args,
+            prune_args,
+            cluster_args,
+            _residency_resolved=resolved,
+        )
+
     set_seed(reap_args.seed)
     results_dir = create_results_directory(model_args.model_name, ds_args.dataset_name)
 
-    # No model name patching in the stripped codebase; use the name as given.
     model_name = model_args.model_name
 
-    # Load tokenizer
     logger.info(f"Loading tokenizer for {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     model = None
@@ -271,31 +318,28 @@ def run(
                 f"Combined dataset requested but no pre-recorded data found at {cached_data_path}"
             )
     else:
-        # Prepare calibration samples
         logger.info("Preparing calibration samples...")
         data_batches = prepare_calibration_batches(tokenizer, ds_args, obs_args)
 
-        # Load model on CPU for layerwise processing
-        logger.info(f"Loading model {model_name} on CPU for layerwise processing...")
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="cpu",
-            torch_dtype="auto",
-            trust_remote_code=True,
+        # Layerwise: auto+disk offload instead of pinning entire model in host RAM.
+        offload_root = results_dir / ".offload"
+        plan = plan_load(
+            "layerwise",
+            offload_root=offload_root,
             low_cpu_mem_usage=layerwise_args.low_cpu_mem_usage,
         )
-        model.eval()
-
+        logger.info(
+            "Loading model for layerwise processing (%s)...", plan.reason
+        )
+        model = load_causal_lm(model_name, plan)
         logger.info(f"Model loaded: {model.__class__.__name__}")
         num_params = sum(p.numel() for p in model.parameters())
         logger.info(f"Total parameters: {num_params / 1e9:.2f}B")
 
-        # Check for cached observer data
         if cached_data_path.exists() and not obs_args.overwrite_observations:
             logger.info(f"Loading cached observer data from {cached_data_path}")
             observer_data = torch.load(cached_data_path, weights_only=False)
         else:
-            # Record activations using layerwise processing
             logger.info("Recording activations using layerwise processing...")
             observer_data = record_activations_layerwise(
                 model,
@@ -352,21 +396,23 @@ def run(
             f"Pruned model already exists at {pruned_model_dir}. Skipping pruning."
         )
     else:
-        # Reload model on auto device for pruning
-        logger.info("Reloading model on GPU for pruning...")
+        # Reload for mutate/save with GPU-first residency (never pin full model
+        # on CPU when host RAM is the bottleneck).
+        logger.info("Reloading model for pruning (gpu_full plan)...")
         if model is not None:
             del model
         cleanup_memory()
 
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="auto",
-            torch_dtype="auto",
-            trust_remote_code=True,
-            local_files_only=True,
-        )
+        from reap.residency import load_causal_lm, plan_load
 
-        # Prune
+        plan = plan_load("gpu_full")
+        try:
+            model = load_causal_lm(
+                model_name, plan, local_files_only=True
+            )
+        except Exception:
+            model = load_causal_lm(model_name, plan, local_files_only=False)
+
         logger.info(f"Pruning model to {total_experts - n_experts_to_prune} experts...")
         prune_model(
             observer_data,

@@ -10,14 +10,17 @@ Implementation: `merge_pipeline.py`, `layerwise_merge.py`, `cluster.py`,
 ## Pipeline summary
 
 ```txt
-observe (record_pruning_metrics_only=False)
+resolve --residency (may delegate full ↔ layerwise)
+  -> load via residency plan
+  -> observe (record_pruning_metrics_only=False)
   -> cluster labels per layer
   -> MoEExpertMerger.merge_experts (in place)
-  -> save model + clusters.pkl
+  -> stream_save_pretrained + clusters.pkl
 ```
 
 Merge entrypoints **force** full merge-criteria metrics even if the CLI default
-is pruning-only.
+is pruning-only. Weight placement uses the same `--residency` policy as prune
+([residency.md](residency.md)).
 
 ## Expert similarity (`--expert-sim`)
 
@@ -91,12 +94,14 @@ merged_models/<merge_name>/<cluster_desc>/
 
 ## Layerwise merge notes
 
-- Calibration is block-wise on GPU.
-- Model weights for merge are loaded on CPU; merger mutates CPU tensors.
+- Calibration is block-wise on GPU when residency resolves to `layerwise`.
+- Weight load uses residency plan (auto + disk offload preferred over full CPU
+  pin); see [residency.md](residency.md). Explicit `cpu_full` still pins CPU.
 - Ensure merge metrics were observed (not pruning-only cache).
 
 ## Related
 
+- [residency.md](residency.md)
 - [observation-and-metrics.md](observation-and-metrics.md)
 - [pruning.md](pruning.md)
 - [cli.md](cli.md)

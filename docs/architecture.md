@@ -9,7 +9,8 @@ work is confined to the phases that need it.
 | Module / package | Responsibility | Notes |
 | --- | --- | --- |
 | `reap.cli` | Typer CLI; builds dataclasses; calls `run()` APIs | No model I/O |
-| `reap.args` | Dataclass config surface (shared by CLI + legacy HF parsers) | Defaults live here |
+| `reap.args` | Dataclass config surface (shared by CLI + legacy HF parsers) | Includes `ReapArgs.residency` |
+| `reap.residency` | Weight load/save policy: auto/gpu_full/layerwise/cpu_full, stream save | Orthogonal to observe backends |
 | `reap.pipeline` | Full-model `record_activations`, results dirs, smoke helper | Hooks standard observer |
 | `reap.model_adapters` | Layout discovery, layer config, `slice_experts`, config patch | Layout-agnostic contract |
 | `reap.observer` | Full-model forward hooks + MoE observation | Uses `kernels.observe` |
@@ -31,6 +32,7 @@ work is confined to the phases that need it.
 src/reap/
   cli/                 # Typer: prune|merge × full|layerwise
   kernels/             # observe backends (bmm/frea/f2), F4/F5
+  residency.py         # weight residency + stream save
   model_adapters.py
   observer.py
   layerwise_observer.py
@@ -53,9 +55,10 @@ src/reap/
 
 ```txt
 Typer / HfArgumentParser
-  -> ReapArgs, ModelArgs, DatasetArgs, ObserverArgs, PruneArgs, ClusterArgs
+  -> ReapArgs (incl. residency), ModelArgs, DatasetArgs, ...
+  -> resolve_residency / preflight; maybe delegate to layerwise_prune
   -> create_results_directory(artifacts/<model>/<dataset>/)
-  -> AutoModelForCausalLM(device_map=auto) + tokenizer
+  -> load_causal_lm(plan_load(gpu_full|cpu_full)) + tokenizer
   -> load_category_batches / composite dataset
   -> MoETransformerObserver hooks
        for each batch: model(**batch)
@@ -64,26 +67,29 @@ Typer / HfArgumentParser
   -> report_state / save .pt
   -> per-layer topk lowest saliency -> slice_experts
   -> update_config(num_experts, top_k)
-  -> save_pretrained + tokenizer
+  -> stream_save_pretrained + tokenizer
   -> optional smoke_test / lm-eval
 ```
 
 ## Data flow (prune, layerwise mode)
 
 ```txt
-Load model on CPU
+resolve_residency (cli_prefers_layerwise=True)
+  -> maybe delegate to prune.run if gpu_full|cpu_full
+Load with plan_load(layerwise): device_map=auto + offload_folder
   -> capture first-block inputs (pre-hook) into ReplayCache (CPU)
   -> for each decoder block:
        move block to CUDA
        for each cached batch: forward block
          MoE hook -> observe_moe_batch
        offload block to CPU
-  -> reload model device_map=auto for in-place prune + save
+  -> del model; cleanup_memory()
+  -> reload plan_load(gpu_full) for in-place prune + stream_save_pretrained
 ```
 
 Hidden states between blocks are cached on **CPU** to fit large models; saliency
-and expert matmuls for the active block stay on **GPU**. See
-[layerwise.md](layerwise.md).
+and expert matmuls for the active block stay on **GPU**. Weight placement is
+governed by [residency.md](residency.md); block schedule by [layerwise.md](layerwise.md).
 
 ## Adapter boundary
 
@@ -135,6 +141,10 @@ force `False`. Contract tests live in
    the activation device.
 5. `pairwise_expert_frequency` is `freq_i + freq_j` (historical REAP semantics),
    not co-routing counts.
+6. Weight residency is resolved once per `run()` entry; cross-delegation uses
+   `_residency_resolved` so `auto` cannot recurse between full and layerwise.
+7. Default save path strips accelerate hooks and does **not** force
+   `model.to("cpu")` before `save_pretrained`.
 
 ## Design non-goals
 

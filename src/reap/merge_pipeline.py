@@ -375,7 +375,14 @@ def save_merged_model(
     logger.info("Saving merged model...")
     merged_model_dir.mkdir(parents=True, exist_ok=True)
     start = time.time()
-    model.save_pretrained(merged_model_dir, safe_serialization=safe_serialization)
+    from reap.residency import stream_save_pretrained
+
+    # Prefer GPU/device stream save (strip accelerate hooks) so low-RAM hosts
+    # do not materialize a full CPU state dict.
+    if safe_serialization:
+        stream_save_pretrained(model, merged_model_dir)
+    else:
+        model.save_pretrained(merged_model_dir, safe_serialization=False)
     if tokenizer is not None:
         tokenizer.save_pretrained(merged_model_dir)
     logger.info(
@@ -512,8 +519,19 @@ def run(
     cluster_args: ClusterArgs,
     merge_args: MergeArgs,
     eval_args: EvalArgs,
+    *,
+    _residency_resolved: str | None = None,
 ):
     """Full-model observe (merge metrics) → cluster → merge → save."""
+    from reap.residency import (
+        estimate_model_bytes_from_config,
+        load_causal_lm,
+        plan_load,
+        preflight_or_warn,
+        resolve_residency,
+        validate_residency,
+    )
+
     if cluster_args.singleton_super_experts and cluster_args.singleton_outlier_experts:
         raise ValueError(
             "Only one of singleton_super_experts or singleton_outlier_experts can be True."
@@ -527,18 +545,46 @@ def run(
         )
         obs_args.record_pruning_metrics_only = False
 
+    if _residency_resolved is None:
+        residency = validate_residency(getattr(reap_args, "residency", "auto"))
+        model_bytes = estimate_model_bytes_from_config(model_args.model_name)
+        resolved, reason = resolve_residency(
+            residency,
+            model_bytes=model_bytes,
+            cli_prefers_layerwise=False,
+        )
+        logger.info("Residency resolved: %s (%s)", resolved, reason)
+        preflight_or_warn(resolved, model_bytes)
+    else:
+        resolved = validate_residency(_residency_resolved)
+        model_bytes = estimate_model_bytes_from_config(model_args.model_name)
+        logger.info("Residency (pre-resolved): %s", resolved)
+        preflight_or_warn(resolved, model_bytes)
+
+    if resolved == "layerwise":
+        from reap.args import LayerwiseArgs
+        from reap.layerwise_merge import run as run_layerwise_merge
+
+        logger.info("Delegating to layerwise merge (residency=%s)", resolved)
+        return run_layerwise_merge(
+            reap_args,
+            ds_args,
+            obs_args,
+            model_args,
+            eval_args,
+            cluster_args,
+            merge_args,
+            LayerwiseArgs(),
+            _residency_resolved=resolved,
+        )
+
     set_seed(reap_args.seed)
     results_dir = create_results_directory(model_args.model_name, ds_args.dataset_name)
 
     model_name = model_args.model_name
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto",
-        torch_dtype="auto",
-        trust_remote_code=True,
-    )
-    model.eval()
+    plan = plan_load("cpu_full" if resolved == "cpu_full" else "gpu_full")
+    model = load_causal_lm(model_name, plan)
 
     logger.info(
         f"Running observer to collect activation+merging data for "
