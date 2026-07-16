@@ -132,22 +132,33 @@ def observe_moe_batch(
     if router is None:
         raise ValueError("Cannot find router on MoE module")
 
-    router_logits_full = extract_router_logits(
-        router,
-        flat_input,
-        batch_size=batch_size,
-        sequence_length=sequence_length,
-        hidden_dim=flat_input.shape[-1],
-    )
-    # Optional expert bias (LFM2) already inside router if applicable.
+    # LFM2 uses sigmoid + per-expert bias + topk-on-scores (not softmax+topk).
+    # Use the model's own router to get correct pairs; FREA/F2 still run on them.
+    if getattr(adapter, "adapter_name", "") == "lfm2_moe":
+        from reap.kernels.router import f5_router_from_module
 
-    # F5 on full logits then filter pairs — keep pair_token_idx into flat_input.
-    router_pairs = f5_router(
-        router_logits_full,
-        top_k,
-        norm_topk_prob=renormalize_router_weights,
-        valid_token_mask=valid_token_mask,
-    )
+        router_logits_full, router_pairs = f5_router_from_module(
+            moe,
+            adapter,
+            flat_input,
+            top_k=top_k,
+            valid_token_mask=valid_token_mask,
+        )
+    else:
+        router_logits_full = extract_router_logits(
+            router,
+            flat_input,
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            hidden_dim=flat_input.shape[-1],
+        )
+        # F5 on full logits then filter pairs — keep pair_token_idx into flat_input.
+        router_pairs = f5_router(
+            router_logits_full,
+            top_k,
+            norm_topk_prob=renormalize_router_weights,
+            valid_token_mask=valid_token_mask,
+        )
 
     stacked = get_stacked_expert_weights(moe, adapter, device=device)
     # frea/f2 try Triton when runtime is ready; bmm stays pure PyTorch.
