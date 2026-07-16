@@ -3,15 +3,23 @@
 Layout-agnostic: expects Linear-convention weights from F4
 (``W_gate/up: (E, I, H)``, ``W_down: (E, H, I)``).
 
-Only supports SiLU gate activation (all current MoE targets). Other ``act_fn``
-values fall back to the PyTorch grouped path. Block sizes auto-scale to the
-active GPU's per-block shared memory so L4/T4 and large-datacenter GPUs both
-work without hardcoding SKUs.
+Throughput vs memory on shared-mem-bound GPUs
+---------------------------------------------
+* **auto** (default): one-shot empirical probe (Triton vs cuBLAS PyTorch) per
+  ``(device, H, I)``, memoize the winner for the rest of the process.
+* **triton**: force Triton when tiles fit (may use SM opt-in for 128×128).
+* **pytorch**: force grouped ``F.linear`` path (max throughput on many L4/T4s).
+
+Set via :func:`set_frea_backend`, env ``REAP_FREA_BACKEND``, or CLI
+``--frea-backend``.
 """
 
 from __future__ import annotations
 
-from typing import Callable
+import logging
+import os
+import time
+from typing import Callable, Literal
 
 import torch
 import torch.nn.functional as F
@@ -29,9 +37,47 @@ from reap.kernels.triton_utils import (
     triton_runtime_available,
 )
 
+logger = logging.getLogger(__name__)
+
 # tl.dot on recent Triton wants M/N/K multiples of 16 for tensor cores.
 _MIN_DOT = 16
 _COMPONENT = "frea"
+# Prefer tiles at least this large for static profitability (when probe is off).
+_PROFITABLE_BLOCK_FLOOR = 128
+
+FreaBackend = Literal["auto", "triton", "pytorch"]
+FREA_BACKENDS: tuple[str, ...] = ("auto", "triton", "pytorch")
+
+# Process-level override (CLI / set_frea_backend). Env wins if set.
+_FREA_BACKEND: str = "auto"
+# Memo: (device_index, h, i_dim) -> "triton" | "pytorch"
+_PROBE_CHOICE: dict[tuple[int | None, int, int], str] = {}
+# Prefer opt-in SM budget after a successful large-tile launch; clear on failure.
+_USE_SMEM_OPTIN: bool | None = None
+
+
+def set_frea_backend(mode: str) -> str:
+    """Set process-wide FREA backend: ``auto`` | ``triton`` | ``pytorch``."""
+    global _FREA_BACKEND
+    m = (mode or "auto").lower().strip()
+    if m not in FREA_BACKENDS:
+        raise ValueError(f"Unknown frea backend {mode!r}; expected one of {FREA_BACKENDS}")
+    _FREA_BACKEND = m
+    return m
+
+
+def get_frea_backend() -> str:
+    env = os.environ.get("REAP_FREA_BACKEND", "").strip().lower()
+    if env in FREA_BACKENDS:
+        return env
+    return _FREA_BACKEND
+
+
+def reset_frea_probe_cache() -> None:
+    """Clear profitability probe memo (tests)."""
+    global _USE_SMEM_OPTIN
+    _PROBE_CHOICE.clear()
+    _USE_SMEM_OPTIN = None
 
 
 def _is_silu(act_fn: Callable) -> bool:
@@ -39,13 +85,12 @@ def _is_silu(act_fn: Callable) -> bool:
 
 
 def estimate_frea_shared_bytes(block_n: int, block_h: int, block_i: int) -> int:
-    """Estimate dynamic shared memory for the SwiGLU tile kernel.
-
-    Matches observed Triton requirements: two live weight tiles (gate/up) as
-    ``BLOCK_I × BLOCK_H`` fp32 plus the ``x`` tile ``BLOCK_N × BLOCK_H`` fp32
-    (e.g. 128/128/16 → 139 264 B on Ada default 99 KiB → too large; 64/64/16 fits).
-    """
+    """Estimate dynamic shared memory for the SwiGLU tile kernel."""
     return int(2 * block_h * block_i * 4 + block_n * block_h * 4 + 4096)
+
+
+def _smem_budget(device: torch.device | None, *, prefer_optin: bool) -> int | None:
+    return device_shared_memory_bytes(device, prefer_optin=prefer_optin)
 
 
 def choose_frea_block_sizes(
@@ -54,38 +99,49 @@ def choose_frea_block_sizes(
     *,
     device: torch.device | None = None,
     block_n: int = 16,
+    prefer_optin: bool | None = None,
 ) -> tuple[int, int, int] | None:
     """Pick largest power-of-two tiles that fit device shared memory.
 
-    Returns ``(block_h, block_i, block_n)`` or ``None`` if no feasible config.
+    Tries opt-in SM budget first (Ampere/Ada ~164 KiB) so 128×128 can fit on
+    L4/T4 when the runtime allows; falls back to the default per-block limit.
     """
-    smem = device_shared_memory_bytes(device)
-    if smem is None:
-        return None
+    if prefer_optin is None:
+        prefer_optin = _USE_SMEM_OPTIN is not False
 
-    # Prefer larger tiles when the device allows (throughput).
-    candidates_h = [
-        b
-        for b in (128, 64, 32, 16)
-        if b >= _MIN_DOT and b <= max(_MIN_DOT, next_power_of_2(h))
-    ]
-    candidates_i = [
-        b
-        for b in (128, 64, 32, 16)
-        if b >= _MIN_DOT and b <= max(_MIN_DOT, next_power_of_2(i_dim))
-    ]
-    if not candidates_h:
-        candidates_h = [_MIN_DOT]
-    if not candidates_i:
-        candidates_i = [_MIN_DOT]
-
-    safety = 2048
-    for bh in candidates_h:
-        for bi in candidates_i:
-            need = estimate_frea_shared_bytes(block_n, bh, bi)
-            if need + safety <= smem:
-                return bh, bi, block_n
+    for use_optin in ((True, False) if prefer_optin else (False,)):
+        smem = _smem_budget(device, prefer_optin=use_optin)
+        if smem is None:
+            continue
+        candidates_h = [
+            b
+            for b in (128, 64, 32, 16)
+            if b >= _MIN_DOT and b <= max(_MIN_DOT, next_power_of_2(h))
+        ]
+        candidates_i = [
+            b
+            for b in (128, 64, 32, 16)
+            if b >= _MIN_DOT and b <= max(_MIN_DOT, next_power_of_2(i_dim))
+        ]
+        if not candidates_h:
+            candidates_h = [_MIN_DOT]
+        if not candidates_i:
+            candidates_i = [_MIN_DOT]
+        safety = 2048
+        for bh in candidates_h:
+            for bi in candidates_i:
+                need = estimate_frea_shared_bytes(block_n, bh, bi)
+                if need + safety <= smem:
+                    return bh, bi, block_n
     return None
+
+
+def _tile_profitable(blocks: tuple[int, int, int] | None) -> bool:
+    """Static heuristic: small auto-tiles are usually slower than cuBLAS on L4."""
+    if blocks is None:
+        return False
+    bh, bi, _bn = blocks
+    return bh >= _PROFITABLE_BLOCK_FLOOR or bi >= _PROFITABLE_BLOCK_FLOOR
 
 
 def _triton_frea_supported(
@@ -93,6 +149,7 @@ def _triton_frea_supported(
     W_gate: torch.Tensor,
     *,
     act_fn: Callable,
+    require_profitable_tiles: bool = False,
 ) -> tuple[bool, str]:
     disabled = is_component_disabled(_COMPONENT)
     if disabled:
@@ -110,12 +167,90 @@ def _triton_frea_supported(
         return False, f"dims H={h}, I={i_dim} below Triton tl.dot floor {_MIN_DOT}"
     blocks = choose_frea_block_sizes(h, i_dim, device=flat_input.device)
     if blocks is None:
-        limit = device_shared_memory_bytes(flat_input.device)
+        limit = device_shared_memory_bytes(flat_input.device, prefer_optin=True)
         return (
             False,
             f"no FREA tile config fits shared mem (device limit={limit}B, H={h}, I={i_dim})",
         )
+    if require_profitable_tiles and not _tile_profitable(blocks):
+        return (
+            False,
+            f"auto-tiled blocks {blocks[0]}x{blocks[1]} below profitability floor "
+            f"{_PROFITABLE_BLOCK_FLOOR} (prefer cuBLAS PyTorch)",
+        )
     return True, ""
+
+
+def _probe_key(flat_input: torch.Tensor, W_gate: torch.Tensor) -> tuple[int | None, int, int]:
+    idx = flat_input.device.index if flat_input.device.type == "cuda" else None
+    _e, i_dim, h = W_gate.shape
+    return (idx, int(h), int(i_dim))
+
+
+def _run_probe(
+    flat_input: torch.Tensor,
+    router_pairs: RouterPairOutputs,
+    W_gate: torch.Tensor,
+    W_up: torch.Tensor,
+    W_down: torch.Tensor,
+    *,
+    act_fn: Callable,
+) -> str:
+    """Time Triton vs PyTorch once; return ``triton`` or ``pytorch``."""
+    key = _probe_key(flat_input, W_gate)
+    if key in _PROBE_CHOICE:
+        return _PROBE_CHOICE[key]
+
+    n_pairs = int(router_pairs.pair_token_idx.numel())
+    # Tiny pair counts: launch overhead dominates — prefer PyTorch.
+    if n_pairs < 16:
+        choice = "pytorch"
+        _PROBE_CHOICE[key] = choice
+        logger.info(
+            "FREA profitability probe: n_pairs=%d < 16 -> %s (skip timed probe)",
+            n_pairs,
+            choice,
+        )
+        return choice
+
+    ok, reason = _triton_frea_supported(
+        flat_input, W_gate, act_fn=act_fn, require_profitable_tiles=False
+    )
+    t_tr = float("inf")
+    if ok:
+        try:
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            _ = _frea_triton_impl(flat_input, router_pairs, W_gate, W_up, W_down)
+            torch.cuda.synchronize()
+            t_tr = time.perf_counter() - t0
+        except Exception as exc:  # pragma: no cover
+            logger.debug("FREA probe Triton failed: %s", exc)
+            t_tr = float("inf")
+
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    _ = routed_expert_activations_grouped(
+        flat_input, router_pairs, W_gate, W_up, W_down, act_fn=act_fn
+    )
+    torch.cuda.synchronize()
+    t_py = time.perf_counter() - t0
+
+    # Prefer Triton on ties (memory win); require clear win for pytorch.
+    if t_tr <= t_py * 1.05:
+        choice = "triton" if t_tr < float("inf") else "pytorch"
+    else:
+        choice = "pytorch"
+
+    _PROBE_CHOICE[key] = choice
+    logger.info(
+        "FREA profitability probe: triton=%.4fs pytorch=%.4fs -> %s (reason_ok=%s)",
+        t_tr if t_tr < float("inf") else -1.0,
+        t_py,
+        choice,
+        reason if not ok else "ok",
+    )
+    return choice
 
 
 def frea_triton_activations(
@@ -126,13 +261,49 @@ def frea_triton_activations(
     W_down: torch.Tensor,
     *,
     act_fn: Callable = F.silu,
+    backend: str | None = None,
 ) -> torch.Tensor:
-    """Compute ``(n_pairs, H)`` routed expert outputs via Triton when possible."""
-    ok, reason = _triton_frea_supported(flat_input, W_gate, act_fn=act_fn)
+    """Compute ``(n_pairs, H)`` via Triton and/or PyTorch per *backend* policy."""
+    mode = (backend or get_frea_backend()).lower().strip()
+    if mode not in FREA_BACKENDS:
+        mode = "auto"
+
+    if mode == "pytorch":
+        log_triton_fallback(_COMPONENT, "frea_backend=pytorch")
+        return routed_expert_activations_grouped(
+            flat_input, router_pairs, W_gate, W_up, W_down, act_fn=act_fn
+        )
+
+    if mode == "auto":
+        # Empirical probe is the default profitability signal (#25).
+        # Skip probe when REAP_FREA_PROBE=0 → static tile floor (#26).
+        probe_env = os.environ.get("REAP_FREA_PROBE", "1").strip().lower()
+        if probe_env in {"0", "false", "no", "off"}:
+            ok, reason = _triton_frea_supported(
+                flat_input, W_gate, act_fn=act_fn, require_profitable_tiles=True
+            )
+            if not ok:
+                log_triton_fallback(_COMPONENT, reason)
+                return routed_expert_activations_grouped(
+                    flat_input, router_pairs, W_gate, W_up, W_down, act_fn=act_fn
+                )
+        else:
+            choice = _run_probe(
+                flat_input, router_pairs, W_gate, W_up, W_down, act_fn=act_fn
+            )
+            if choice == "pytorch":
+                log_triton_fallback(_COMPONENT, "probe chose pytorch")
+                return routed_expert_activations_grouped(
+                    flat_input, router_pairs, W_gate, W_up, W_down, act_fn=act_fn
+                )
+            # else triton — fall through
+
+    # mode == "triton" or auto after probe chose triton
+    ok, reason = _triton_frea_supported(
+        flat_input, W_gate, act_fn=act_fn, require_profitable_tiles=False
+    )
     if not ok:
         log_triton_fallback(_COMPONENT, reason)
-        # Permanent disable when shared-mem infeasible (avoids N failed launches).
-        # Skip re-disable when already memoized ("disabled: …").
         if "shared mem" in reason and not is_component_disabled(_COMPONENT):
             disable_component(_COMPONENT, reason)
         return routed_expert_activations_grouped(
@@ -142,11 +313,23 @@ def frea_triton_activations(
         out = _frea_triton_impl(flat_input, router_pairs, W_gate, W_up, W_down)
         record_triton_ok(_COMPONENT)
         return out
-    except Exception as exc:  # pragma: no cover - device/compile specific
+    except Exception as exc:  # pragma: no cover
         msg = str(exc)
         log_triton_fallback(_COMPONENT, msg)
-        # Memoize hard resource failures (shared mem / out of resource).
+        global _USE_SMEM_OPTIN
         if "shared memory" in msg.lower() or "out of resource" in msg.lower():
+            # Disable opt-in path and retry once with default SM budget tiles.
+            if _USE_SMEM_OPTIN is not False:
+                _USE_SMEM_OPTIN = False
+                try:
+                    out = _frea_triton_impl(
+                        flat_input, router_pairs, W_gate, W_up, W_down
+                    )
+                    record_triton_ok(_COMPONENT)
+                    return out
+                except Exception as exc2:
+                    msg = str(exc2)
+                    log_triton_fallback(_COMPONENT, msg)
             disable_component(_COMPONENT, msg)
         return routed_expert_activations_grouped(
             flat_input, router_pairs, W_gate, W_up, W_down, act_fn=act_fn
@@ -162,6 +345,8 @@ def _frea_triton_impl(
 ) -> torch.Tensor:
     import triton
     import triton.language as tl
+
+    global _USE_SMEM_OPTIN
 
     pair_token_idx = router_pairs.pair_token_idx.contiguous()
     expert_offsets = router_pairs.expert_offsets.contiguous()
@@ -186,6 +371,9 @@ def _frea_triton_impl(
     if blocks is None:
         raise RuntimeError("FREA block selection failed after support check")
     block_h, block_i, block_n = blocks
+    # Prefer larger token tiles when H/I tiles are small (#29 occupancy).
+    if block_h <= 64 and block_i <= 64:
+        block_n = 32 if n_pairs >= 32 else block_n
 
     @triton.jit
     def _expert_swiglu_kernel(
@@ -275,8 +463,10 @@ def _frea_triton_impl(
                 y_prev = tl.load(y_ptrs, mask=mask_nh, other=0.0)
                 tl.store(y_ptrs, y_prev + y_delta, mask=mask_nh)
 
-    # num_stages=2 keeps pipeline staging modest vs default 3–4 on shared mem.
     num_warps = 4 if h <= 1024 else 8
+    if block_h <= 64:
+        num_warps = max(num_warps, 8)
+
     for expert_id in range(e):
         start = int(expert_offsets[expert_id].item())
         end = int(expert_offsets[expert_id + 1].item())
@@ -314,6 +504,9 @@ def _frea_triton_impl(
         )
         out[start:end].copy_(y_fp32.to(dtype=out.dtype))
 
+    # Successful launch with large tiles implies opt-in path is usable.
+    if block_h >= 128 and block_i >= 128 and _USE_SMEM_OPTIN is None:
+        _USE_SMEM_OPTIN = True
     return out
 
 
@@ -326,13 +519,24 @@ def frea_activations_auto(
     *,
     act_fn: Callable = F.silu,
     use_triton: bool | None = None,
+    frea_backend: str | None = None,
 ) -> torch.Tensor:
     """Public FREA entry used by ``frea.frea_activations``."""
+    if use_triton is False:
+        return routed_expert_activations_grouped(
+            flat_input, router_pairs, W_gate, W_up, W_down, act_fn=act_fn
+        )
     if use_triton is None:
         use_triton = triton_runtime_available() and flat_input.is_cuda
     if use_triton:
         return frea_triton_activations(
-            flat_input, router_pairs, W_gate, W_up, W_down, act_fn=act_fn
+            flat_input,
+            router_pairs,
+            W_gate,
+            W_up,
+            W_down,
+            act_fn=act_fn,
+            backend=frea_backend,
         )
     return routed_expert_activations_grouped(
         flat_input, router_pairs, W_gate, W_up, W_down, act_fn=act_fn

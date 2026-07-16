@@ -168,6 +168,19 @@ class ObserverArgs:
             "choices": ["auto", "loop", "bmm", "frea", "f2"],
         },
     )
+    frea_backend: str = field(
+        default="auto",
+        metadata={
+            "help": (
+                "FREA expert-MLP path: auto|triton|pytorch. "
+                "auto times Triton vs cuBLAS PyTorch once per shape and keeps "
+                "the winner (throughput on L4/T4, memory on big-SM GPUs). "
+                "triton forces the Triton kernel when tiles fit; pytorch forces "
+                "grouped F.linear."
+            ),
+            "choices": ["auto", "triton", "pytorch"],
+        },
+    )
 
 @dataclass
 class ClusterArgs:

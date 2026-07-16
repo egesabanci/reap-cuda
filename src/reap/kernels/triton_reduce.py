@@ -118,6 +118,10 @@ def _scatter_triton(
     )
 
     block_h = min(next_power_of_2(h), 128)
+    # Occupancy: more warps when H is large; still 1D grid (safe, low risk).
+    num_warps = 4 if h >= 512 else 2
+    if n >= 2048:
+        num_warps = max(num_warps, 4)
 
     @triton.jit
     def _reduce_kernel(
@@ -174,7 +178,7 @@ def _scatter_triton(
         y.stride(0),
         y.stride(1),
         BLOCK_H=block_h,
-        num_warps=2,
+        num_warps=num_warps,
     )
     batch_max = torch.where(
         torch.isfinite(batch_max), batch_max, torch.zeros_like(batch_max)

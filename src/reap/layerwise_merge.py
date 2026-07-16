@@ -158,6 +158,13 @@ def record_activations_layerwise_merge(
     first_moe_layer = adapter.layers(model)[moe_indices[0]]
     layer_cfg = adapter.get_layer_config(first_moe_layer, model.config)
 
+    try:
+        from reap.kernels.triton_frea import set_frea_backend
+
+        set_frea_backend(getattr(obs_args, "frea_backend", "auto"))
+    except Exception:
+        pass
+
     hook_config = MoETransformerObserverConfig(
         module_class_name_to_hook_regex=adapter.hook_regex(),
         fused_experts=layer_cfg.fused_experts,

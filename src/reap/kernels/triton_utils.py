@@ -66,23 +66,37 @@ def triton_runtime_available() -> bool:
         return False
 
 
-def device_shared_memory_bytes(device: torch.device | int | None = None) -> int | None:
+def _cuda_device_index(device: torch.device | int | None = None) -> int:
+    if device is None:
+        return 0
+    if isinstance(device, torch.device):
+        return device.index if device.index is not None else 0
+    return int(device)
+
+
+def device_shared_memory_bytes(
+    device: torch.device | int | None = None,
+    *,
+    prefer_optin: bool = False,
+) -> int | None:
     """Return per-block dynamic shared-memory limit (bytes) for *device*.
 
-    Uses the **default** (not opt-in) limit so preflight matches what Triton
-    launches get without ``cudaFuncSetAttribute``. Returns ``None`` without CUDA.
+    When *prefer_optin* is True and the device exposes
+    ``shared_memory_per_block_optin`` (Ampere/Ada often ~164 KiB), that larger
+    limit is returned so FREA can try 128×128 tiles. Triton/CUDA typically
+    opt-in when the kernel's declared shared mem exceeds the default. On launch
+    failure callers should fall back to the default limit.
     """
     if not torch.cuda.is_available():
         return None
     try:
-        idx = 0
-        if device is not None:
-            if isinstance(device, torch.device):
-                idx = device.index if device.index is not None else 0
-            else:
-                idx = int(device)
+        idx = _cuda_device_index(device)
         props = torch.cuda.get_device_properties(idx)
-        return int(props.shared_memory_per_block)
+        base = int(props.shared_memory_per_block)
+        optin = getattr(props, "shared_memory_per_block_optin", None)
+        if prefer_optin and optin is not None and int(optin) > base:
+            return int(optin)
+        return base
     except Exception as exc:  # pragma: no cover
         logger.debug("shared_memory probe failed: %s", exc)
         return None
@@ -93,9 +107,10 @@ def shared_mem_feasible(
     *,
     device: torch.device | int | None = None,
     safety_margin: int = 2048,
+    prefer_optin: bool = False,
 ) -> tuple[bool, str]:
     """Whether *required_bytes* fits the device's per-block shared memory."""
-    limit = device_shared_memory_bytes(device)
+    limit = device_shared_memory_bytes(device, prefer_optin=prefer_optin)
     if limit is None:
         return False, "no CUDA shared-memory limit (no device)"
     if required_bytes + safety_margin > limit:

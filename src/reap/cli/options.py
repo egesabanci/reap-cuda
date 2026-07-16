@@ -63,6 +63,17 @@ ObserveBackend = Annotated[
         rich_help_panel="Observer",
     ),
 ]
+FreaBackend = Annotated[
+    str,
+    typer.Option(
+        "--frea-backend",
+        help=(
+            "FREA path: auto (profitability probe) | triton | pytorch. "
+            "auto picks the faster of Triton vs cuBLAS per host/shape."
+        ),
+        rich_help_panel="Observer",
+    ),
+]
 BatchSize = Annotated[
     int,
     typer.Option("--batch-size", help="Calibration batch size.", rich_help_panel="Data"),
@@ -185,7 +196,15 @@ def build_observer_args(
     record_pruning_metrics_only: bool = True,
     renormalize_router_weights: bool = True,
     observe_backend: str = "auto",
+    frea_backend: str = "auto",
 ) -> ObserverArgs:
+    # Apply process-wide FREA policy for kernel dispatch.
+    try:
+        from reap.kernels.triton_frea import set_frea_backend
+
+        set_frea_backend(frea_backend)
+    except Exception:
+        pass
     return ObserverArgs(
         batches_per_category=batches_per_category,
         split_by_category=split_by_category,
@@ -198,6 +217,7 @@ def build_observer_args(
         record_pruning_metrics_only=record_pruning_metrics_only,
         renormalize_router_weights=renormalize_router_weights,
         observe_backend=observe_backend,
+        frea_backend=frea_backend,
     )
 
 

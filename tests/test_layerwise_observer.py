@@ -66,14 +66,18 @@ def _assert_states_match(a: dict, b: dict) -> None:
     for layer_idx in a:
         for metric in metrics_to_compare:
             av, bv = a[layer_idx][metric], b[layer_idx][metric]
-            if av.is_floating_point():
+            if torch.is_tensor(av):
+                av, bv = av.detach().cpu(), bv.detach().cpu()
+            if torch.is_tensor(av) and av.is_floating_point():
                 assert torch.allclose(av, bv, rtol=1e-5, atol=1e-6), (
                     f"mismatch layer {layer_idx} {metric}: {av} vs {bv}"
                 )
-            else:
+            elif torch.is_tensor(av):
                 assert torch.equal(av, bv), (
                     f"mismatch layer {layer_idx} {metric}: {av} vs {bv}"
                 )
+            else:
+                assert av == bv, f"mismatch layer {layer_idx} {metric}: {av} vs {bv}"
 
 
 def test_layerwise_observer_matches_standard_observer():
@@ -107,11 +111,12 @@ def test_layerwise_observer_matches_standard_observer():
     assert standard_state[0]["total_tokens"] == expected_tokens
 
     assert torch.equal(
-        layerwise_state[0]["expert_frequency"], standard_state[0]["expert_frequency"]
+        layerwise_state[0]["expert_frequency"].cpu(),
+        standard_state[0]["expert_frequency"].cpu(),
     )
     assert torch.equal(
-        layerwise_state[0]["pairwise_expert_frequency"],
-        standard_state[0]["pairwise_expert_frequency"],
+        layerwise_state[0]["pairwise_expert_frequency"].cpu(),
+        standard_state[0]["pairwise_expert_frequency"].cpu(),
     )
     for k in (
         "weighted_expert_frequency_sum",
@@ -120,9 +125,10 @@ def test_layerwise_observer_matches_standard_observer():
         "ean_mean",
         "reap",
     ):
-        assert torch.allclose(
-            layerwise_state[0][k], standard_state[0][k], rtol=1e-5, atol=1e-6
-        ), f"mismatch in {k}"
+        # Compare on CPU so CUDA-vs-CPU device placement never fails the assert.
+        av = layerwise_state[0][k].detach().cpu()
+        bv = standard_state[0][k].detach().cpu()
+        assert torch.allclose(av, bv, rtol=1e-5, atol=1e-6), f"mismatch in {k}"
 
 
 def test_layerwise_observer_grouped_batches_match_single_pass():

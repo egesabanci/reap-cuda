@@ -109,6 +109,14 @@ def _setup_observer(model, obs_args):
     if renormalize_router_weights:
         logger.info("Renormalizing topk router weights to sum to 1.")
 
+    # Honor ObserverArgs.frea_backend for kernel dispatch.
+    try:
+        from reap.kernels.triton_frea import set_frea_backend
+
+        set_frea_backend(getattr(obs_args, "frea_backend", "auto"))
+    except Exception:
+        pass
+
     observer_config = MoETransformerObserverConfig(
         module_class_name_to_hook_regex=adapter.hook_regex(),
         fused_experts=adapter.get_layer_config(

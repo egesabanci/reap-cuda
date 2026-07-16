@@ -22,13 +22,13 @@ documented separately: **[residency.md](residency.md)** (`--residency`).
 ### Triton hardware gates (model / SKU agnostic)
 
 - `prefer_triton_for` checks CUDA + dtype + optional min numel.
-- **FREA** queries `shared_memory_per_block` and auto-scales `BLOCK_H` /
-  `BLOCK_I` (128→64→32→16) so L4/T4 and large datacenter GPUs both work.
-- Shared-mem infeasible configs fail the support gate **before** launch; failures
-  are memoized so observe does not re-attempt thousands of times.
-- End of observe logs an INFO **Triton usage summary**
-  (`FREA N Triton / M PyTorch; F2 …`).
-- F2 scatter accumulates **fp64** (matches docs and the PyTorch path).
+- **FREA** auto-scales tiles to device shared mem (default + Ampere/Ada **opt-in**
+  ~164 KiB when available so 128×128 can fit on L4/T4).
+- **`--frea-backend auto`** (default): one-shot **profitability probe** (Triton vs
+  cuBLAS PyTorch) per shape; memoize winner. Force with `triton` / `pytorch`,
+  or env `REAP_FREA_BACKEND` / `REAP_FREA_PROBE=0` for static tile-floor gate.
+- Shared-mem failures are memoized; end of observe logs **Triton usage summary**.
+- F2 scatter accumulates **fp64**; slightly higher `num_warps` on large H.
 
 Native routers (sigmoid + `expert_bias`, etc.) use
 `f5_router_from_module` when `prefers_native_router` detects structural signals —

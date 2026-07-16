@@ -230,21 +230,16 @@ def test_estimate_frea_shared_bytes_known_shape():
 
 
 def test_choose_frea_blocks_respects_tight_shared_mem(monkeypatch):
-    # Simulate L4-like 99 KiB limit
-    monkeypatch.setattr(
-        "reap.kernels.triton_frea.device_shared_memory_bytes",
-        lambda device=None: 101376,
-    )
+    # Simulate L4-like 99 KiB default (and opt-in) limit
+    def _smem(device=None, prefer_optin=False):
+        return 101376
+
+    monkeypatch.setattr("reap.kernels.triton_frea.device_shared_memory_bytes", _smem)
+    monkeypatch.setattr("reap.kernels.triton_utils.device_shared_memory_bytes", _smem)
     blocks = choose_frea_block_sizes(2048, 1792)
     assert blocks is not None
     bh, bi, bn = blocks
     need = estimate_frea_shared_bytes(bn, bh, bi)
-    ok, _ = shared_mem_feasible(need, device=None)
-    # shared_mem_feasible also probes device — monkeypatch utils too
-    monkeypatch.setattr(
-        "reap.kernels.triton_utils.device_shared_memory_bytes",
-        lambda device=None: 101376,
-    )
     ok, reason = shared_mem_feasible(need, device=None)
     assert ok, reason
     # Must not pick 128/128 on 99 KiB
@@ -252,10 +247,10 @@ def test_choose_frea_blocks_respects_tight_shared_mem(monkeypatch):
 
 
 def test_choose_frea_blocks_none_when_impossible(monkeypatch):
-    monkeypatch.setattr(
-        "reap.kernels.triton_frea.device_shared_memory_bytes",
-        lambda device=None: 1024,  # tiny
-    )
+    def _smem(device=None, prefer_optin=False):
+        return 1024  # tiny
+
+    monkeypatch.setattr("reap.kernels.triton_frea.device_shared_memory_bytes", _smem)
     assert choose_frea_block_sizes(2048, 1792) is None
 
 
@@ -400,6 +395,29 @@ def test_cli_help_shows_dataset_path_and_artifacts():
     low = result.stdout.lower()
     assert "dataset-path" in low or "dataset_path" in low
     assert "artifacts-dir" in low or "artifacts" in low
+    assert "frea-backend" in low or "frea_backend" in low
+
+
+def test_frea_backend_set_and_get():
+    from reap.kernels.triton_frea import (
+        get_frea_backend,
+        reset_frea_probe_cache,
+        set_frea_backend,
+    )
+
+    reset_frea_probe_cache()
+    assert set_frea_backend("pytorch") == "pytorch"
+    assert get_frea_backend() == "pytorch"
+    set_frea_backend("auto")
+    assert get_frea_backend() == "auto"
+
+
+def test_tile_profitable_heuristic():
+    from reap.kernels.triton_frea import _tile_profitable
+
+    assert _tile_profitable((128, 64, 16)) is True
+    assert _tile_profitable((64, 64, 16)) is False
+    assert _tile_profitable(None) is False
 
 
 @patch("reap.prune.run")
