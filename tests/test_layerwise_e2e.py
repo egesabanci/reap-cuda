@@ -4,7 +4,7 @@ Exercises the full wiring path restored in the layerwise port:
 ``record_activations_layerwise`` (adapter config construction + block-by-block
 forward + state save) -> ``prune`` (adapter.slice_experts + save_pretrained).
 
-Runs on CPU with the project venv (transformers 4.55) on a tiny
+Runs on CPU with the project venv on a tiny
 ``Qwen3MoeForCausalLM`` (4 experts, 2 layers). No weights are downloaded.
 """
 from __future__ import annotations
@@ -38,7 +38,11 @@ def _make_model(num_experts: int = 4, num_hidden_layers: int = 2):
 
 
 def _n_experts(model) -> int:
-    return len(model.model.layers[0].mlp.experts)
+    # Robust to both the non-fused ModuleList layout (transformers 4.55) and
+    # the fused gate_up_proj/down_proj layout (transformers >=5.x, where
+    # ``len(model.model.layers[0].mlp.experts)`` raises). The config field is
+    # patched by ``adapter.update_config`` after pruning.
+    return model.config.num_experts
 
 
 def test_layerwise_calibrate_then_prune_end_to_end():

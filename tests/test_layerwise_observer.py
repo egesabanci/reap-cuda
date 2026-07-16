@@ -6,8 +6,10 @@ cache) produces state that bit-for-bit matches the standard
 HuggingFace ``Qwen3MoeForCausalLM``. This is the gold-standard check that the
 layerwise mechanism's port onto the adapter system preserves REAP semantics.
 
-Runs on CPU with the project venv (pinned transformers 4.55, where Qwen3-MoE
-experts are a non-fused ``ModuleList``).
+Runs on CPU with the project venv. Qwen3-MoE experts are a fused
+``gate_up_proj`` / ``down_proj`` stack under transformers >=5.x (and a
+non-fused ``ModuleList`` under the legacy 4.55 pin); the test derives the
+layout from the adapter so it passes in both.
 """
 from __future__ import annotations
 
@@ -39,10 +41,12 @@ def _make_qwen3_moe_model(num_hidden_layers: int = 1):
     return model
 
 
-def _make_config(adapter) -> MoETransformerObserverConfig:
+def _make_config(adapter, model) -> MoETransformerObserverConfig:
+    first_layer = adapter.layers(model)[0]
+    fused = adapter.get_layer_config(first_layer, model.config).fused_experts
     return MoETransformerObserverConfig(
         module_class_name_to_hook_regex=adapter.hook_regex(),
-        fused_experts=False,
+        fused_experts=fused,
         record_pruning_metrics_only=True,
     )
 
@@ -84,7 +88,7 @@ def test_layerwise_observer_matches_standard_observer():
 
     # standard observer (adapter-driven)
     sa = infer_model_adapter(model, model.config)
-    observer = MoETransformerObserver(model, hook_config=_make_config(sa), adapter=sa)
+    observer = MoETransformerObserver(model, hook_config=_make_config(sa, model), adapter=sa)
     with observer.set_attention_mask(batch["attention_mask"]):
         _ = model(**batch)
     standard_state = observer.report_state()
@@ -93,7 +97,7 @@ def test_layerwise_observer_matches_standard_observer():
     # layerwise observer (adapter-driven)
     la = infer_model_adapter(layerwise_model, layerwise_model.config)
     layerwise_observer = LayerwiseMoEObserver(
-        layerwise_model, hook_config=_make_config(la), adapter=la
+        layerwise_model, hook_config=_make_config(la, layerwise_model), adapter=la
     )
     layerwise_state = layerwise_observer.record_all_blocks([batch])
     layerwise_observer.close_hooks()
@@ -148,12 +152,12 @@ def test_layerwise_observer_grouped_batches_match_single_pass():
     ]
 
     a = infer_model_adapter(model, model.config)
-    single_pass = LayerwiseMoEObserver(model, hook_config=_make_config(a), adapter=a)
+    single_pass = LayerwiseMoEObserver(model, hook_config=_make_config(a, model), adapter=a)
     single_pass_state = single_pass.record_all_blocks(batches)
     single_pass.close_hooks()
 
     ga = infer_model_adapter(grouped_model, grouped_model.config)
-    grouped = LayerwiseMoEObserver(grouped_model, hook_config=_make_config(ga), adapter=ga)
+    grouped = LayerwiseMoEObserver(grouped_model, hook_config=_make_config(ga, grouped_model), adapter=ga)
     grouped_state = grouped.record_all_blocks(batches, batch_group_size=1)
     grouped.close_hooks()
 

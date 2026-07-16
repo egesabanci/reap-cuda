@@ -61,9 +61,11 @@ def test_merge_pipeline_end_to_end():
     # Collect observer state WITH merging-criteria metrics (record_pruning_metrics_only=False)
     # so clustering has characteristic_activation / router_logit_similarity to work with.
     adapter = infer_model_adapter(model, model.config)
+    first_layer = adapter.layers(model)[0]
+    fused = adapter.get_layer_config(first_layer, model.config).fused_experts
     hook_config = MoETransformerObserverConfig(
         module_class_name_to_hook_regex=adapter.hook_regex(),
-        fused_experts=False,
+        fused_experts=fused,
         record_pruning_metrics_only=False,
     )
     observer = MoETransformerObserver(model, hook_config=hook_config, adapter=adapter)

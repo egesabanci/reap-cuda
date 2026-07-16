@@ -24,7 +24,7 @@ from reap.model_adapters import (
     MixtralMoeModelAdapter,
     infer_model_adapter,
 )
-from reap.main import _setup_observer
+from reap.pipeline import _setup_observer
 
 H, E, K = 16, 8, 2
 
