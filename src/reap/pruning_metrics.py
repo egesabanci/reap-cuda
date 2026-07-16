@@ -326,65 +326,27 @@ def update_pruning_state_routed(
     if pair_out.numel() == 0:
         return
 
-    ean_norm = torch.linalg.norm(pair_out.float(), dim=-1)  # (n_pairs,)
+    # F2 scatter: Triton atomics when eligible, else PyTorch index_add_/scatter_reduce.
+    from reap.kernels.triton_reduce import scatter_pair_stats
 
-    # Use F5 pair_router_w (already top-k weights, renorm-aware when configured).
-    w = pair_router_w
-    if renormalize_router_weights and router_weights_full is None:
-        # Fallback: recompute from logits if F5 did not renorm.
-        rw = F.softmax(router_logits, dim=-1, dtype=torch.float32)
-        topk_w = torch.gather(rw, 1, selected_experts)
-        rw = rw / topk_w.sum(dim=-1, keepdim=True).clamp_min(
-            torch.finfo(rw.dtype).eps
-        )
-        # Map pair weights from (token, expert) — pair_token_idx may be original;
-        # when pairs were built on filtered tokens, pair_token_idx is 0..T_valid-1.
-        # We trust pair_router_w from F5 as the source of truth when provided.
+    stats = scatter_pair_stats(
+        pair_out, pair_expert_idx, pair_router_w, num_experts
+    )
+    ean_sum = stats["ean_sum"]
+    weighted_ean_sum = stats["weighted_ean_sum"]
+    weighted_freq = stats["weighted_freq"]
+    batch_max_raw = stats["batch_max"]
 
-    ean_sum = torch.zeros(num_experts, device=device, dtype=torch.float64)
-    weighted_ean_sum = torch.zeros(num_experts, device=device, dtype=torch.float64)
-    weighted_freq = torch.zeros(num_experts, device=device, dtype=torch.float64)
-    ean_sum.index_add_(0, pair_expert_idx, ean_norm.to(torch.float64))
-    weighted_ean_sum.index_add_(0, pair_expert_idx, (ean_norm * w).to(torch.float64))
-    weighted_freq.index_add_(0, pair_expert_idx, w.to(torch.float64))
-
-    # Per-expert means for this batch (for OnlineStatsTracker / Welford).
-    freq_f = expert_frequency.to(torch.float32).clamp_min(0)
+    # Per-expert batch means for OnlineStatsTracker / Welford (PyTorch; exact).
     ean_mean = torch.zeros(num_experts, device=device, dtype=torch.float32)
     reap = torch.zeros(num_experts, device=device, dtype=torch.float32)
     nonzero = expert_frequency > 0
-    ean_mean[nonzero] = (ean_sum[nonzero] / expert_frequency[nonzero].to(torch.float64)).to(
-        torch.float32
-    )
+    ean_mean[nonzero] = (
+        ean_sum[nonzero] / expert_frequency[nonzero].to(torch.float64)
+    ).to(torch.float32)
     reap[nonzero] = (
         weighted_ean_sum[nonzero] / expert_frequency[nonzero].to(torch.float64)
     ).to(torch.float32)
-
-    # max over activation magnitudes (matches selected_activations.max() over n_e×H)
-    pair_abs_max = pair_out.float().abs().amax(dim=-1)  # (n_pairs,)
-    # scatter max per expert
-    batch_max = torch.full(
-        (num_experts,), float("-inf"), device=device, dtype=torch.float32
-    )
-    batch_max.scatter_reduce_(
-        0, pair_expert_idx, pair_abs_max, reduce="amax", include_self=True
-    )
-    batch_max = torch.where(
-        torch.isfinite(batch_max), batch_max, torch.zeros_like(batch_max)
-    )
-    # Historical code used .max() without abs — use max of raw values to match.
-    pair_raw_max = pair_out.float().amax(dim=-1)
-    batch_max_raw = torch.full(
-        (num_experts,), float("-inf"), device=device, dtype=torch.float32
-    )
-    batch_max_raw.scatter_reduce_(
-        0, pair_expert_idx, pair_raw_max, reduce="amax", include_self=True
-    )
-    batch_max_raw = torch.where(
-        torch.isfinite(batch_max_raw),
-        batch_max_raw,
-        torch.zeros_like(batch_max_raw),
-    )
 
     layer_state["ean_sum"] = layer_state["ean_sum"] + ean_sum
     layer_state["ean_mean"].update(ean_mean, expert_frequency)

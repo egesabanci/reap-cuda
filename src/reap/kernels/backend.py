@@ -5,21 +5,29 @@ from __future__ import annotations
 import os
 from typing import Literal
 
-import torch
-
-try:
-    import triton  # noqa: F401
-
-    _HAS_TRITON = True
-except ImportError:
-    _HAS_TRITON = False
+from reap.kernels.triton_utils import (
+    triton_import_error,
+    triton_package_available,
+    triton_runtime_available,
+)
 
 ObserveBackend = Literal["auto", "loop", "bmm", "frea", "f2"]
 OBSERVE_BACKENDS = ("auto", "loop", "bmm", "frea", "f2")
 
 
 def triton_available() -> bool:
-    return _HAS_TRITON and torch.cuda.is_available()
+    """True when custom Triton kernels can run (CUDA + triton package)."""
+    return triton_runtime_available()
+
+
+def triton_status() -> dict[str, object]:
+    """Diagnostics for CLI / logs."""
+    return {
+        "package": triton_package_available(),
+        "runtime": triton_runtime_available(),
+        "import_error": triton_import_error(),
+        "disabled_env": os.environ.get("REAP_DISABLE_TRITON", ""),
+    }
 
 
 def select_observe_backend(
@@ -29,11 +37,11 @@ def select_observe_backend(
 ) -> str:
     """Resolve observation backend.
 
-    * ``auto``: ``f2`` on CUDA+Triton, else ``bmm`` (GPU or MPS/CPU PyTorch).
-    * ``frea`` / ``f2``: Triton when available, otherwise the pure-PyTorch
-      grouped-bmm path (same math; still GPU-resident).
-    * ``loop``: legacy full ``(E,T,H)`` path (parity oracle).
-    * ``bmm``: grouped routed-only PyTorch (parity oracle for Triton).
+    * ``auto``: ``f2`` when Triton runtime is up, else ``bmm``.
+    * ``frea`` / ``f2``: keep the name so dispatch can try Triton, with
+      automatic PyTorch fallback inside the kernel wrappers.
+    * ``loop``: legacy path (parity oracle).
+    * ``bmm``: pure-PyTorch grouped routed matmul (parity oracle for Triton).
     """
     req = (requested or os.environ.get("REAP_OBSERVE_BACKEND") or "auto").lower()
     if req not in OBSERVE_BACKENDS:
@@ -44,7 +52,4 @@ def select_observe_backend(
         if prefer_triton and triton_available():
             return "f2"
         return "bmm"
-    if req in ("frea", "f2") and not triton_available():
-        # Still correct: PyTorch FREA/F2 fallbacks are GPU-resident grouped bmm.
-        return req
     return req

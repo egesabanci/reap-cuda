@@ -123,6 +123,11 @@ class TestCliStructure:
         out = _strip_ansi(_invoke("version").stdout).strip()
         assert re.match(r"^\d+\.\d+\.\d+", out)
 
+    def test_kernels_status_command(self):
+        out = _strip_ansi(_invoke("kernels").stdout)
+        assert "triton" in out.lower()
+        assert "auto backend" in out.lower()
+
     def test_unknown_command_fails(self):
         result = runner.invoke(app, ["not-a-command"], color=False, env=_ENV)
         assert result.exit_code != 0

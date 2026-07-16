@@ -61,16 +61,21 @@ No full expert loop over all tokens; no persistent `(E, T, H)` on prune path.
 - Optional renorm when `renormalize_router_weights` and model `norm_topk_prob`
 - Emits expert-sorted pair indices + CSR `expert_offsets` for coalesced work
 
-## FREA / F2 reality check
+## FREA / F2 / Triton
 
-| Name | Implementation today |
+| Name | Implementation |
 | --- | --- |
-| FREA | Grouped `F.linear` per active expert; optional `torch.compile` on CUDA |
-| F2 | GPU `index_add_` / scatter_reduce + Welford trackers |
-| Custom Triton kernels | Design docs under `docs/kernels/`; not required for correctness |
+| F5 softmax | Triton online row-softmax when `E ≤ 1024` and CUDA; else `F.softmax` |
+| FREA | Triton per-expert tiled SwiGLU (`triton_frea.py`) when `H,I ≥ 16` + SiLU; else grouped `F.linear` |
+| F2 | Triton atomic scatter of norms/weights (`triton_reduce.py`); Welford means stay PyTorch |
+| Force PyTorch | `REAP_DISABLE_TRITON=1` or `--observe-backend bmm` |
 
-Expect **algorithmic** wins (routed FLOPs, no 8 GB activation blob) immediately;
-wall-clock vs a hand-tuned Triton suite is a separate optimization track.
+```bash
+reap kernels   # print Triton package/runtime + auto backend
+```
+
+All Triton launches are **optional**: failures or unsupported shapes fall back
+to pure PyTorch automatically (debug log: `Triton … fallback → PyTorch`).
 
 ## Why double compute?
 

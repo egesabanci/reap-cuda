@@ -62,6 +62,26 @@ def version() -> None:
         typer.echo("0.1.0")
 
 
+@app.command("kernels")
+def kernels_status() -> None:
+    """Show observation-backend / Triton readiness (no model load)."""
+    import torch
+
+    from reap.kernels.backend import select_observe_backend, triton_status
+
+    status = triton_status()
+    typer.echo(f"torch.cuda.is_available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        typer.echo(f"cuda device: {torch.cuda.get_device_name(0)}")
+    typer.echo(f"triton package: {status['package']}")
+    typer.echo(f"triton runtime: {status['runtime']}")
+    if status["import_error"]:
+        typer.echo(f"triton import error: {status['import_error']}")
+    if status["disabled_env"]:
+        typer.echo(f"REAP_DISABLE_TRITON: {status['disabled_env']}")
+    typer.echo(f"auto backend: {select_observe_backend('auto')}")
+
+
 def main() -> None:
     """Console-script entry point."""
     app()

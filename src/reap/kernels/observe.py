@@ -91,15 +91,13 @@ def observe_moe_batch(
     if fused is None:
         fused = adapter.expert_weight_attrs(moe).get("fused", False)
 
-    # Filter padding early so all backends share one token axis.
     if valid_token_mask is not None:
         mask = valid_token_mask.reshape(-1).bool().to(device)
-        flat_valid = flat_input[mask]
     else:
         mask = None
-        flat_valid = flat_input
 
     need_dense = not record_pruning_metrics_only
+    from reap.kernels.triton_utils import triton_runtime_available
 
     if backend == "loop":
         # Loop over full flat_input then let update_pruning_state apply mask
@@ -152,7 +150,8 @@ def observe_moe_batch(
     )
 
     stacked = get_stacked_expert_weights(moe, adapter, device=device)
-    use_triton = backend in ("frea", "f2")
+    # frea/f2 try Triton when runtime is ready; bmm stays pure PyTorch.
+    use_triton = backend in ("frea", "f2") and triton_runtime_available()
     pair_out = frea_activations(
         flat_input,
         router_pairs,
