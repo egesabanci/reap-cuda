@@ -4,6 +4,7 @@ import logging
 import pathlib
 import re
 
+import json
 import yaml
 import torch
 from tqdm import tqdm
@@ -182,6 +183,48 @@ def _profile_model(model, tokenizer, model_args, obs_args, observer):
     observer.reset()
 
 
+def _compute_artifact_metadata(
+    reap_args, model_args, ds_args, obs_args,
+) -> dict[str, object]:
+    """Compute a stable metadata dict for cache invalidation."""
+    return {
+        "version": 2,
+        "model_name": model_args.model_name,
+        "dataset_name": ds_args.dataset_name,
+        "dataset_config_name": getattr(ds_args, "dataset_config_name", None),
+        "dataset_path": getattr(ds_args, "dataset_path", None),
+        "split": ds_args.split,
+        "seed": reap_args.seed,
+        "shuffle": getattr(ds_args, "shuffle", True),
+        "model_max_length": obs_args.model_max_length,
+        "batches_per_category": obs_args.batches_per_category,
+        "batch_size": obs_args.batch_size,
+        "truncate": obs_args.truncate,
+        "split_by_category": obs_args.split_by_category,
+        "distance_measure": obs_args.distance_measure,
+        "record_pruning_metrics_only": obs_args.record_pruning_metrics_only,
+        "renormalize_router_weights": obs_args.renormalize_router_weights,
+        "observe_backend": getattr(obs_args, "observe_backend", "auto"),
+        "frea_backend": getattr(obs_args, "frea_backend", "auto"),
+    }
+
+
+def load_observer_artifact(path: pathlib.Path) -> dict[str, object]:
+    """Load an observer state dict with safe tensor-only deserialization."""
+    value = torch.load(path, weights_only=True, map_location="cpu")
+    if not isinstance(value, dict):
+        raise ValueError(f"Observer artifact {path} is not a dict")
+    for layer_key, layer_data in value.items():
+        if isinstance(layer_data, dict):
+            expected_fields = {"expert_frequency", "total_tokens"}
+            if not expected_fields.issubset(layer_data):
+                logger.warning(
+                    "Layer %s in %s lacks expected fields %s",
+                    layer_key, path, expected_fields - set(layer_data),
+                )
+    return value
+
+
 def record_activations(
     model, tokenizer, reap_args, model_args, ds_args, obs_args, results_dir
 ):
@@ -190,15 +233,44 @@ def record_activations(
     reset_triton_usage()
     dataset_path = getattr(ds_args, "dataset_path", None)
 
+    # Compute aggregate path early (before any model/observer setup).
+    all_dir = results_dir / "all"
+    all_dir.mkdir(parents=True, exist_ok=True)
+    aggregate_path = all_dir / obs_args.output_file_name
+    meta_path = aggregate_path.with_suffix(aggregate_path.suffix + ".meta.json")
+
+    # Early return if valid aggregate cache exists.
+    if aggregate_path.exists() and not obs_args.overwrite_observations:
+        try:
+            current_meta = _compute_artifact_metadata(reap_args, model_args, ds_args, obs_args)
+            if meta_path.exists():
+                with open(meta_path) as f:
+                    stored_meta = json.load(f)
+                if stored_meta == current_meta:
+                    logger.info(
+                        "Aggregate cache hit @ %s; returning cached data.",
+                        aggregate_path,
+                    )
+                    return load_observer_artifact(aggregate_path)
+                else:
+                    logger.info(
+                        "Aggregate cache @ %s has mismatched metadata; recomputing.",
+                        aggregate_path,
+                    )
+            else:
+                logger.info(
+                    "Aggregate cache @ %s has no metadata; recomputing.",
+                    aggregate_path,
+                )
+        except Exception as exc:
+            logger.warning("Aggregate cache validation failed (%s); recomputing.", exc)
+
     if ds_args.dataset_name == "combined":
-        # just return the combined data
-        cat_dir = results_dir / "all"
-        f_name = cat_dir / obs_args.output_file_name
-        if f_name.exists():
-            return torch.load(f_name, weights_only=False)
+        if aggregate_path.exists():
+            return load_observer_artifact(aggregate_path)
         else:
             raise RuntimeError(
-                f"Combined dataset requested but no pre-recorded data found at {f_name}"
+                f"Combined dataset requested but no pre-recorded data found at {aggregate_path}"
             )
 
     # check for composite dataset specification
@@ -227,6 +299,8 @@ def record_activations(
             return_vllm_tokens_prompt=obs_args.return_vllm_tokens_prompt,
             truncate=obs_args.truncate,
             global_dataset_path=dataset_path,
+            shuffle=getattr(ds_args, "shuffle", True),
+            seed=reap_args.seed,
         )
     else:
         category_data_batches = load_category_batches(
@@ -241,13 +315,15 @@ def record_activations(
             batches_per_category=obs_args.batches_per_category,
             batch_size=obs_args.batch_size,
             dataset_path=dataset_path,
+            shuffle=getattr(ds_args, "shuffle", True),
+            seed=reap_args.seed,
         )
 
     logger.info(
         "Loaded and processed data for categories: %s",
         str(list(category_data_batches.keys())),
     )
-    
+
     # load observer and hook model
     observer = _setup_observer(model, obs_args)
     primary_device = _primary_device(model)
@@ -255,51 +331,39 @@ def record_activations(
     if reap_args.profile:
         _profile_model(model, tokenizer, model_args, obs_args, observer)
 
-    # run samples over model and save observer state
     # Process all categories into a single accumulated observer state.
-    # Per-category artifacts are saved individually; an aggregate is written
-    # to results_dir / "all" at the end.
-    all_dir = results_dir / "all"
-    all_dir.mkdir(parents=True, exist_ok=True)
-    aggregate_path = all_dir / obs_args.output_file_name
-
+    # Per-category artifacts are saved as diagnostics; the aggregate is the
+    # authoritative cache.  Every category always runs — a per-category skip
+    # would leave the aggregate with empty state.
     with torch.no_grad():
         for category, cat_data in category_data_batches.items():
             logger.info(f"Processing category: {category}...")
             cat_dir = results_dir / str_to_directory_name(category)
             cat_dir.mkdir(parents=True, exist_ok=True)
-            f_name = cat_dir / obs_args.output_file_name
-            if f_name.exists() and not obs_args.overwrite_observations:
-                logger.info(
-                    f"Category '{category}' previously processed. Skipping to next category..."
-                )
-                continue
-            try:
-                logger.info("No previous data found @ %s", f_name)
-                for sample in tqdm(cat_data, desc=f"Processing {category} samples"):
-                    attention_mask = sample.get("attention_mask", None)
-                    sample = {
-                        k: v.to(primary_device) if torch.is_tensor(v) else v
-                        for k, v in sample.items()
-                    }
-                    with observer.set_attention_mask(attention_mask):
-                        model(**sample)
-            except Exception as e:
-                logger.error(f"Error processing category '{category}'")
-                logger.info(
-                    f"Saving partial results for category '{category}' and exiting"
-                )
-                observer.save_state(cat_dir / "partial.pkl")
-                raise e
-            # Save per-category snapshot (debug / partial resume).
-            observer.save_state(f_name)
-            logger.info(f"Category '{category}' data saved to {f_name}")
+            for sample in tqdm(cat_data, desc=f"Processing {category} samples"):
+                attention_mask = sample.get("attention_mask", None)
+                sample = {
+                    k: v.to(primary_device) if torch.is_tensor(v) else v
+                    for k, v in sample.items()
+                }
+                with observer.set_attention_mask(attention_mask):
+                    model(**sample)
+            # Save per-category diagnostic snapshot.
+            cat_path = cat_dir / obs_args.output_file_name
+            observer.save_state(cat_path)
+            logger.info(f"Category '{category}' data saved to {cat_path}")
 
     # Write aggregate (all categories combined in one observer).
     observer.save_state(aggregate_path)
-    # Capture the in-memory state BEFORE close_hooks() resets it. close_hooks()
-    # calls reset() which does ``del self.state; self.state = {}``, so calling
-    # report_state() afterwards would return {} and crash prune (StopIteration).
+    # Write sidecar metadata for future cache validation.
+    meta = _compute_artifact_metadata(reap_args, model_args, ds_args, obs_args)
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2, default=str)
+    logger.info(
+        "Aggregate cache saved @ %s (version=%d)", aggregate_path, meta["version"]
+    )
+
+    # Capture the in-memory state BEFORE close_hooks() resets it.
     observer_data = observer.report_state()
     observer.close_hooks()
     log_triton_usage_summary()

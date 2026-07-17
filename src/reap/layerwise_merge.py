@@ -76,6 +76,9 @@ def prepare_calibration_batches(
     tokenizer,
     ds_args: DatasetArgs,
     obs_args: ObserverArgs,
+    *,
+    shuffle: bool = True,
+    seed: int = 42,
 ) -> List[torch.Tensor]:
     """Prepare calibration samples for layerwise processing.
 
@@ -102,6 +105,8 @@ def prepare_calibration_batches(
             return_vllm_tokens_prompt=obs_args.return_vllm_tokens_prompt,
             truncate=obs_args.truncate,
             global_dataset_path=global_path,
+            shuffle=shuffle,
+            seed=seed,
         )
         all_batches = []
         for _category, batches in category_data_batches.items():
@@ -120,6 +125,8 @@ def prepare_calibration_batches(
         batches_per_category=obs_args.batches_per_category,
         batch_size=obs_args.batch_size,
         dataset_path=global_path,
+        shuffle=shuffle,
+        seed=seed,
     )
     all_batches: List[torch.Tensor] = []
     for _category, samples in category_data_batches.items():
@@ -250,9 +257,9 @@ def run(
     if layerwise_args.batch_group_size is not None and layerwise_args.batch_group_size < 1:
         raise ValueError("layerwise batch_group_size must be at least 1 when provided.")
 
+    tcr = bool(getattr(model_args, "trust_remote_code", False))
     if _residency_resolved is None:
         residency = validate_residency(getattr(reap_args, "residency", "auto"))
-        tcr = getattr(model_args, "trust_remote_code", False)
         model_bytes = estimate_model_bytes_from_config(model_args.model_name, trust_remote_code=tcr)
         resolved, reason = resolve_residency(
             residency,
@@ -293,7 +300,6 @@ def run(
     )
 
     model_name = model_args.model_name
-    tcr = getattr(model_args, "trust_remote_code", False)
 
     logger.info(f"Loading tokenizer for {model_name}...")
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=tcr)
@@ -317,7 +323,7 @@ def run(
 
     if cached_data_path.exists() and not obs_args.overwrite_observations:
         logger.info(f"Loading cached observer data from {cached_data_path}")
-        observer_data = torch.load(cached_data_path, weights_only=False)
+        observer_data = torch.load(cached_data_path, weights_only=True, map_location="cpu")
     else:
         if ds_args.dataset_name == "combined":
             raise RuntimeError(
@@ -325,7 +331,11 @@ def run(
                 f"{cached_data_path}"
             )
         logger.info("Preparing calibration samples...")
-        data_batches = prepare_calibration_batches(tokenizer, ds_args, obs_args)
+        data_batches = prepare_calibration_batches(
+            tokenizer, ds_args, obs_args,
+            shuffle=getattr(ds_args, "shuffle", True),
+            seed=reap_args.seed,
+        )
 
         logger.info("Recording activations with layerwise merge observer...")
         observer_data = record_activations_layerwise_merge(

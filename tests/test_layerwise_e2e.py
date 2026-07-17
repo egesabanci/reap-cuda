@@ -18,7 +18,7 @@ from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
 
 from reap.args import DatasetArgs, ObserverArgs, PruneArgs, LayerwiseArgs
 from reap.layerwise_prune import record_activations_layerwise
-from reap.prune import prune as prune_model
+from reap.prune import apply_pruning as prune_model
 
 
 def _make_model(num_experts: int = 4, num_hidden_layers: int = 2):
@@ -74,8 +74,5 @@ def test_layerwise_calibrate_then_prune_end_to_end():
         assert observer_data[0]["expert_frequency"].numel() == 4
 
         pruned_dir = results_dir / "pruned"
-        prune_model(observer_data, model, PruneArgs(), 2, pruned_dir)
-
+        prune_model(observer_data, model, PruneArgs(), 2)
         assert _n_experts(model) == 2, "prune did not reduce experts 4 -> 2"
-        saved = list(pruned_dir.glob("*.safetensors")) + list(pruned_dir.glob("*.bin"))
-        assert saved, "pruned model was not saved"

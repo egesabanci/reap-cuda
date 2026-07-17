@@ -75,14 +75,18 @@ def _resolve_saliency(
     return saliency_data.to(device=model_device)
 
 
-def prune(
+def apply_pruning(
     observer_data,
     model,
     prune_args,
     n_experts_to_prune,
-    pruned_model_dir,
-):
-    """Prune the model based on the observer data."""
+) -> None:
+    """Mutate the model in-memory by slicing / pruning low-saliency experts.
+
+    Does **not** write any files. After this call the model is pruned but
+    still in its current device placement.  Call ``publish_pruned_model``
+    (after a smoke test) to persist weights.
+    """
     adapter = infer_model_adapter(model, model.config)
     if adapter is None:
         raise ValueError(
@@ -102,10 +106,10 @@ def prune(
 
     # Optional super/outlier expert preservation (mirrors merge path).
     protected: dict[int, set[int]] = {}
-    if prune_args.perserve_super_experts or prune_args.perserve_outliers:
+    if prune_args.preserve_super_experts or prune_args.preserve_outliers:
         super_idx = get_super_expert_indices(
             observer_data,
-            include_last_layers=bool(prune_args.perserve_outliers),
+            include_last_layers=bool(prune_args.preserve_outliers),
         )
         for row in super_idx:
             layer_i, expert_i = int(row[0].item()), int(row[1].item())
@@ -115,6 +119,29 @@ def prune(
             int(super_idx.shape[0]),
         )
 
+    # Compute per-layer capacity to determine a single uniform prune count.
+    capacity: dict[int, int] = {}
+    for layer in observer_data:
+        num_experts = observer_data[layer]["expert_frequency"].shape[0]
+        if layer in protected:
+            protected_count = len({e for e in protected[layer] if 0 <= e < num_experts})
+        else:
+            protected_count = 0
+        max_possible = num_experts - protected_count - 1  # always leave >= 1
+        capacity[layer] = max(0, max_possible)
+
+    effective_n_prune = min(n_experts_to_prune, *capacity.values())
+    if effective_n_prune < n_experts_to_prune:
+        constrained = [l for l, c in capacity.items() if c < n_experts_to_prune]
+        logger.warning(
+            "Requested %d pruned but layers %s can only accommodate %d; "
+            "using %d so all layers keep the same number of experts.",
+            n_experts_to_prune,
+            constrained,
+            min(capacity.values()),
+            effective_n_prune,
+        )
+
     retained_expert_indicies = None
     for layer in tqdm(observer_data, "Pruning layers..."):
         num_experts = observer_data[layer]["expert_frequency"].shape[0]
@@ -122,9 +149,6 @@ def prune(
             observer_data[layer], prune_args.prune_method, model_device=model_device
         )
 
-        # Build unprotected candidate set instead of manipulating saliency.
-        # Protected experts are excluded from the candidate pool so they
-        # are *guaranteed* retained regardless of the requested count.
         if layer in protected:
             protected_set = {
                 e for e in protected[layer] if 0 <= e < num_experts
@@ -136,29 +160,14 @@ def prune(
             protected_set = set()
             unprotected = list(range(num_experts))
 
-        # Never prune more than the unprotected population, and always
-        # leave at least one expert in the layer.
-        max_possible = len(unprotected)
-        max_possible = min(max_possible, num_experts - 1)
-        if n_experts_to_prune > max_possible and max_possible > 0:
-            logger.warning(
-                "Layer %d: requested %d pruned but only %d unprotected "
-                "experts available; capping to %d.",
-                layer,
-                n_experts_to_prune,
-                len(unprotected),
-                max_possible,
-            )
-        n_prune = min(n_experts_to_prune, max_possible)
-        if n_prune < 1:
+        if effective_n_prune < 1:
             retained_expert_indicies = list(range(num_experts))
             continue
 
-        # Select lowest-k *from unprotected candidates only*.
         if unprotected:
             unprotected_saliency = saliency[unprotected]
             _, unprotected_prune_rel = torch.topk(
-                unprotected_saliency, n_prune, largest=False
+                unprotected_saliency, effective_n_prune, largest=False
             )
             prune_set = {unprotected[i] for i in unprotected_prune_rel.tolist()}
         else:
@@ -168,8 +177,8 @@ def prune(
             actually_pruned = prune_set & protected_set
             if actually_pruned:
                 logger.warning(
-                    "Layer %d: %d protected experts were selected for pruning — "
-                    "this indicates a bug in the protection logic; skipping prune",
+                    "Layer %d: %d protected experts were selected for pruning "
+                    "\u2014 this indicates a bug in the protection logic; skipping prune",
                     layer,
                     len(actually_pruned),
                 )
@@ -182,20 +191,66 @@ def prune(
         moe = adapter.get_moe(layers[layer])
         adapter.slice_experts(moe, retained_expert_indicies)
 
-    logger.info("Saving pruned model...")
     retained_experts = len(retained_expert_indicies)
     moe_layer_indices = adapter.identify_moe_layers(model)
     first_moe_layer = layers[moe_layer_indices[0]]
     layer_cfg = adapter.get_layer_config(first_moe_layer, model.config)
     adapter.update_config(model.config, retained_experts, layer_cfg.top_k)
-
-    pruned_model_dir.mkdir(parents=True, exist_ok=True)
-    start = time.time()
-    stream_save_pretrained(model, pruned_model_dir)
-    end = time.time()
     logger.info(
-        f"Pruned model saved to {pruned_model_dir} in {end - start:.2f} seconds"
+        "Pruning applied: %d MoE layers each \u2192 %d experts",
+        len(observer_data), retained_experts,
     )
+
+
+def publish_pruned_model(
+    model,
+    tokenizer,
+    pruned_model_dir: pathlib.Path,
+    *,
+    smoke_test_fn=None,
+    extra_yaml_args: dict[str, object] | None = None,
+) -> pathlib.Path:
+    """Write pruned model weights, tokenizer, and metadata to disk.
+
+    Uses a staging directory so that partial output is never written to
+    the final path.  If ``smoke_test_fn`` is provided, it is called
+    *before* writing files; when it raises, no output is left behind.
+    """
+    # Run smoke test before writing any files.
+    if smoke_test_fn is not None:
+        logger.info("Running smoke test before publishing...")
+        smoke_test_fn()
+
+    # Write to a staging directory next to the final path.
+    import uuid
+    pruned_model_dir = pathlib.Path(pruned_model_dir)
+    stage = pruned_model_dir.parent / f".{pruned_model_dir.name}.tmp-{uuid.uuid4().hex[:8]}"
+    try:
+        stage.mkdir(parents=True, exist_ok=True)
+        start = time.time()
+        stream_save_pretrained(model, stage)
+        tokenizer.save_pretrained(stage)
+        if extra_yaml_args:
+            from reap.pipeline import dump_args_to_yaml
+            dump_args_to_yaml(stage, **extra_yaml_args)
+        end = time.time()
+        logger.info(
+            "Pruned model saved to staging %s in %.2f seconds",
+            stage, end - start,
+        )
+        # Atomically promote.
+        if pruned_model_dir.exists():
+            import shutil
+            shutil.rmtree(pruned_model_dir)
+        stage.rename(pruned_model_dir)
+        logger.info("Published pruned model to %s", pruned_model_dir)
+    except BaseException:
+        if stage.exists():
+            import shutil
+            shutil.rmtree(stage, ignore_errors=True)
+            logger.warning("Staging directory %s cleaned up after failure", stage)
+        raise
+
     return pruned_model_dir
 
 
@@ -213,10 +268,10 @@ def get_pruned_model_dir(
     name_prefix = "" if name_prefix is None else name_prefix
     pruned_model_name = f"{name_prefix}{prune_args.prune_method}"
 
-    if prune_args.perserve_super_experts:
-        pruned_model_name += "-perserve_super"
-    elif prune_args.perserve_outliers:
-        pruned_model_name += "-perserve_outlier"
+    if prune_args.preserve_super_experts:
+        pruned_model_name += "-preserve_super"
+    elif prune_args.preserve_outliers:
+        pruned_model_name += "-preserve_outlier"
     if renorm:
         pruned_model_name += f"-renorm_{str(renorm).lower()}"
     pruned_model_name += f"-seed_{seed}"
@@ -244,9 +299,9 @@ def run(
     Honors ``reap_args.residency``. If resolved mode is ``layerwise``, delegates
     to :func:`reap.layerwise_prune.run`.
     """
+    tcr = bool(getattr(model_args, "trust_remote_code", False))
     if _residency_resolved is None:
         residency = validate_residency(getattr(reap_args, "residency", "auto"))
-        tcr = getattr(model_args, "trust_remote_code", False)
         model_bytes = estimate_model_bytes_from_config(model_args.model_name, trust_remote_code=tcr)
         resolved, reason = resolve_residency(
             residency,
@@ -286,7 +341,6 @@ def run(
     )
 
     model_name = model_args.model_name
-    tcr = getattr(model_args, "trust_remote_code", False)
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=tcr)
     plan = plan_load("cpu_full" if resolved == "cpu_full" else "gpu_full")
 
@@ -352,21 +406,38 @@ def run(
         )
     else:
         logger.info(f"Pruning model to {total_experts - n_experts_to_prune} experts...")
-        prune(
+        apply_pruning(
             observer_data,
             model,
             prune_args,
             n_experts_to_prune,
-            pruned_model_dir,
         )
         logger.info("pruning completed.")
 
-        if reap_args.smoke_test:
-            logger.info("Running smoke test on the pruned model...")
-            smoke_test(model, tokenizer)
+        # Collect extra YAML args for the published artifact.
+        yaml_kwargs = dict(
+            reap_args=reap_args,
+            ds_args=ds_args,
+            obs_args=obs_args,
+            model_args=model_args,
+            eval_args=eval_args,
+            prune_args=prune_args,
+            cluster_args=cluster_args,
+        )
 
-        tokenizer.save_pretrained(pruned_model_dir)
-        logger.info("Pruning completed.")
+        publish_pruned_model(
+            model,
+            tokenizer,
+            pruned_model_dir,
+            smoke_test_fn=(
+                lambda: smoke_test(model, tokenizer)
+                if reap_args.smoke_test else None
+            ),
+            extra_yaml_args=yaml_kwargs,
+        )
+
+        if reap_args.smoke_test:
+            logger.info("Smoke test passed; model published.")
 
     if reap_args.do_eval and pruned_model_dir.exists():
         remove_hook_from_module(model, recurse=True)

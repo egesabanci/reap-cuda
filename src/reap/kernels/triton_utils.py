@@ -146,9 +146,7 @@ def prefer_triton_for(
         return False
     if tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         return False
-    if min_numel is not None and tensor.numel() < min_numel:
-        return False
-    return True
+    return min_numel is None or tensor.numel() >= min_numel
 
 
 def next_power_of_2(n: int) -> int:

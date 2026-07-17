@@ -132,8 +132,93 @@ def snapshot_memory() -> MemorySnapshot:
     )
 
 
+def _try_meta_parameter_count(cfg, *, trust_remote_code: bool) -> int | None:
+    """Construct model metadata-only to get exact parameter count.
+
+    Uses ``accelerate.init_empty_weights`` + ``from_config`` so no
+    checkpoint tensors are loaded.  Falls back to ``None`` when the
+    architecture is unknown or construction fails.
+    """
+    try:
+        from accelerate import init_empty_weights
+        from transformers import AutoModelForCausalLM
+
+        with init_empty_weights(include_buffers=True):
+            model = AutoModelForCausalLM.from_config(cfg, trust_remote_code=trust_remote_code)
+        return sum(p.numel() for p in model.parameters())
+    except Exception as exc:
+        logger.debug("Meta-parameter count unavailable: %s", exc)
+        return None
+
+
+def _fallback_config_heuristic(cfg) -> int | None:
+    """Fallback heuristic for unknown architectures.
+
+    Unlike the old formula, this only charges expert params to the layers
+    that the config explicitly identifies as MoE (``num_experts`` attribute
+    exists per layer or is non-zero).  When the config does not distinguish
+    MoE from dense layers, it returns ``None`` so the caller can warn and
+    default to conservative behavior.
+    """
+    try:
+        hidden = int(getattr(cfg, "hidden_size", 0) or 0)
+        layers = int(getattr(cfg, "num_hidden_layers", 0) or 0)
+        vocab = int(getattr(cfg, "vocab_size", 0) or 0)
+        if hidden <= 0 or layers <= 0:
+            return None
+
+        # Embedding + LM head.
+        embed = vocab * hidden * 2  # tie weights by default
+
+        num_experts = int(getattr(cfg, "num_experts", 0) or getattr(cfg, "num_local_experts", 0) or 0)
+        inter = int(
+            getattr(cfg, "intermediate_size", 0)
+            or getattr(cfg, "moe_intermediate_size", 0)
+            or 0
+        )
+
+        if num_experts > 0 and inter > 0:
+            # Architecture exposes MoE structure — estimate per-layer breakdown.
+            # Count expert-only FFN vs dense-attn-only layers transparently.
+            moe_layers = int(getattr(cfg, "num_experts_per_layer", 0) or getattr(cfg, "num_moe_layers", 0) or layers)
+            dense_layers = layers - moe_layers
+
+            # Attention (QKV+O): ~4 * hidden^2 per layer.
+            attn_per_layer = 4 * hidden * hidden
+
+            # Dense FFN: ~3 * hidden * inter.
+            dense_ffn_per_layer = 3 * hidden * inter if inter > 0 else 0
+
+            # MoE FFN: experts * 3 * hidden * inter (up/gate/down).
+            moe_ffn_per_layer = num_experts * 3 * hidden * inter
+
+            params = (
+                embed
+                + dense_layers * (attn_per_layer + dense_ffn_per_layer)
+                + moe_layers * (attn_per_layer + moe_ffn_per_layer)
+            )
+            return int(params)
+
+        # No MoE info — attn-only estimate (dense model).
+        per_layer = 4 * hidden * hidden + 3 * hidden * max(inter, hidden * 4) if inter > 0 else 12 * hidden * hidden
+        params = embed + layers * per_layer
+        return int(params)
+    except Exception:
+        return None
+
+
 def estimate_model_bytes_from_config(model_name: str, *, trust_remote_code: bool = False) -> int | None:
-    """Best-effort parameter-byte estimate from HF config (no full weight load)."""
+    """Estimate parameter bytes from HF config.
+
+    Resolution order:
+    1. Explicit config field (``num_parameters`` / ``n_params``).
+    2. Meta-device model construction via ``init_empty_weights``.
+    3. Conservative config heuristic (only for architectures with
+       known MoE/dense layer layout).
+
+    Returns ``None`` when no estimate is possible, allowing the caller
+    to decide conservatively.
+    """
     try:
         from transformers import AutoConfig
 
@@ -142,38 +227,31 @@ def estimate_model_bytes_from_config(model_name: str, *, trust_remote_code: bool
         logger.debug("Could not load config for size estimate (%s): %s", model_name, exc)
         return None
 
-    # Prefer explicit counts when present.
+    # Stage 1 — explicit config field.
     n = getattr(cfg, "num_parameters", None)
     if n is None:
         n = getattr(cfg, "n_params", None)
     if isinstance(n, int) and n > 0:
-        # Assume bf16/fp16 storage (2 bytes) as the common deployment dtype.
+        logger.debug("Size estimate from config field num_parameters=%d", n)
         return int(n) * 2
 
-    # MoE rough estimate for common HF configs (order-of-magnitude).
-    try:
-        hidden = int(getattr(cfg, "hidden_size", 0) or 0)
-        layers = int(getattr(cfg, "num_hidden_layers", 0) or 0)
-        vocab = int(getattr(cfg, "vocab_size", 0) or 0)
-        inter = int(
-            getattr(cfg, "intermediate_size", 0)
-            or getattr(cfg, "moe_intermediate_size", 0)
-            or 0
+    # Stage 2 — meta-device model construction.
+    meta_params = _try_meta_parameter_count(cfg, trust_remote_code=trust_remote_code)
+    if meta_params is not None:
+        logger.debug("Size estimate from meta-device model: %d params", meta_params)
+        return meta_params * 2
+
+    # Stage 3 — conservative heuristic.
+    heuristic = _fallback_config_heuristic(cfg)
+    if heuristic is not None:
+        logger.warning(
+            "Heuristic size estimate: %d params; auto-residency may be "
+            "conservative for unknown architectures.",
+            heuristic,
         )
-        experts = int(
-            getattr(cfg, "num_experts", 0)
-            or getattr(cfg, "num_local_experts", 0)
-            or 1
-        )
-        if hidden <= 0 or layers <= 0:
-            return None
-        # Very rough: embed + layers * (attn ~ 4 h^2 + experts * 3 * h * inter)
-        embed = vocab * hidden
-        per_layer = 4 * hidden * hidden + experts * 3 * hidden * max(inter, hidden * 4)
-        params = embed + layers * per_layer
-        return int(params) * 2
-    except Exception:
-        return None
+        return heuristic * 2
+
+    return None
 
 
 def estimate_model_bytes_from_module(model: torch.nn.Module) -> int:

@@ -246,9 +246,8 @@ def build_prune_args(
         prune_method=prune_method,
         n_experts_to_prune=n_experts_to_prune,
         overwrite_pruned_model=overwrite_pruned_model,
-        # Keep legacy field names on the dataclass.
-        perserve_super_experts=preserve_super_experts,
-        perserve_outliers=preserve_outliers,
+        preserve_super_experts=preserve_super_experts,
+        preserve_outliers=preserve_outliers,
     )
 
 

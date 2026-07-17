@@ -6,9 +6,6 @@ on:
   pull_request:
     branches: [main]
 
-env:
-  PYTHON_VERSION: "3.12"
-
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -17,8 +14,14 @@ jobs:
       - uses: astral-sh/setup-uv@v2
         with:
           version: "latest"
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Install dependencies
-        run: uv pip install --system -e ".[eval]"
+        run: uv pip install --system -e ".[eval]" 
+      - name: Install lint extras
+        run: uv pip install --system ruff
       - name: Ruff check
         run: ruff check src tests
       - name: Compile check
@@ -35,11 +38,17 @@ jobs:
       - uses: astral-sh/setup-uv@v2
         with:
           version: "latest"
+      - name: Install Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
       - name: Install dependencies
         run: uv pip install --system -e ".[eval]"
+      - name: Install test extras
+        run: uv pip install --system ruff pytest coverage[toml]
       - name: Run tests
         run: python -m pytest -q --tb=short
       - name: Coverage report
         run: |
-          python -m coverage run -m pytest -q --tb=short || true
-          python -m coverage report -m --include="src/reap/*" --fail-under=30 || true
+          python -m coverage run -m pytest -q --tb=short
+          python -m coverage report -m --include="src/reap/*" --fail-under=30

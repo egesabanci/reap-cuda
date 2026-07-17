@@ -519,22 +519,21 @@ class PruneArgs:
             )
         },
     )
-    perserve_super_experts: bool = field(
-        default=False,
-        metadata={
-            "help": (
-                "Whether to preserve super experts when pruning. Excludes last 25%% of layers"
-            )
-        }
-    )
-    perserve_outliers: bool = field(
-        default=False,
-        metadata={
-            "help": (
-                "Whether to preserve outlier experts when pruning, includes all layers"
-            )
-        }
-    )
+    preserve_super_experts: bool = field(default=False, metadata={
+        "help": "Whether to preserve super experts when pruning. Excludes last 25%% of layers"
+    })
+    preserve_outliers: bool = field(default=False, metadata={
+        "help": "Whether to preserve outlier experts when pruning, includes all layers"
+    })
+
+    # Legacy aliases for backward compatibility.
+    @property
+    def perserve_super_experts(self) -> bool:
+        return self.preserve_super_experts
+
+    @property
+    def perserve_outliers(self) -> bool:
+        return self.preserve_outliers
 
 
 @dataclass

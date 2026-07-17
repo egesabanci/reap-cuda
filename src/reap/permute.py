@@ -274,12 +274,16 @@ class DirectAlignmentPermuter(ExpertPermuter):
             if expert_idx == dom_expert_idx:
                 continue
             expert = experts[expert_idx]
-            cost_matrix = self._expert_cost_matrix(
-                expert, experts[dom_expert_idx], self.model_attrs
-            )
-            cost_matrix_np = cost_matrix.cpu().to(torch.float16).numpy()
-            row_ind, col_ind = linear_sum_assignment(cost_matrix_np)
-            permutation = torch.tensor(col_ind, dtype=torch.long)
+            with torch.no_grad():
+                cost_matrix = self._expert_cost_matrix(
+                    expert, experts[dom_expert_idx], self.model_attrs
+                )
+                cost_matrix_np = cost_matrix.cpu().to(torch.float16).numpy()
+                row_ind, col_ind = linear_sum_assignment(cost_matrix_np)
+                # Inverse permutation: Hungarian returns col_ind[i] = j meaning
+                # source neuron i best matches dominant neuron j.  Reorder source
+                # so that the source neuron for dominant position j sits at j.
+                permutation = torch.tensor(col_ind, dtype=torch.long).argsort()
             self.apply_permutation_direct_alignment(
                 expert, permutation, self.model_attrs
             )

@@ -20,6 +20,17 @@ def merge_full(
     model: opt.ModelName = "Qwen/Qwen3-30B-A3B",
     dataset: opt.DatasetName = "theblackcat102/evol-codealpaca-v1",
     compression_ratio: opt.CompressionRatio = 0.5,
+    num_clusters: Annotated[
+        int | None,
+        typer.Option(
+            "--num-clusters",
+            help=(
+                "Explicit number of clusters per layer. Overrides "
+                "--compression-ratio when set."
+            ),
+            rich_help_panel="Cluster",
+        ),
+    ] = None,
     expert_sim: Annotated[
         str,
         typer.Option(
@@ -161,6 +172,7 @@ def merge_full(
         ),
         opt.build_cluster_args(
             compression_ratio=compression_ratio,
+            num_clusters=num_clusters,
             expert_sim=expert_sim,
             cluster_method=cluster_method,
             linkage_method=linkage_method,
@@ -182,6 +194,17 @@ def merge_layerwise(
     model: opt.ModelName = "Qwen/Qwen3-30B-A3B",
     dataset: opt.DatasetName = "theblackcat102/evol-codealpaca-v1",
     compression_ratio: opt.CompressionRatio = 0.5,
+    num_clusters: Annotated[
+        int | None,
+        typer.Option(
+            "--num-clusters",
+            help=(
+                "Explicit number of clusters per layer. Overrides "
+                "--compression-ratio when set."
+            ),
+            rich_help_panel="Cluster",
+        ),
+    ] = None,
     expert_sim: Annotated[
         str,
         typer.Option("--expert-sim", rich_help_panel="Cluster"),
@@ -304,6 +327,7 @@ def merge_layerwise(
         opt.build_eval_args(do_eval=do_eval),
         opt.build_cluster_args(
             compression_ratio=compression_ratio,
+            num_clusters=num_clusters,
             expert_sim=expert_sim,
             cluster_method=cluster_method,
             linkage_method=linkage_method,

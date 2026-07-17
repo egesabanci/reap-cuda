@@ -453,6 +453,7 @@ def load_category_batches(
     batches_per_category,
     dataset_path=None,
     shuffle=True,
+    seed=42,
 ):
     """Load + process calibration batches.
 
@@ -516,7 +517,7 @@ def load_category_batches(
     _validate_processor_columns(registry_key, raw_ds, path)
 
     if shuffle and len(raw_ds) > 0:
-        raw_ds = raw_ds.shuffle(seed=42)
+        raw_ds = raw_ds.shuffle(seed=seed)
 
     processor = proc_cls(
         dataset=raw_ds,
@@ -543,6 +544,8 @@ def load_composite_category_batches(
     return_vllm_tokens_prompt: bool,
     truncate: bool,
     global_dataset_path: str | None = None,
+    shuffle: bool = True,
+    seed: int = 42,
 ) -> dict:
     """Load and concatenate batches for a composite dataset spec.
 
@@ -593,6 +596,8 @@ def load_composite_category_batches(
             batches_per_category=component.num_batches,
             batch_size=batch_size,
             dataset_path=path,
+            shuffle=shuffle,
+            seed=seed + comp_idx,
         )
         combined.extend(part["all"])
     return {"all": combined}

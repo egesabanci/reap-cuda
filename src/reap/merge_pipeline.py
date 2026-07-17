@@ -22,6 +22,7 @@ import pickle
 import time
 from typing import Any
 
+import contextlib
 import math
 import numpy as np
 import torch
@@ -216,23 +217,17 @@ def cluster(
             continue
         expert_prob = data[layer]["expert_frequency"] / data[layer]["total_tokens"]
         ttm_sim_matrix = None
-        try:
+        with contextlib.suppress(KeyError):
             ttm_sim_matrix = data[layer]["ttm_similarity_matrix"]
-        except KeyError:
-            pass
         online_characteristic_activation_dist = None
-        try:
+        with contextlib.suppress(KeyError):
             online_characteristic_activation_dist = data[layer][
                 "online_characteristic_activation_dist"
             ]
-        except KeyError:
-            pass
         ca = data[layer]["characteristic_activation"]
         routed_ca = None
-        try:
+        with contextlib.suppress(KeyError):
             routed_ca = data[layer]["routed_characteristic_activation"]
-        except KeyError:
-            pass
         router_logits = data[layer]["router_logit_similiarity"]
 
         expert_similarity_scores = {
@@ -525,7 +520,7 @@ def run_merge(
         model,
         tokenizer,
         merged_model_dir,
-        safe_serialization=True if not merge_args.save_as_tied_params else False,
+        safe_serialization=not merge_args.save_as_tied_params,
     )
 
     cluster_analysis_dir = merged_model_dir / "clusters"
@@ -587,9 +582,9 @@ def run(
         )
         obs_args.record_pruning_metrics_only = False
 
+    tcr = bool(getattr(model_args, "trust_remote_code", False))
     if _residency_resolved is None:
         residency = validate_residency(getattr(reap_args, "residency", "auto"))
-        tcr = getattr(model_args, "trust_remote_code", False)
         model_bytes = estimate_model_bytes_from_config(model_args.model_name, trust_remote_code=tcr)
         resolved, reason = resolve_residency(
             residency,
@@ -629,7 +624,6 @@ def run(
     )
 
     model_name = model_args.model_name
-    tcr = getattr(model_args, "trust_remote_code", False)
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=tcr)
     plan = plan_load("cpu_full" if resolved == "cpu_full" else "gpu_full")
     model = load_causal_lm(model_name, plan, trust_remote_code=tcr)
