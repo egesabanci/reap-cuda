@@ -57,6 +57,17 @@ CompressionRatio = Annotated[
         rich_help_panel="Compression",
     ),
 ]
+TrustRemoteCode = Annotated[
+    bool,
+    typer.Option(
+        "--trust-remote-code/--no-trust-remote-code",
+        help=(
+            "Allow execution of custom code from the HuggingFace hub. "
+            "WARNING: only enable for repositories you trust."
+        ),
+        rich_help_panel="Model",
+    ),
+]
 ObserveBackend = Annotated[
     str,
     typer.Option(
@@ -137,7 +148,6 @@ ArtifactsDir = Annotated[
 def build_reap_args(
     *,
     seed: int = 42,
-    debug: bool = False,
     profile: bool = True,
     run_observer_only: bool = False,
     do_eval: bool = False,
@@ -147,7 +157,6 @@ def build_reap_args(
 ) -> ReapArgs:
     return ReapArgs(
         seed=seed,
-        debug=debug,
         profile=profile,
         run_observer_only=run_observer_only,
         do_eval=do_eval,
@@ -160,10 +169,12 @@ def build_reap_args(
 def build_model_args(
     *,
     model_name: str = "Qwen/Qwen3-30B-A3B",
+    trust_remote_code: bool = False,
     num_experts_per_tok_override: int | None = None,
 ) -> ModelArgs:
     return ModelArgs(
         model_name=model_name,
+        trust_remote_code=trust_remote_code,
         num_experts_per_tok_override=num_experts_per_tok_override,
     )
 

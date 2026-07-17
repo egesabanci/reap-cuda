@@ -22,6 +22,7 @@ import pickle
 import time
 from typing import Any
 
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -49,6 +50,52 @@ from reap.cluster import (
     restricted_hierarchical_clustering,
     kmeans_clustering,
 )
+
+
+def _resolve_num_clusters(
+    explicit: int | None,
+    compression_ratio: float | None,
+    experts_per_layer: int,
+) -> int:
+    """Resolve the number of clusters per layer.
+
+    Uses explicit ``num_clusters`` when provided; otherwise derives from
+    ``compression_ratio``.  Rejects invalid or contradictory inputs before
+    any model/clustering work runs.
+    """
+    if explicit is not None:
+        if explicit < 1 or explicit > experts_per_layer:
+            raise ValueError(
+                f"--num-clusters must be >= 1 and <= experts_per_layer "
+                f"({experts_per_layer}); got {explicit}."
+            )
+        if compression_ratio is not None and compression_ratio != 0.5:
+            logger.info(
+                "--num-clusters=%d overrides --compression-ratio=%s",
+                explicit,
+                compression_ratio,
+            )
+        return explicit
+
+    if compression_ratio is None:
+        raise ValueError(
+            "Either --num-clusters or --compression-ratio must be set."
+        )
+
+    if not math.isfinite(compression_ratio):
+        raise ValueError(f"compression_ratio must be finite; got {compression_ratio}")
+    if compression_ratio < 0.0 or compression_ratio >= 1.0:
+        raise ValueError(
+            f"compression_ratio must be in [0, 1); got {compression_ratio}"
+        )
+
+    num_clusters = int(experts_per_layer * (1.0 - compression_ratio))
+    if num_clusters < 1:
+        raise ValueError(
+            f"compression_ratio {compression_ratio} yields 0 clusters "
+            f"(experts_per_layer={experts_per_layer})."
+        )
+    return num_clusters
 from reap.pipeline import record_activations, dump_args_to_yaml, create_results_directory
 from reap.merge import MergeMethod, MoEExpertMerger
 from reap.metrics import get_distance_fn
@@ -262,8 +309,9 @@ def cluster(
         elif cluster_args.cluster_method == "kmeans":
             cluster_label = kmeans_clustering(distance, num_clusters)
         else:
-            raise NotImplementedError(
-                f"Clustering method '{cluster_args.cluster_method}' is not implemented."
+            raise ValueError(
+                f"Unknown clustering method '{cluster_args.cluster_method}'. "
+                f"Supported: agglomerative, kmeans, mc_smoe."
             )
         cluster_labels[layer] = cluster_label
 
@@ -442,18 +490,12 @@ def run_merge(
             "skip_first/skip_last exclude all layers; nothing to merge."
         )
 
-    # Each merged layer is compressed by the configured ratio; skipped layers
-    # keep all experts (identity clusters), handled in cluster(). Using the
-    # per-layer formula (rather than redistributing a global cluster budget
-    # across merged layers) guarantees num_clusters <= experts_per_layer, so
-    # the underlying agglomerative clustering never receives an impossible
-    # cluster count (n_clusters > n_samples).
-    num_clusters = int(experts_per_layer * (1 - cluster_args.compression_ratio))
-    if num_clusters < 1:
-        raise ValueError(
-            f"compression_ratio {cluster_args.compression_ratio} yields 0 "
-            f"clusters (experts_per_layer={experts_per_layer})."
-        )
+    # Resolve num_clusters from explicit argument or compression ratio.
+    num_clusters = _resolve_num_clusters(
+        cluster_args.num_clusters,
+        cluster_args.compression_ratio,
+        experts_per_layer,
+    )
 
     logger.info(
         f"Calculated num_clusters: {num_clusters} (compression_ratio "
@@ -547,7 +589,8 @@ def run(
 
     if _residency_resolved is None:
         residency = validate_residency(getattr(reap_args, "residency", "auto"))
-        model_bytes = estimate_model_bytes_from_config(model_args.model_name)
+        tcr = getattr(model_args, "trust_remote_code", False)
+        model_bytes = estimate_model_bytes_from_config(model_args.model_name, trust_remote_code=tcr)
         resolved, reason = resolve_residency(
             residency,
             model_bytes=model_bytes,
@@ -557,7 +600,7 @@ def run(
         preflight_or_warn(resolved, model_bytes)
     else:
         resolved = validate_residency(_residency_resolved)
-        model_bytes = estimate_model_bytes_from_config(model_args.model_name)
+        model_bytes = estimate_model_bytes_from_config(model_args.model_name, trust_remote_code=tcr)
         logger.info("Residency (pre-resolved): %s", resolved)
         preflight_or_warn(resolved, model_bytes)
 
@@ -586,9 +629,10 @@ def run(
     )
 
     model_name = model_args.model_name
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tcr = getattr(model_args, "trust_remote_code", False)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=tcr)
     plan = plan_load("cpu_full" if resolved == "cpu_full" else "gpu_full")
-    model = load_causal_lm(model_name, plan)
+    model = load_causal_lm(model_name, plan, trust_remote_code=tcr)
 
     logger.info(
         f"Running observer to collect activation+merging data for "

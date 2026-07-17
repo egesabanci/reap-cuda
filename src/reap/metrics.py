@@ -298,3 +298,21 @@ class OnlineStatsTracker:
         self.mean = t
         # End Kahan Summation
         self.count = updated_count
+
+    def merge(self, other: "OnlineStatsTracker") -> None:
+        """Merge another tracker's state into this one in-place.
+
+        Uses the pairwise Welford formula to combine two independent
+        online estimates with Kahan-compensated update.  After the call,
+        *self* represents the combined population.
+        """
+        if other.count.sum() == 0:
+            return
+        if self.count.sum() == 0:
+            self.count = other.count.clone().to(self.device)
+            self.mean = other.mean.clone().to(self.device, dtype=self.dtype)
+            self.mean_compensation = other.mean_compensation.clone().to(
+                self.device, dtype=self.dtype
+            )
+            return
+        self.update(other.mean, other.count)

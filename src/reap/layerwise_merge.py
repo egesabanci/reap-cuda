@@ -252,7 +252,8 @@ def run(
 
     if _residency_resolved is None:
         residency = validate_residency(getattr(reap_args, "residency", "auto"))
-        model_bytes = estimate_model_bytes_from_config(model_args.model_name)
+        tcr = getattr(model_args, "trust_remote_code", False)
+        model_bytes = estimate_model_bytes_from_config(model_args.model_name, trust_remote_code=tcr)
         resolved, reason = resolve_residency(
             residency,
             model_bytes=model_bytes,
@@ -262,7 +263,7 @@ def run(
         preflight_or_warn(resolved, model_bytes)
     else:
         resolved = validate_residency(_residency_resolved)
-        model_bytes = estimate_model_bytes_from_config(model_args.model_name)
+        model_bytes = estimate_model_bytes_from_config(model_args.model_name, trust_remote_code=tcr)
         logger.info("Residency (pre-resolved): %s", resolved)
         preflight_or_warn(resolved, model_bytes)
 
@@ -292,9 +293,10 @@ def run(
     )
 
     model_name = model_args.model_name
+    tcr = getattr(model_args, "trust_remote_code", False)
 
     logger.info(f"Loading tokenizer for {model_name}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=tcr)
 
     # Prefer auto+disk offload over pinning the entire model in host RAM.
     offload_root = results_dir / ".offload"
@@ -304,7 +306,7 @@ def run(
         low_cpu_mem_usage=layerwise_args.low_cpu_mem_usage,
     )
     logger.info("Loading model for layerwise merge (%s)...", plan.reason)
-    model = load_causal_lm(model_name, plan)
+    model = load_causal_lm(model_name, plan, trust_remote_code=tcr)
     logger.info(f"Model loaded: {model.__class__.__name__}")
     num_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Total parameters: {num_params / 1e9:.2f}B")

@@ -121,20 +121,61 @@ def prune(
         saliency = _resolve_saliency(
             observer_data[layer], prune_args.prune_method, model_device=model_device
         )
-        # Mask protected experts so they are never among the lowest-k.
-        if layer in protected:
-            saliency = saliency.clone()
-            for e in protected[layer]:
-                if 0 <= e < num_experts:
-                    saliency[e] = torch.finfo(saliency.dtype).max
 
-        n_prune = min(n_experts_to_prune, num_experts - 1)
+        # Build unprotected candidate set instead of manipulating saliency.
+        # Protected experts are excluded from the candidate pool so they
+        # are *guaranteed* retained regardless of the requested count.
+        if layer in protected:
+            protected_set = {
+                e for e in protected[layer] if 0 <= e < num_experts
+            }
+            unprotected = [
+                i for i in range(num_experts) if i not in protected_set
+            ]
+        else:
+            protected_set = set()
+            unprotected = list(range(num_experts))
+
+        # Never prune more than the unprotected population, and always
+        # leave at least one expert in the layer.
+        max_possible = len(unprotected)
+        max_possible = min(max_possible, num_experts - 1)
+        if n_experts_to_prune > max_possible and max_possible > 0:
+            logger.warning(
+                "Layer %d: requested %d pruned but only %d unprotected "
+                "experts available; capping to %d.",
+                layer,
+                n_experts_to_prune,
+                len(unprotected),
+                max_possible,
+            )
+        n_prune = min(n_experts_to_prune, max_possible)
         if n_prune < 1:
             retained_expert_indicies = list(range(num_experts))
             continue
 
-        _, experts_to_prune = torch.topk(saliency, n_prune, largest=False)
-        prune_set = set(experts_to_prune.tolist())
+        # Select lowest-k *from unprotected candidates only*.
+        if unprotected:
+            unprotected_saliency = saliency[unprotected]
+            _, unprotected_prune_rel = torch.topk(
+                unprotected_saliency, n_prune, largest=False
+            )
+            prune_set = {unprotected[i] for i in unprotected_prune_rel.tolist()}
+        else:
+            prune_set = set()
+
+        if protected_set:
+            actually_pruned = prune_set & protected_set
+            if actually_pruned:
+                logger.warning(
+                    "Layer %d: %d protected experts were selected for pruning — "
+                    "this indicates a bug in the protection logic; skipping prune",
+                    layer,
+                    len(actually_pruned),
+                )
+                retained_expert_indicies = list(range(num_experts))
+                continue
+
         retained_expert_indicies = [
             i for i in range(num_experts) if i not in prune_set
         ]
@@ -205,7 +246,8 @@ def run(
     """
     if _residency_resolved is None:
         residency = validate_residency(getattr(reap_args, "residency", "auto"))
-        model_bytes = estimate_model_bytes_from_config(model_args.model_name)
+        tcr = getattr(model_args, "trust_remote_code", False)
+        model_bytes = estimate_model_bytes_from_config(model_args.model_name, trust_remote_code=tcr)
         resolved, reason = resolve_residency(
             residency,
             model_bytes=model_bytes,
@@ -215,7 +257,7 @@ def run(
         preflight_or_warn(resolved, model_bytes)
     else:
         resolved = validate_residency(_residency_resolved)
-        model_bytes = estimate_model_bytes_from_config(model_args.model_name)
+        model_bytes = estimate_model_bytes_from_config(model_args.model_name, trust_remote_code=tcr)
         logger.info("Residency (pre-resolved): %s", resolved)
         preflight_or_warn(resolved, model_bytes)
 
@@ -244,10 +286,11 @@ def run(
     )
 
     model_name = model_args.model_name
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tcr = getattr(model_args, "trust_remote_code", False)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=tcr)
     plan = plan_load("cpu_full" if resolved == "cpu_full" else "gpu_full")
 
-    model = load_causal_lm(model_name, plan)
+    model = load_causal_lm(model_name, plan, trust_remote_code=tcr)
     try:
         live_bytes = estimate_model_bytes_from_module(model)
         logger.info("Loaded model weight footprint ~%.2f GiB", live_bytes / 1024**3)
@@ -320,10 +363,7 @@ def run(
 
         if reap_args.smoke_test:
             logger.info("Running smoke test on the pruned model...")
-            try:
-                smoke_test(model, tokenizer)
-            except Exception as e:
-                logger.error(f"Smoke test failed: {e}")
+            smoke_test(model, tokenizer)
 
         tokenizer.save_pretrained(pruned_model_dir)
         logger.info("Pruning completed.")

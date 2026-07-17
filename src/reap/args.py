@@ -4,9 +4,6 @@ from dataclasses import dataclass, field
 @dataclass
 class ReapArgs:
     seed: int = field(default=42, metadata={"help": "Random seed for reproducibility."})
-    debug: bool = field(
-        default=False, metadata={"help": "Enable debug mode for more verbose output."}
-    )
     profile: bool = field(
         default=True, metadata={"help": "Enable profiling prior to run to avoid OOM."}
     )
@@ -59,6 +56,15 @@ class ModelArgs:
             "help": "Name of the model to use.",
         },
     )
+    trust_remote_code: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Allow execution of custom model code from the hub. "
+                "WARNING: only enable for trusted repositories."
+            )
+        },
+    )
     num_experts_per_tok_override: int | None = field(
         default=None,
         metadata={
@@ -105,8 +111,6 @@ class DatasetArgs:
     shuffle: bool = field(
         default=True, metadata={"help": "Whether to shuffle the dataset."}
     )
-    # for SFT only
-    dataset_test_split: str = field(default="test", metadata={"help": "Dataset split to use for evaluation."})
 
 
 @dataclass
@@ -216,8 +220,8 @@ class ClusterArgs:
         default=0.5,
         metadata={
             "help": (
-                "Compression ratio for clustering experts. If None, num_clusters must "
-                "be set."
+                "Fraction of experts to merge away (0.0 = keep all, 0.5 = keep half). "
+                "Ignored when --num-clusters is set. Must be in [0, 1)."
             )
         },
     )
@@ -225,8 +229,9 @@ class ClusterArgs:
         default=None,
         metadata={
             "help": (
-                "Number of clusters to place experts into per layer. If None, "
-                "num_clusters is calculated as int(num_experts * compression_ratio)."
+                "Number of clusters (surviving experts) per merged layer. "
+                "When set, overrides --compression-ratio. "
+                "Must be >= 1 and <= experts_per_layer."
             )
         },
     )
@@ -234,7 +239,7 @@ class ClusterArgs:
         default="agglomerative",
         metadata={
             "help": "Clustering method to use.",
-            "choices": ["agglomerative", "kmeans", "spectral", "mc_smoe"],
+            "choices": ["agglomerative", "kmeans", "mc_smoe"],
         },
     )
     linkage_method: str = field(

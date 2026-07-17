@@ -54,14 +54,15 @@ def run_evaluate(model_args, results_dir, eval_args, seed):
 
     torch.manual_seed(seed)
     logger.info("Loading model for evaluation: %s", model_args.model_name)
+    tcr = getattr(model_args, "trust_remote_code", False)
     model = AutoModelForCausalLM.from_pretrained(
         model_args.model_name,
         torch_dtype="auto",
-        trust_remote_code=True,
+        trust_remote_code=tcr,
         device_map="auto",
     )
     tokenizer = AutoTokenizer.from_pretrained(
-        model_args.model_name, trust_remote_code=True
+        model_args.model_name, trust_remote_code=tcr
     )
 
     hf_lm = HFLM(pretrained=model, tokenizer=tokenizer, batch_size=1)

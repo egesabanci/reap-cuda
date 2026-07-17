@@ -266,7 +266,8 @@ def run(
 
     if _residency_resolved is None:
         residency = validate_residency(getattr(reap_args, "residency", "auto"))
-        model_bytes = estimate_model_bytes_from_config(model_args.model_name)
+        tcr = getattr(model_args, "trust_remote_code", False)
+        model_bytes = estimate_model_bytes_from_config(model_args.model_name, trust_remote_code=tcr)
         resolved, reason = resolve_residency(
             residency,
             model_bytes=model_bytes,
@@ -276,7 +277,7 @@ def run(
         preflight_or_warn(resolved, model_bytes)
     else:
         resolved = validate_residency(_residency_resolved)
-        model_bytes = estimate_model_bytes_from_config(model_args.model_name)
+        model_bytes = estimate_model_bytes_from_config(model_args.model_name, trust_remote_code=tcr)
         logger.info("Residency (pre-resolved): %s", resolved)
         preflight_or_warn(resolved, model_bytes)
 
@@ -306,9 +307,9 @@ def run(
     )
 
     model_name = model_args.model_name
-
+    tcr = getattr(model_args, "trust_remote_code", False)
     logger.info(f"Loading tokenizer for {model_name}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=tcr)
     model = None
 
     cached_data_path = _get_observer_output_path(
@@ -339,7 +340,7 @@ def run(
         logger.info(
             "Loading model for layerwise processing (%s)...", plan.reason
         )
-        model = load_causal_lm(model_name, plan)
+        model = load_causal_lm(model_name, plan, trust_remote_code=tcr)
         logger.info(f"Model loaded: {model.__class__.__name__}")
         num_params = sum(p.numel() for p in model.parameters())
         logger.info(f"Total parameters: {num_params / 1e9:.2f}B")
@@ -404,22 +405,19 @@ def run(
             f"Pruned model already exists at {pruned_model_dir}. Skipping pruning."
         )
     else:
-        # Reload for mutate/save with GPU-first residency (never pin full model
-        # on CPU when host RAM is the bottleneck).
-        logger.info("Reloading model for pruning (gpu_full plan)...")
-        if model is not None:
-            del model
-        cleanup_memory()
-
-        from reap.residency import load_causal_lm, plan_load
-
-        plan = plan_load("gpu_full")
-        try:
-            model = load_causal_lm(
-                model_name, plan, local_files_only=True
+        logger.info("Pruning model with layerwise-resident weights...")
+        # Use the already-loaded offloaded model for pruning instead of
+        # reloading with gpu_full — this keeps VRAM low.  The prune
+        # function mutates MoE layers in-place and stream_save_pretrained
+        # writes device tensors shard-wise, so no full-GPU materialization
+        # is needed.
+        if model is None:
+            plan = plan_load(
+                "layerwise",
+                offload_root=results_dir / ".offload",
+                low_cpu_mem_usage=layerwise_args.low_cpu_mem_usage,
             )
-        except Exception:
-            model = load_causal_lm(model_name, plan, local_files_only=False)
+            model = load_causal_lm(model_name, plan, trust_remote_code=tcr)
 
         logger.info(f"Pruning model to {total_experts - n_experts_to_prune} experts...")
         prune_model(

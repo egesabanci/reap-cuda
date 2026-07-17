@@ -452,6 +452,7 @@ def load_category_batches(
     truncate,
     batches_per_category,
     dataset_path=None,
+    shuffle=True,
 ):
     """Load + process calibration batches.
 
@@ -513,6 +514,9 @@ def load_category_batches(
         )
 
     _validate_processor_columns(registry_key, raw_ds, path)
+
+    if shuffle and len(raw_ds) > 0:
+        raw_ds = raw_ds.shuffle(seed=42)
 
     processor = proc_cls(
         dataset=raw_ds,

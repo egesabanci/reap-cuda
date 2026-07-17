@@ -132,12 +132,12 @@ def snapshot_memory() -> MemorySnapshot:
     )
 
 
-def estimate_model_bytes_from_config(model_name: str) -> int | None:
+def estimate_model_bytes_from_config(model_name: str, *, trust_remote_code: bool = False) -> int | None:
     """Best-effort parameter-byte estimate from HF config (no full weight load)."""
     try:
         from transformers import AutoConfig
 
-        cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=trust_remote_code)
     except Exception as exc:
         logger.debug("Could not load config for size estimate (%s): %s", model_name, exc)
         return None
@@ -345,7 +345,7 @@ def load_causal_lm(
     plan: LoadPlan,
     *,
     torch_dtype: str | torch.dtype = "auto",
-    trust_remote_code: bool = True,
+    trust_remote_code: bool = False,
     local_files_only: bool = False,
 ) -> Any:
     """``from_pretrained`` honoring a :class:`LoadPlan`."""

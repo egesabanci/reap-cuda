@@ -48,6 +48,7 @@ def prune_full(
     residency: opt.Residency = "auto",
     dataset_path: opt.DatasetPath = None,
     artifacts_dir: opt.ArtifactsDir = None,
+    trust_remote_code: opt.TrustRemoteCode = False,
     observe_only: Annotated[
         bool,
         typer.Option(
@@ -166,7 +167,7 @@ def prune_full(
             observe_backend=observe_backend,
             frea_backend=frea_backend,
         ),
-        opt.build_model_args(model_name=model),
+        opt.build_model_args(model_name=model, trust_remote_code=trust_remote_code),
         opt.build_eval_args(do_eval=do_eval),
         opt.build_prune_args(
             prune_method=prune_method,
@@ -233,6 +234,7 @@ def prune_layerwise(
     residency: opt.Residency = "auto",
     dataset_path: opt.DatasetPath = None,
     artifacts_dir: opt.ArtifactsDir = None,
+    trust_remote_code: opt.TrustRemoteCode = False,
     observe_only: Annotated[
         bool,
         typer.Option(
@@ -326,7 +328,7 @@ def prune_layerwise(
             observe_backend=observe_backend,
             frea_backend=frea_backend,
         ),
-        opt.build_model_args(model_name=model),
+        opt.build_model_args(model_name=model, trust_remote_code=trust_remote_code),
         opt.build_eval_args(do_eval=do_eval),
         opt.build_prune_args(
             prune_method=prune_method,

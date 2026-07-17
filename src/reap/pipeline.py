@@ -256,6 +256,13 @@ def record_activations(
         _profile_model(model, tokenizer, model_args, obs_args, observer)
 
     # run samples over model and save observer state
+    # Process all categories into a single accumulated observer state.
+    # Per-category artifacts are saved individually; an aggregate is written
+    # to results_dir / "all" at the end.
+    all_dir = results_dir / "all"
+    all_dir.mkdir(parents=True, exist_ok=True)
+    aggregate_path = all_dir / obs_args.output_file_name
+
     with torch.no_grad():
         for category, cat_data in category_data_batches.items():
             logger.info(f"Processing category: {category}...")
@@ -283,21 +290,16 @@ def record_activations(
                     f"Saving partial results for category '{category}' and exiting"
                 )
                 observer.save_state(cat_dir / "partial.pkl")
-                logger.info(
-                    f"{category} data processed and saved to "
-                    f"{cat_dir / obs_args.output_file_name}"
-                )
                 raise e
-            observer.save_state(cat_dir / obs_args.output_file_name)
-            observer.reset()
-            logger.info(
-                f"{category} data processed and saved to "
-                f"{cat_dir / obs_args.output_file_name}"
-            )
+            # Save per-category snapshot (debug / partial resume).
+            observer.save_state(f_name)
+            logger.info(f"Category '{category}' data saved to {f_name}")
+
+    # Write aggregate (all categories combined in one observer).
+    observer.save_state(aggregate_path)
     observer.close_hooks()
     log_triton_usage_summary()
-    with open(f"{cat_dir / obs_args.output_file_name}", "rb") as f:
-        observer_data = torch.load(f, weights_only=False)
+    observer_data = observer.report_state()
     return observer_data
 
 

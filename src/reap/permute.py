@@ -91,7 +91,6 @@ class ExpertPermuter(ABC):
         """
         pass
 
-    @abstractmethod
     def _fused_permute(
         self,
         experts: nn.Module,
@@ -99,10 +98,14 @@ class ExpertPermuter(ABC):
         dom_expert_idx: int,
     ):
         """
-        Abstract method to permute experts in a fused model.
-        Must be implemented by subclasses.
+        Permute experts in a fused model.
+
+        Default raises NotImplementedError; subclasses supporting fused
+        layouts must override this.
         """
-        pass
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support fused expert permute."
+        )
 
     def _run_assertions(
         self, permuted_expert, orig_expert, cost_matrix_np, row_ind, col_ind
@@ -264,19 +267,22 @@ class DirectAlignmentPermuter(ExpertPermuter):
     def _permute(
         self,
         experts: list[nn.Module],
+        expert_indices: list[int],
         dom_expert_idx: int,
     ):
-        for expert in experts:
-            if expert is not experts[dom_expert_idx]:
-                cost_matrix = self._expert_cost_matrix(
-                    expert, experts[dom_expert_idx], self.model_attrs
-                )
-                cost_matrix_np = cost_matrix.cpu().to(torch.float16).numpy()
-                row_ind, col_ind = linear_sum_assignment(cost_matrix_np)
-                permutation = torch.tensor(col_ind, dtype=torch.long)
-                self.apply_permutation_direct_alignment(
-                    expert, permutation, self.model_attrs
-                )
+        for expert_idx in expert_indices:
+            if expert_idx == dom_expert_idx:
+                continue
+            expert = experts[expert_idx]
+            cost_matrix = self._expert_cost_matrix(
+                expert, experts[dom_expert_idx], self.model_attrs
+            )
+            cost_matrix_np = cost_matrix.cpu().to(torch.float16).numpy()
+            row_ind, col_ind = linear_sum_assignment(cost_matrix_np)
+            permutation = torch.tensor(col_ind, dtype=torch.long)
+            self.apply_permutation_direct_alignment(
+                expert, permutation, self.model_attrs
+            )
 
     def _l2_dist(self, a, dom):
         return torch.cdist(a, dom, p=2) ** 2

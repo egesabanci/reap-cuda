@@ -36,7 +36,7 @@ def merge_full(
         str,
         typer.Option(
             "--cluster-method",
-            help="agglomerative | kmeans | spectral | mc_smoe",
+            help="agglomerative | kmeans | mc_smoe",
             rich_help_panel="Cluster",
         ),
     ] = "agglomerative",
@@ -76,6 +76,7 @@ def merge_full(
     residency: opt.Residency = "auto",
     dataset_path: opt.DatasetPath = None,
     artifacts_dir: opt.ArtifactsDir = None,
+    trust_remote_code: opt.TrustRemoteCode = False,
     skip_first: Annotated[
         bool,
         typer.Option("--skip-first/--no-skip-first", rich_help_panel="Merge"),
@@ -141,7 +142,7 @@ def merge_full(
             residency=residency,
             artifacts_dir=artifacts_dir,
         ),
-        opt.build_model_args(model_name=model),
+        opt.build_model_args(model_name=model, trust_remote_code=trust_remote_code),
         opt.build_dataset_args(
             dataset_name=dataset,
             dataset_config_name=dataset_config,
@@ -225,6 +226,7 @@ def merge_layerwise(
     residency: opt.Residency = "auto",
     dataset_path: opt.DatasetPath = None,
     artifacts_dir: opt.ArtifactsDir = None,
+    trust_remote_code: opt.TrustRemoteCode = False,
     skip_first: Annotated[
         bool,
         typer.Option("--skip-first/--no-skip-first", rich_help_panel="Merge"),
@@ -298,7 +300,7 @@ def merge_layerwise(
             observe_backend=observe_backend,
             frea_backend=frea_backend,
         ),
-        opt.build_model_args(model_name=model),
+        opt.build_model_args(model_name=model, trust_remote_code=trust_remote_code),
         opt.build_eval_args(do_eval=do_eval),
         opt.build_cluster_args(
             compression_ratio=compression_ratio,

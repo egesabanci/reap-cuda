@@ -34,4 +34,14 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 [tool.ruff]
 line-length = 88
+
+[tool.ruff.lint]
 select = ["SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["SIM105"]
+"src/reap/permute.py" = ["SIM108"]
+"src/reap/merge.py" = ["SIM108"]
+"src/reap/layerwise_observer.py" = ["SIM108"]
+"src/reap/kernels/observe.py" = ["SIM108"]
+"src/reap/kernels/triton_utils.py" = ["SIM108"]
