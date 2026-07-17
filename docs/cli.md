@@ -58,6 +58,8 @@ reap prune full \
 | Option | Default | Panel |
 | --- | --- | --- |
 | `--model` / `-m` | `Qwen/Qwen3-30B-A3B` | Model |
+| `--model-revision` / `--local-files-only` | unset / off | Model |
+| `--trust-remote-code` | off | Model |
 | `--dataset` / `-d` | evol-codealpaca | Data |
 | `--dataset-config` | unset | Data |
 | `--split` | `train` | Data |
@@ -76,10 +78,14 @@ reap prune full \
 | `--renorm-router` / `--no-renorm-router` | renorm on | Observer |
 | `--overwrite-observations` / `--keep-observations` | keep | Observer |
 | `--dataset-path` | unset | Data |
+| `--shuffle` / `--no-shuffle` | shuffle on | Data |
+| `--trust-observation-artifact` | off | Security |
 | `--artifacts-dir` | `./artifacts` or env | Run |
 | `--observe-only` | off | Run |
 | `--smoke-test` / `--no-smoke-test` | smoke on | Run |
 | `--eval` / `--no-eval` | no eval | Run |
+| `--eval-tasks`, `--eval-backend`, `--eval-num-fewshot` | default tasks / `hf` / `0` | Evaluation |
+| `--eval-batch-size`, `--eval-limit`, `--eval-baseline`, `--eval-data-path` | `1` / unset / off / unset | Evaluation |
 | `--profile` / `--no-profile` | profile on | Run |
 | `--seed` | `42` | Run |
 | `--residency` | `auto` | Residency |
@@ -135,7 +141,7 @@ disk offload). Orthogonal to full vs layerwise observe schedule.
 | --- | --- |
 | `auto` | Pick from host/GPU memory + model-size estimate |
 | `gpu_full` | `device_map="auto"`; stream-save; no full CPU pin |
-| `layerwise` | Block observe; auto + disk offload; mutate/save via `gpu_full` plan |
+| `layerwise` | Block observe; auto + disk offload; mutate/save reuses the offloaded model (no `gpu_full` reload) |
 | `cpu_full` | Pin full model on CPU (needs ample host RAM) |
 
 ```bash

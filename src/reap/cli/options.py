@@ -68,6 +68,74 @@ TrustRemoteCode = Annotated[
         rich_help_panel="Model",
     ),
 ]
+ModelRevision = Annotated[
+    Optional[str],
+    typer.Option(
+        "--model-revision",
+        help="Immutable Hugging Face revision to load and record in artifacts.",
+        rich_help_panel="Model",
+    ),
+]
+LocalFilesOnly = Annotated[
+    bool,
+    typer.Option(
+        "--local-files-only/--allow-hub-downloads",
+        help="Forbid Hugging Face Hub access for model/config/tokenizer loading.",
+        rich_help_panel="Model",
+    ),
+]
+TrustObservationArtifact = Annotated[
+    bool,
+    typer.Option(
+        "--trust-observation-artifact/--no-trust-observation-artifact",
+        help="Allow legacy observation artifacts without compatible manifests.",
+        rich_help_panel="Security",
+    ),
+]
+Shuffle = Annotated[
+    bool,
+    typer.Option(
+        "--shuffle/--no-shuffle",
+        help="Deterministically shuffle calibration data using --seed.",
+        rich_help_panel="Data",
+    ),
+]
+EvalTasks = Annotated[
+    Optional[str],
+    typer.Option(
+        "--eval-tasks",
+        help="Comma-separated lm-eval task names.",
+        rich_help_panel="Evaluation",
+    ),
+]
+EvalBackend = Annotated[
+    str,
+    typer.Option(
+        "--eval-backend",
+        help="lm-eval backend: hf or vllm.",
+        rich_help_panel="Evaluation",
+    ),
+]
+EvalNumFewshot = Annotated[
+    int,
+    typer.Option("--eval-num-fewshot", help="Few-shot examples per task.", rich_help_panel="Evaluation"),
+]
+EvalBatchSize = Annotated[
+    int,
+    typer.Option("--eval-batch-size", help="lm-eval batch size.", rich_help_panel="Evaluation"),
+]
+EvalLimit = Annotated[
+    Optional[int],
+    typer.Option("--eval-limit", help="Optional examples per task limit.", rich_help_panel="Evaluation"),
+]
+EvalBaseline = Annotated[
+    bool,
+    typer.Option("--eval-baseline/--no-eval-baseline", help="Evaluate original model and write deltas.", rich_help_panel="Evaluation"),
+]
+EvalDataPath = Annotated[
+    Optional[str],
+    typer.Option("--eval-data-path", help="Local HF cache root for offline task data.", rich_help_panel="Evaluation"),
+]
 ObserveBackend = Annotated[
     str,
     typer.Option(
@@ -170,12 +238,14 @@ def build_model_args(
     *,
     model_name: str = "Qwen/Qwen3-30B-A3B",
     trust_remote_code: bool = False,
-    num_experts_per_tok_override: int | None = None,
+    model_revision: str | None = None,
+    local_files_only: bool = False,
 ) -> ModelArgs:
     return ModelArgs(
         model_name=model_name,
         trust_remote_code=trust_remote_code,
-        num_experts_per_tok_override=num_experts_per_tok_override,
+        model_revision=model_revision,
+        local_files_only=local_files_only,
     )
 
 
@@ -204,6 +274,7 @@ def build_observer_args(
     model_max_length: int | None = 2048,
     truncate: bool = False,
     overwrite_observations: bool = False,
+    trust_observation_artifact: bool = False,
     distance_measure: str = "angular",
     output_file_name: str = "observations_1024_cosine.pt",
     record_pruning_metrics_only: bool = True,
@@ -225,6 +296,7 @@ def build_observer_args(
         model_max_length=model_max_length,
         truncate=truncate,
         overwrite_observations=overwrite_observations,
+        trust_observation_artifact=trust_observation_artifact,
         distance_measure=distance_measure,
         output_file_name=output_file_name,
         record_pruning_metrics_only=record_pruning_metrics_only,
@@ -328,20 +400,39 @@ def build_eval_args(
     top_p: float = 0.8,
     top_k: int = 20,
     run_lm_eval: bool = True,
-    lm_eval_tasks: list[str] | None = None,
+    lm_eval_tasks: list[str] | str | None = None,
+    eval_backend: str = "hf",
+    eval_num_fewshot: int = 0,
+    eval_batch_size: int = 1,
+    eval_limit: int | None = None,
+    eval_baseline: bool = False,
+    eval_data_path: str | None = None,
 ) -> EvalArgs:
+    if eval_backend not in {"hf", "vllm"}:
+        raise typer.BadParameter("--eval-backend must be 'hf' or 'vllm'.")
+    if eval_num_fewshot < 0:
+        raise typer.BadParameter("--eval-num-fewshot must be non-negative.")
+    if eval_batch_size < 1:
+        raise typer.BadParameter("--eval-batch-size must be at least 1.")
+    if eval_limit is not None and eval_limit < 1:
+        raise typer.BadParameter("--eval-limit must be at least 1 when set.")
     args = EvalArgs(
         greedy=greedy,
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
         run_lm_eval=run_lm_eval and do_eval,
-        # Disable unimplemented backends by default in the Typer CLI.
-        run_evalplus=False,
-        run_livecodebench=False,
-        run_wildbench=False,
-        run_math=False,
+        eval_backend=eval_backend,
+        eval_num_fewshot=eval_num_fewshot,
+        eval_batch_size=eval_batch_size,
+        eval_limit=eval_limit,
+        eval_baseline=eval_baseline and do_eval,
+        eval_data_path=eval_data_path,
     )
+    if isinstance(lm_eval_tasks, str):
+        lm_eval_tasks = [task.strip() for task in lm_eval_tasks.split(",") if task.strip()]
     if lm_eval_tasks is not None:
+        if not lm_eval_tasks:
+            raise typer.BadParameter("--eval-tasks must contain at least one task.")
         args.lm_eval_tasks = lm_eval_tasks
     return args

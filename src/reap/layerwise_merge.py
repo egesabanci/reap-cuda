@@ -52,8 +52,14 @@ from reap.data import (
 from reap.model_adapters import infer_model_adapter
 from reap.observer import MoETransformerObserverConfig
 from reap.layerwise_observer import LayerwiseMoEObserver
-from reap.merge_pipeline import run_merge
-from reap.pipeline import dump_args_to_yaml, create_results_directory
+from reap.merge_pipeline import run_merge, validate_cluster_args_static
+from reap.pipeline import (
+    _compute_artifact_metadata,
+    create_results_directory,
+    dump_args_to_yaml,
+    load_observer_artifact,
+    write_observer_metadata,
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -235,6 +241,7 @@ def run(
     from reap.residency import (
         estimate_model_bytes_from_config,
         load_causal_lm,
+        log_model_residency,
         plan_load,
         preflight_or_warn,
         resolve_residency,
@@ -245,6 +252,7 @@ def run(
         raise ValueError(
             "Only one of singleton_super_experts or singleton_outlier_experts can be True."
         )
+    validate_cluster_args_static(cluster_args)
 
     # Merge needs merging-criteria metrics -> must NOT record pruning-only.
     if obs_args.record_pruning_metrics_only:
@@ -258,9 +266,16 @@ def run(
         raise ValueError("layerwise batch_group_size must be at least 1 when provided.")
 
     tcr = bool(getattr(model_args, "trust_remote_code", False))
+    revision = getattr(model_args, "model_revision", None)
+    local_files_only = bool(getattr(model_args, "local_files_only", False))
     if _residency_resolved is None:
         residency = validate_residency(getattr(reap_args, "residency", "auto"))
-        model_bytes = estimate_model_bytes_from_config(model_args.model_name, trust_remote_code=tcr)
+        model_bytes = estimate_model_bytes_from_config(
+            model_args.model_name,
+            trust_remote_code=tcr,
+            revision=revision,
+            local_files_only=local_files_only,
+        )
         resolved, reason = resolve_residency(
             residency,
             model_bytes=model_bytes,
@@ -270,7 +285,12 @@ def run(
         preflight_or_warn(resolved, model_bytes)
     else:
         resolved = validate_residency(_residency_resolved)
-        model_bytes = estimate_model_bytes_from_config(model_args.model_name, trust_remote_code=tcr)
+        model_bytes = estimate_model_bytes_from_config(
+            model_args.model_name,
+            trust_remote_code=tcr,
+            revision=revision,
+            local_files_only=local_files_only,
+        )
         logger.info("Residency (pre-resolved): %s", resolved)
         preflight_or_warn(resolved, model_bytes)
 
@@ -302,7 +322,12 @@ def run(
     model_name = model_args.model_name
 
     logger.info(f"Loading tokenizer for {model_name}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=tcr)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        trust_remote_code=tcr,
+        revision=revision,
+        local_files_only=local_files_only,
+    )
 
     # Prefer auto+disk offload over pinning the entire model in host RAM.
     offload_root = results_dir / ".offload"
@@ -312,7 +337,14 @@ def run(
         low_cpu_mem_usage=layerwise_args.low_cpu_mem_usage,
     )
     logger.info("Loading model for layerwise merge (%s)...", plan.reason)
-    model = load_causal_lm(model_name, plan, trust_remote_code=tcr)
+    model = load_causal_lm(
+        model_name,
+        plan,
+        trust_remote_code=tcr,
+        revision=revision,
+        local_files_only=local_files_only,
+    )
+    log_model_residency(model, phase="layerwise merge load")
     logger.info(f"Model loaded: {model.__class__.__name__}")
     num_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Total parameters: {num_params / 1e9:.2f}B")
@@ -320,10 +352,15 @@ def run(
     cached_data_path = _get_observer_output_path(
         results_dir, ds_args.dataset_name, obs_args.output_file_name
     )
+    artifact_metadata = _compute_artifact_metadata(reap_args, model_args, ds_args, obs_args)
 
     if cached_data_path.exists() and not obs_args.overwrite_observations:
         logger.info(f"Loading cached observer data from {cached_data_path}")
-        observer_data = torch.load(cached_data_path, weights_only=True, map_location="cpu")
+        observer_data = load_observer_artifact(
+            cached_data_path,
+            expected_metadata=artifact_metadata,
+            trust_legacy=bool(getattr(obs_args, "trust_observation_artifact", False)),
+        )
     else:
         if ds_args.dataset_name == "combined":
             raise RuntimeError(
@@ -342,6 +379,7 @@ def run(
             model, tokenizer, data_batches, ds_args, obs_args, layerwise_args,
             results_dir,
         )
+        write_observer_metadata(cached_data_path, artifact_metadata)
 
     if reap_args.run_observer_only:
         logger.info("Observer run completed. Exiting (run_observer_only=True)")

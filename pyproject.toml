@@ -21,6 +21,13 @@ dependencies = [
 eval = ["lm-eval>=0.4.5"]
 cuda = ["triton>=2.3"]
 
+[dependency-groups]
+dev = [
+    "coverage[toml]>=7.8",
+    "pytest>=8.3",
+    "ruff>=0.11",
+]
+
 [project.scripts]
 reap = "reap.cli.app:main"
 # Legacy console scripts (HfArgumentParser); prefer `reap …` Typer CLI.
@@ -32,6 +39,11 @@ reap-layerwise-merge = "reap.layerwise_merge:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+[tool.pytest.ini_options]
+markers = [
+    "cuda: requires a CUDA-capable host and optional Triton installation",
+]
+
 [tool.ruff]
 line-length = 88
 

@@ -55,7 +55,13 @@ from reap.layerwise_model_utils import cleanup_memory
 from reap.eval import run_evaluate
 from reap.prune import apply_pruning
 from reap.prune import get_pruned_model_dir
-from reap.pipeline import dump_args_to_yaml, create_results_directory
+from reap.pipeline import (
+    _compute_artifact_metadata,
+    create_results_directory,
+    dump_args_to_yaml,
+    load_observer_artifact,
+    write_observer_metadata,
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -254,6 +260,7 @@ def run(
     from reap.residency import (
         estimate_model_bytes_from_config,
         load_causal_lm,
+        log_model_residency,
         plan_load,
         preflight_or_warn,
         resolve_residency,
@@ -271,10 +278,19 @@ def run(
     ):
         raise ValueError("layerwise batch_group_size must be at least 1 when provided.")
 
+    source_model_name = str(model_args.model_name)
+    baseline_model_args = dataclasses.replace(model_args)
     tcr = bool(getattr(model_args, "trust_remote_code", False))
+    revision = getattr(model_args, "model_revision", None)
+    local_files_only = bool(getattr(model_args, "local_files_only", False))
     if _residency_resolved is None:
         residency = validate_residency(getattr(reap_args, "residency", "auto"))
-        model_bytes = estimate_model_bytes_from_config(model_args.model_name, trust_remote_code=tcr)
+        model_bytes = estimate_model_bytes_from_config(
+            model_args.model_name,
+            trust_remote_code=tcr,
+            revision=revision,
+            local_files_only=local_files_only,
+        )
         resolved, reason = resolve_residency(
             residency,
             model_bytes=model_bytes,
@@ -284,7 +300,12 @@ def run(
         preflight_or_warn(resolved, model_bytes)
     else:
         resolved = validate_residency(_residency_resolved)
-        model_bytes = estimate_model_bytes_from_config(model_args.model_name, trust_remote_code=tcr)
+        model_bytes = estimate_model_bytes_from_config(
+            model_args.model_name,
+            trust_remote_code=tcr,
+            revision=revision,
+            local_files_only=local_files_only,
+        )
         logger.info("Residency (pre-resolved): %s", resolved)
         preflight_or_warn(resolved, model_bytes)
 
@@ -315,7 +336,12 @@ def run(
 
     model_name = model_args.model_name
     logger.info(f"Loading tokenizer for {model_name}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=tcr)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        trust_remote_code=tcr,
+        revision=revision,
+        local_files_only=local_files_only,
+    )
     model = None
 
     cached_data_path = _get_observer_output_path(
@@ -323,11 +349,16 @@ def run(
         ds_args.dataset_name,
         obs_args.output_file_name,
     )
+    artifact_metadata = _compute_artifact_metadata(reap_args, model_args, ds_args, obs_args)
 
     if ds_args.dataset_name == "combined":
         if cached_data_path.exists():
             logger.info(f"Loading cached observer data from {cached_data_path}")
-            observer_data = torch.load(cached_data_path, weights_only=True, map_location="cpu")
+            observer_data = load_observer_artifact(
+                cached_data_path,
+                expected_metadata=artifact_metadata,
+                trust_legacy=bool(getattr(obs_args, "trust_observation_artifact", False)),
+            )
         else:
             raise RuntimeError(
                 f"Combined dataset requested but no pre-recorded data found at {cached_data_path}"
@@ -350,14 +381,25 @@ def run(
         logger.info(
             "Loading model for layerwise processing (%s)...", plan.reason
         )
-        model = load_causal_lm(model_name, plan, trust_remote_code=tcr)
+        model = load_causal_lm(
+            model_name,
+            plan,
+            trust_remote_code=tcr,
+            revision=revision,
+            local_files_only=local_files_only,
+        )
+        log_model_residency(model, phase="layerwise prune observe load")
         logger.info(f"Model loaded: {model.__class__.__name__}")
         num_params = sum(p.numel() for p in model.parameters())
         logger.info(f"Total parameters: {num_params / 1e9:.2f}B")
 
         if cached_data_path.exists() and not obs_args.overwrite_observations:
             logger.info(f"Loading cached observer data from {cached_data_path}")
-            observer_data = torch.load(cached_data_path, weights_only=True, map_location="cpu")
+            observer_data = load_observer_artifact(
+                cached_data_path,
+                expected_metadata=artifact_metadata,
+                trust_legacy=bool(getattr(obs_args, "trust_observation_artifact", False)),
+            )
         else:
             logger.info("Recording activations using layerwise processing...")
             observer_data = record_activations_layerwise(
@@ -369,6 +411,7 @@ def run(
                 layerwise_args,
                 results_dir,
             )
+            write_observer_metadata(cached_data_path, artifact_metadata)
 
     if reap_args.run_observer_only:
         logger.info("Observer run completed. Exiting (run_observer_only=True)")
@@ -427,8 +470,16 @@ def run(
                 offload_root=results_dir / ".offload",
                 low_cpu_mem_usage=layerwise_args.low_cpu_mem_usage,
             )
-            model = load_causal_lm(model_name, plan, trust_remote_code=tcr)
+            model = load_causal_lm(
+                model_name,
+                plan,
+                trust_remote_code=tcr,
+                revision=revision,
+                local_files_only=local_files_only,
+            )
+            log_model_residency(model, phase="layerwise prune mutation reload")
 
+        log_model_residency(model, phase="layerwise prune before mutation")
         logger.info(f"Pruning model to {total_experts - n_experts_to_prune} experts...")
         apply_pruning(
             observer_data,
@@ -473,12 +524,14 @@ def run(
         del observer_data
         cleanup_memory()
 
-        model_args.model_name = pruned_model_dir
+        model_args.model_name = str(pruned_model_dir)
         run_evaluate(
             model_args,
             pruned_model_dir / "eval",
             eval_args,
             reap_args.seed,
+            baseline_model_name=source_model_name if eval_args.eval_baseline else None,
+            baseline_model_args=baseline_model_args,
         )
 
     return pruned_model_dir

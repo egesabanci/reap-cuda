@@ -207,7 +207,13 @@ def _fallback_config_heuristic(cfg) -> int | None:
         return None
 
 
-def estimate_model_bytes_from_config(model_name: str, *, trust_remote_code: bool = False) -> int | None:
+def estimate_model_bytes_from_config(
+    model_name: str,
+    *,
+    trust_remote_code: bool = False,
+    revision: str | None = None,
+    local_files_only: bool = False,
+) -> int | None:
     """Estimate parameter bytes from HF config.
 
     Resolution order:
@@ -222,7 +228,12 @@ def estimate_model_bytes_from_config(model_name: str, *, trust_remote_code: bool
     try:
         from transformers import AutoConfig
 
-        cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+        cfg = AutoConfig.from_pretrained(
+            model_name,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+            local_files_only=local_files_only,
+        )
     except Exception as exc:
         logger.debug("Could not load config for size estimate (%s): %s", model_name, exc)
         return None
@@ -424,6 +435,7 @@ def load_causal_lm(
     *,
     torch_dtype: str | torch.dtype = "auto",
     trust_remote_code: bool = False,
+    revision: str | None = None,
     local_files_only: bool = False,
 ) -> Any:
     """``from_pretrained`` honoring a :class:`LoadPlan`."""
@@ -433,6 +445,7 @@ def load_causal_lm(
         "device_map": plan.device_map,
         "torch_dtype": torch_dtype,
         "trust_remote_code": trust_remote_code,
+        "revision": revision,
         "low_cpu_mem_usage": plan.low_cpu_mem_usage,
         "local_files_only": local_files_only,
     }
@@ -452,6 +465,26 @@ def load_causal_lm(
     model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
     model.eval()
     return model
+
+
+def log_model_residency(model: Any, *, phase: str) -> None:
+    """Log Accelerate placement and CUDA peak allocation without moving weights."""
+    device_map = getattr(model, "hf_device_map", None)
+    if device_map:
+        placements = sorted({str(device) for device in device_map.values()})
+        logger.info("%s device placement: %s", phase, ", ".join(placements))
+    else:
+        try:
+            logger.info("%s model device: %s", phase, next(model.parameters()).device)
+        except (StopIteration, AttributeError):
+            logger.info("%s model device: unavailable", phase)
+    if torch.cuda.is_available():
+        logger.info(
+            "%s CUDA memory allocated=%.2f GiB peak=%.2f GiB",
+            phase,
+            torch.cuda.memory_allocated() / 1024**3,
+            torch.cuda.max_memory_allocated() / 1024**3,
+        )
 
 
 def stream_save_pretrained(model: Any, output_dir: str | Path) -> None:

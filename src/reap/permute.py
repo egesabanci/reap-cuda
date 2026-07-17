@@ -295,17 +295,20 @@ class DirectAlignmentPermuter(ExpertPermuter):
         """
         Computes the L1 distance between two experts.
         """
+        # Linear weights are [intermediate, hidden] for up/gate and
+        # [hidden, intermediate] for down.  Compare the intermediate-neuron
+        # vectors, exactly as WeightMatchingPermuter does, but with L2 cost.
         up = self._l2_dist(
-            getattr(expert, model_attrs["up_proj"]).weight.T,
-            getattr(dominant_expert, model_attrs["up_proj"]).weight.T,
+            getattr(expert, model_attrs["up_proj"]).weight,
+            getattr(dominant_expert, model_attrs["up_proj"]).weight,
         )
         gate = self._l2_dist(
-            getattr(expert, model_attrs["gate_proj"]).weight.T,
-            getattr(dominant_expert, model_attrs["gate_proj"]).weight.T,
+            getattr(expert, model_attrs["gate_proj"]).weight,
+            getattr(dominant_expert, model_attrs["gate_proj"]).weight,
         )
         down = self._l2_dist(
-            getattr(expert, model_attrs["down_proj"]).weight,
-            getattr(dominant_expert, model_attrs["down_proj"]).weight,
+            getattr(expert, model_attrs["down_proj"]).weight.T,
+            getattr(dominant_expert, model_attrs["down_proj"]).weight.T,
         )
         return up + gate + down
 
@@ -317,9 +320,12 @@ class DirectAlignmentPermuter(ExpertPermuter):
         gate_proj = getattr(expert, model_attrs["gate_proj"])
         down_proj = getattr(expert, model_attrs["down_proj"])
 
-        up_proj.weight.data = up_proj.weight.data[:, permutation]
-        gate_proj.weight.data = gate_proj.weight.data[:, permutation]
-        down_proj.weight.data = down_proj.weight.data[permutation, :]
+        # Reorder intermediate output neurons of up/gate and the matching
+        # intermediate input columns of down.  This preserves the expert's
+        # forward function while aligning it with the dominant expert.
+        up_proj.weight.data = up_proj.weight.data[permutation]
+        gate_proj.weight.data = gate_proj.weight.data[permutation]
+        down_proj.weight.data = down_proj.weight.data[:, permutation]
 
 
 PERMUTER_REGISTRY = {

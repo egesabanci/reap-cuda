@@ -58,7 +58,7 @@ Load plan when staying on full path:
 | Residency | May delegate to full path if resolved `gpu_full` / `cpu_full` |
 | Load (observe) | `plan_load("layerwise")`: `device_map="auto"` **+ disk offload** under `artifacts/.../.offload` — **not** a full host pin |
 | Observe | `LayerwiseMoEObserver.record_all_blocks` — one block on GPU |
-| Prune | Delete observe model; **reload** with `plan_load("gpu_full")`; slice; stream save (needs VRAM for full model at mutate/save) |
+| Prune | Reuse the accelerate disk-offloaded model; slice; stage + stream-save without a `gpu_full` reload |
 
 Older docs said layerwise always used `device_map="cpu"`. That caused host OOM on
 small-RAM GPU instances; offload + optional delegation replaces that default.

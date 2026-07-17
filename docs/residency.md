@@ -74,7 +74,7 @@ CPU state dict when `device_map="auto"` + low_cpu_mem works.
 | `device_map` | `"auto"` |
 | `low_cpu_mem_usage` | `True` |
 | `offload_folder` | temp dir or `artifacts/.../.offload` |
-| `stream_save_from_gpu` | `True` (mutate/save reload uses `gpu_full` plan) |
+| `stream_save_from_gpu` | `True` (mutate/save reuses the offloaded layerwise model) |
 | `avoid_cpu_materialize` | `True` |
 
 **Intended use:** model larger than single-GPU budget; calibration must walk
@@ -85,10 +85,10 @@ one decoder block at a time ([layerwise.md](layerwise.md)).
 so host RAM is not required to hold every parameter at once. The layerwise
 observer still moves **one block** to CUDA for forward/metrics.
 
-**Mutate/save (prune):** after observe, the CPU/offload model is deleted,
-memory cleaned, and the model is **reloaded with `plan_load("gpu_full")`** for
-`slice_experts` + stream save. That step still needs enough **VRAM** for the
-full (or multi-GPU-mapped) model at save time.
+**Mutate/save (prune):** REAP reuses the existing auto+disk-offloaded model
+for `slice_experts` and staged stream save. It never reloads the mutation stage
+with `plan_load("gpu_full")`; device-map and CUDA peak-allocation logs make the
+actual residency visible.
 
 ### `cpu_full` (detail)
 
@@ -308,21 +308,20 @@ Same pattern:
 | `merge_pipeline.run` | resolved `layerwise` → `layerwise_merge.run` |
 | `layerwise_merge.run` | resolved `gpu_full` / `cpu_full` → `merge_pipeline.run` |
 
-### Layerwise observe load vs mutate reload
+### Layerwise observe load and mutation
 
 For resolved **`layerwise`** prune:
 
 ```txt
 1. plan_load("layerwise", offload_root=artifacts/.offload)
 2. load_causal_lm → block-wise observe
-3. del model; cleanup_memory()
-4. plan_load("gpu_full"); load_causal_lm (local_files_only first)
-5. prune_model → stream_save_pretrained
+3. retain the offloaded model (or reload with the same layerwise plan only if needed)
+4. slice experts in place → staged stream_save_pretrained
 ```
 
-If the model does not fit GPU at step 4, mutate/save will OOM even if observe
-succeeded — same class of constraint as before, but observe no longer requires
-full host RAM.
+The mutation stage does not require a `gpu_full` reload. REAP logs the
+Accelerate device map and CUDA peak allocation before mutation so operators can
+verify real placement on their hardware.
 
 ---
 
@@ -350,7 +349,7 @@ Help panel name: **Residency**.
 | Host | Model | Command sketch |
 | --- | --- | --- |
 | g6.xlarge (16 GiB RAM, L4 24 GiB) | ~8B MoE FP16 | `reap prune full --residency auto` (or `gpu_full`) |
-| Same | 30B MoE | `reap prune layerwise --residency auto` (observe offload; save still needs VRAM budget) |
+| Same | 30B MoE | `reap prune layerwise --residency auto` (observe/mutate via disk offload) |
 | L40S 46 GiB, large RAM | 30B | `reap prune layerwise --residency auto` |
 | Multi-GPU 80 GiB+ | 30B+ | `reap prune full --residency gpu_full` |
 | CPU-only debug | tiny | `reap prune full --residency cpu_full` |
@@ -462,7 +461,7 @@ Config field: **`ReapArgs.residency`** (`src/reap/args.py`, default `"auto"`).
 | Host OOM during load with old mental model | Still using `cpu_full` or external scripts that pin CPU | `--residency gpu_full` or `auto` |
 | Host OOM on save | accelerate hooks materializing CPU state dict | Ensure stream path (`stream_save_pretrained`); update to current prune/merge |
 | GPU OOM on full observe | Model > VRAM; auto wrongly chose `gpu_full` | `--residency layerwise` |
-| GPU OOM on layerwise mutate/save | Full reload for slice needs VRAM | Multi-GPU, larger instance, or prune offline on bigger box after observe-only |
+| GPU OOM on layerwise mutate/save | Offloaded module working set exceeds VRAM | Lower batch group size, use a larger GPU, or inspect logged device placement |
 | `cpu_full` warning in logs | Model large vs host | Prefer `gpu_full` on GPU hosts |
 | Infinite recursion (should not happen) | Missing `_residency_resolved` | Fixed by keyword; do not call `run` peers without it when re-entering |
 

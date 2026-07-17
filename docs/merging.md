@@ -41,7 +41,6 @@ Vector similarities may be converted with `--distance`
 | --- | --- |
 | `agglomerative` | Default; linkage via `--linkage` |
 | `kmeans` | On characteristic activations |
-| `spectral` | Supported in cluster utilities |
 | `mc_smoe` | Multi-criterion style path |
 
 Optional:
@@ -51,11 +50,17 @@ Optional:
 - singleton super / outlier experts
 - `multi_layer` joint clustering
 
-Target cluster count:
+Target cluster count is resolved before clustering:
 
 ```txt
+--num-clusters N                 # explicit surviving experts; takes precedence
+# otherwise
 num_clusters = int(experts_per_layer * (1 - compression_ratio))
 ```
+
+Exactly one effective control is required. `N` must be in
+`[1, experts_per_layer]`; ratios must be finite and in `[0, 1)`. Unsupported
+methods (including `spectral`) fail before model loading.
 
 ## Skip layers
 
@@ -72,7 +77,11 @@ boundary layers. Validated so skips cannot remove all layers.
 | `multislerp` | Multi-SLERP; optional `dom_as_base` |
 | `sce` / `karcher` / `submoe` | Additional fusion schemes |
 
-Optional `--permute {direct,wm}` aligns intermediate neurons before merge.
+Optional `--permute {direct,wm}` aligns intermediate neurons before merge on
+non-fused expert layouts. Both preserve each expert's forward function while
+reordering the intermediate-neuron axis. `direct` intentionally rejects fused
+layouts with an actionable `NotImplementedError`; use `wm` where fused
+permutation support is required.
 
 Fused vs non-fused weight access uses `expert_weight_attrs` (live fused detection
 for Qwen).

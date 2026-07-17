@@ -12,7 +12,7 @@ class ReapArgs:
         metadata={"help": "Whether to only run the observer to collect activation data."},
     )
     do_eval: bool = field(
-        default=True,
+        default=False,
         metadata={"help": "Whether to run evaluation after pruning."},
     )
     smoke_test: bool = field(
@@ -65,13 +65,16 @@ class ModelArgs:
             )
         },
     )
-    num_experts_per_tok_override: int | None = field(
+    model_revision: str | None = field(
         default=None,
         metadata={
-            "help": (
-                "Override the number of experts per token. If None, uses the model's "
-                "default number of experts per token."
-            )
+            "help": "Optional immutable Hugging Face revision recorded in artifacts.",
+        },
+    )
+    local_files_only: bool = field(
+        default=False,
+        metadata={
+            "help": "Never contact the Hugging Face Hub while loading this model.",
         },
     )
 
@@ -133,6 +136,15 @@ class ObserverArgs:
     overwrite_observations: bool = field(
         default=False,
         metadata={"help": "Whether to overwrite existing observer data files."},
+    )
+    trust_observation_artifact: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Allow loading a legacy observation artifact without a compatible "
+                "metadata manifest. Only enable for artifacts you trust."
+            )
+        },
     )
     distance_measure: str = field(
         default="angular",
@@ -437,12 +449,12 @@ class EvalArgs:
         metadata={"help": "Whether to run evaluation on the merged model."},
     )
     run_evalplus: bool = field(
-        default=True,
-        metadata={"help": "Whether to run evaluation using evalplus."},
+        default=False,
+        metadata={"help": "Request evaluation using evalplus (currently warned as unsupported)."},
     )
     run_livecodebench: bool = field(
-        default=True,
-        metadata={"help": "Whether to run evaluation using livecodebench."},
+        default=False,
+        metadata={"help": "Request evaluation using LiveCodeBench (currently warned as unsupported)."},
     )
     run_wildbench: bool = field(
         default=False,
@@ -481,6 +493,35 @@ class EvalArgs:
         default=32,
         metadata={
             "help": "Number of parallel tasks to run during evalplus evaluation."
+        },
+    )
+    eval_backend: str = field(
+        default="hf",
+        metadata={
+            "help": "lm-eval backend: hf or vllm.",
+            "choices": ["hf", "vllm"],
+        },
+    )
+    eval_num_fewshot: int = field(
+        default=0,
+        metadata={"help": "Number of few-shot examples per lm-eval task."},
+    )
+    eval_batch_size: int = field(
+        default=1,
+        metadata={"help": "Batch size passed to lm-eval."},
+    )
+    eval_limit: int | None = field(
+        default=None,
+        metadata={"help": "Optional maximum examples per lm-eval task."},
+    )
+    eval_baseline: bool = field(
+        default=False,
+        metadata={"help": "Evaluate the original model and write a metric diff."},
+    )
+    eval_data_path: str | None = field(
+        default=None,
+        metadata={
+            "help": "Optional local Hugging Face cache root for offline evaluation tasks."
         },
     )
 

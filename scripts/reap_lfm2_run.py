@@ -72,7 +72,7 @@ import re as _re
 
 def _str_to_dir(s: str) -> str:
     return _re.sub(r"[^\w\-_.]", "_", s)
-from reap.prune import get_pruned_model_dir, prune as reap_prune
+from reap.prune import apply_pruning, get_pruned_model_dir, publish_pruned_model
 from reap.residency import (
     estimate_model_bytes_from_config,
     estimate_model_bytes_from_module,
@@ -170,7 +170,9 @@ class GpuSampler(threading.Thread):
         self.path = path
         self.interval = interval
         self._stop_event = threading.Event()
-        self.f = open(path, "w", newline="")
+        # The sampler intentionally owns this handle for its thread lifetime;
+        # stop() closes it after joining the thread.
+        self.f = open(path, "w", newline="")  # noqa: SIM115
         self.writer = csv.writer(self.f)
         self.writer.writerow(
             ["t_s", "memory.used_mib", "memory.total_mib", "utilization.gpu_pct"]
@@ -237,7 +239,7 @@ def _prepare_local_calib_path(n_examples: int, cache_dir: Path) -> Path:
 # --------------------------- main ------------------------------------------
 def main():
     model_clean = _str_to_dir(MODEL_PATH.split("/")[-1])
-    dataset_clean = _str_to_dir("theblackcat102/evol-codealpaca-v1".split("/")[-1])
+    dataset_clean = "evol-codealpaca-v1"
     results_dir = ARTIFACTS_BASE / model_clean / dataset_clean
     results_dir.mkdir(parents=True, exist_ok=True)
     logger.info("Artifacts directory: %s", results_dir)
@@ -450,10 +452,13 @@ def main():
         )
         with phase("6_prune_slice_save", n_prune=n_experts_to_prune,
                    keep=total_experts - n_experts_to_prune) as r:
-            reap_prune(observer_data, model, prune_args, n_experts_to_prune, pruned_dir)
-            # prune() slices + stream-saves weights; save tokenizer alongside
-            # (mirrors reap.prune.run which calls tokenizer.save_pretrained).
-            tokenizer.save_pretrained(pruned_dir)
+            apply_pruning(observer_data, model, prune_args, n_experts_to_prune)
+            publish_pruned_model(
+                model,
+                tokenizer,
+                pruned_dir,
+                smoke_test_fn=lambda: smoke_test(model, tokenizer),
+            )
             r["pruned_model_dir"] = str(pruned_dir)
             r["pruned_config_num_experts"] = int(getattr(model.config, "num_experts", -1))
             r["pruned_config_top_k"] = int(getattr(model.config, "num_experts_per_tok", -1))

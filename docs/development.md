@@ -5,12 +5,10 @@
 ```bash
 git clone <repo> && cd reap-cuda
 uv venv .venv --seed --python 3.12
-uv pip install --editable .
-uv pip install pytest
+uv sync --locked --group dev
 
-# CUDA host with optional Triton
-uv pip install -e '.[cuda]'
-uv pip install -e '.[eval]'   # lm-eval
+# CUDA host with optional Triton and lm-eval
+uv sync --locked --group dev --extra cuda --extra eval
 ```
 
 Requires **Python ≥ 3.12**, **torch ≥ 2.10**, **transformers ≥ 5.5**.
@@ -19,7 +17,12 @@ Requires **Python ≥ 3.12**, **torch ≥ 2.10**, **transformers ≥ 5.5**.
 
 ```bash
 uv run pytest tests/ -q
+uv run ruff check src tests
 ```
+
+GitHub Actions runs this locked CPU quality gate on Python 3.12 and 3.13.
+`.github/workflows/gpu.yml` is a scheduled/manual self-hosted `linux,gpu` lane
+for CUDA/Triton parity tests; register that runner label to enable it.
 
 Hermetic suite (no Hub downloads):
 

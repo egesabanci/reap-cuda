@@ -110,6 +110,11 @@ class MoEExpertMerger:
             # If permute is enabled, apply permutation to align experts
             if self.permute:
                 permuter_cls = PERMUTER_REGISTRY.get(self.permute)
+                if permuter_cls is None:
+                    raise ValueError(
+                        f"Unsupported permutation method {self.permute!r}; "
+                        f"choose one of {sorted(PERMUTER_REGISTRY)}."
+                    )
                 logger.info(
                     f"Permuting experts in cluster {cluster_id} with {self.permute} method"
                 )

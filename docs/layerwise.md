@@ -29,8 +29,9 @@ Layerwise calibration enables 30B+ MoE observation on a **single mid-size GPU**
 
 3. **Report / save** state (CPU for disk)
 
-4. **Prune path only:** delete observe model, reload with **`plan_load("gpu_full")`**
-   (`device_map="auto"`), slice, **`stream_save_pretrained`**.
+4. **Prune path only:** keep/reload only the existing **`plan_load("layerwise")`**
+   offloaded model if needed, slice experts in place, then stage and
+   **`stream_save_pretrained`** without a full-GPU reload.
 
 ## Weight load (residency)
 
@@ -59,7 +60,7 @@ See **[residency.md](residency.md)** for modes, heuristics, and delegation.
 | Activation transient (old dense loop) | up to multi-GB per layer | multi-GB × concurrency |
 | F4 cache | ~1.2 GB/layer while active | same while hooked layer runs |
 | Replay cache | CPU RAM (all batches × seq × hidden) | N/A |
-| Mutate/save | Full model via `gpu_full` plan | Already loaded |
+| Mutate/save | Existing auto+disk-offloaded model; no `gpu_full` reload | Already loaded |
 
 Use `--batch-group-size` to limit how many batches are cached at once (CPU RAM).
 

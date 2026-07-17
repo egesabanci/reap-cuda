@@ -1,8 +1,11 @@
 from __future__ import annotations
 import dataclasses
+import hashlib
 import logging
+import os
 import pathlib
 import re
+from importlib.metadata import PackageNotFoundError, version
 
 import json
 import yaml
@@ -49,33 +52,37 @@ def resolve_artifacts_root(base: str | pathlib.Path | None = None) -> pathlib.Pa
     return pathlib.Path("./artifacts").resolve()
 
 
+def _normalized_identifier(value: str) -> str:
+    """Normalize a local path or Hub identifier without losing its namespace."""
+    path = pathlib.Path(value).expanduser()
+    if path.exists():
+        return str(path.resolve())
+    return value.strip()
+
+
+def _artifact_path_component(value: str, *, prefix: str) -> str:
+    """Return a readable, collision-resistant component for an artifact path."""
+    normalized = _normalized_identifier(value)
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:12]
+    readable = str_to_directory_name(normalized.replace("/", "--"))[-72:]
+    return f"{prefix}_{readable}-{digest}"
+
+
 def create_results_directory(
     model_name: str,
     dataset_name: str,
     *,
     base: str | pathlib.Path | None = None,
 ) -> pathlib.Path:
-    """Create a clean directory name from model and dataset names.
+    """Create collision-resistant artifact directories for a model/dataset pair.
 
-    For composite dataset specs (comma-separated), uses a short hash of the
-    full spec as the directory name: ``composite_<md5[:8]>``.
-
-    *base* overrides the root (also via ``REAP_ARTIFACTS_DIR`` / ``REAP_OUTPUT_DIR``).
+    The full normalized model and dataset identities are retained in readable
+    form and suffixed with stable hashes. This prevents ``owner-a/model`` and
+    ``owner-b/model`` (or distinct local paths with a shared basename) from
+    reusing each other's observations/checkpoints.
     """
-    import hashlib
-
-    model_clean = model_name.split("/")[-1]
-    model_clean = str_to_directory_name(model_clean)
-
-    if "," in dataset_name:
-        spec_hash = hashlib.md5(dataset_name.encode()).hexdigest()[:8]
-        dataset_clean = f"composite_{spec_hash}"
-        logger.info(
-            f"Composite dataset spec detected. Using directory name: {dataset_clean}"
-        )
-    else:
-        dataset_clean = dataset_name.split("/")[-1]
-        dataset_clean = str_to_directory_name(dataset_clean)
+    model_clean = _artifact_path_component(model_name, prefix="model")
+    dataset_clean = _artifact_path_component(dataset_name, prefix="dataset")
 
     root = resolve_artifacts_root(base)
     results_dir = root / model_clean / dataset_clean
@@ -183,45 +190,141 @@ def _profile_model(model, tokenizer, model_args, obs_args, observer):
     observer.reset()
 
 
+_OBSERVATION_SCHEMA_VERSION = 3
+
+
+def observer_metadata_path(path: pathlib.Path) -> pathlib.Path:
+    return path.with_suffix(path.suffix + ".meta.json")
+
+
+def _fingerprint_path(value: str | None) -> str | None:
+    """Hash local path identity and bounded content samples for cache safety."""
+    if not value:
+        return None
+    root = pathlib.Path(value).expanduser()
+    if not root.exists():
+        return None
+    digest = hashlib.sha256(str(root.resolve()).encode("utf-8"))
+    files = [root] if root.is_file() else sorted(p for p in root.rglob("*") if p.is_file())
+    for file_path in files[:10_000]:
+        stat = file_path.stat()
+        digest.update(str(file_path.relative_to(root) if root.is_dir() else file_path.name).encode())
+        digest.update(f"{stat.st_size}:{stat.st_mtime_ns}".encode())
+        # Detect content changes that preserve timestamp/size without reading a
+        # potentially multi-gigabyte model or dataset in full.
+        with file_path.open("rb") as handle:
+            digest.update(handle.read(64 * 1024))
+            if stat.st_size > 64 * 1024:
+                handle.seek(max(0, stat.st_size - 64 * 1024))
+                digest.update(handle.read(64 * 1024))
+    digest.update(str(len(files)).encode())
+    return digest.hexdigest()
+
+
+def _reap_version() -> str:
+    try:
+        return version("reap")
+    except PackageNotFoundError:
+        return "local-source"
+
+
 def _compute_artifact_metadata(
     reap_args, model_args, ds_args, obs_args,
 ) -> dict[str, object]:
-    """Compute a stable metadata dict for cache invalidation."""
+    """Compute a versioned, provenance-rich observation cache manifest."""
     return {
-        "version": 2,
-        "model_name": model_args.model_name,
-        "dataset_name": ds_args.dataset_name,
-        "dataset_config_name": getattr(ds_args, "dataset_config_name", None),
-        "dataset_path": getattr(ds_args, "dataset_path", None),
-        "split": ds_args.split,
-        "seed": reap_args.seed,
-        "shuffle": getattr(ds_args, "shuffle", True),
-        "model_max_length": obs_args.model_max_length,
-        "batches_per_category": obs_args.batches_per_category,
-        "batch_size": obs_args.batch_size,
-        "truncate": obs_args.truncate,
-        "split_by_category": obs_args.split_by_category,
-        "distance_measure": obs_args.distance_measure,
-        "record_pruning_metrics_only": obs_args.record_pruning_metrics_only,
-        "renormalize_router_weights": obs_args.renormalize_router_weights,
-        "observe_backend": getattr(obs_args, "observe_backend", "auto"),
-        "frea_backend": getattr(obs_args, "frea_backend", "auto"),
+        "schema_version": _OBSERVATION_SCHEMA_VERSION,
+        "reap_version": _reap_version(),
+        "observer_schema_sha256": hashlib.sha256(
+            pathlib.Path(__file__).read_bytes()
+        ).hexdigest(),
+        "model": {
+            "name": model_args.model_name,
+            "normalized_id": _normalized_identifier(model_args.model_name),
+            "revision": getattr(model_args, "model_revision", None),
+            "local_fingerprint": _fingerprint_path(model_args.model_name),
+            "trust_remote_code": bool(getattr(model_args, "trust_remote_code", False)),
+        },
+        "tokenizer": {
+            "revision": getattr(model_args, "model_revision", None),
+            "local_fingerprint": _fingerprint_path(model_args.model_name),
+        },
+        "dataset": {
+            "name": ds_args.dataset_name,
+            "config": getattr(ds_args, "dataset_config_name", None),
+            "path": getattr(ds_args, "dataset_path", None),
+            "path_fingerprint": _fingerprint_path(getattr(ds_args, "dataset_path", None)),
+            "split": ds_args.split,
+            "shuffle": getattr(ds_args, "shuffle", True),
+            "seed": reap_args.seed,
+        },
+        "observer": {
+            "model_max_length": obs_args.model_max_length,
+            "batches_per_category": obs_args.batches_per_category,
+            "batch_size": obs_args.batch_size,
+            "truncate": obs_args.truncate,
+            "split_by_category": obs_args.split_by_category,
+            "distance_measure": obs_args.distance_measure,
+            "record_pruning_metrics_only": obs_args.record_pruning_metrics_only,
+            "renormalize_router_weights": obs_args.renormalize_router_weights,
+            "observe_backend": getattr(obs_args, "observe_backend", "auto"),
+            "frea_backend": getattr(obs_args, "frea_backend", "auto"),
+        },
     }
 
 
-def load_observer_artifact(path: pathlib.Path) -> dict[str, object]:
-    """Load an observer state dict with safe tensor-only deserialization."""
-    value = torch.load(path, weights_only=True, map_location="cpu")
-    if not isinstance(value, dict):
-        raise ValueError(f"Observer artifact {path} is not a dict")
+def write_observer_metadata(path: pathlib.Path, metadata: dict[str, object]) -> None:
+    metadata_path = observer_metadata_path(path)
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    with metadata_path.open("w") as handle:
+        json.dump(metadata, handle, indent=2, sort_keys=True, default=str)
+
+
+def _validate_observer_schema(value: object, path: pathlib.Path) -> dict[str, object]:
+    if not isinstance(value, dict) or not value:
+        raise ValueError(f"Observer artifact {path} must be a non-empty dict.")
     for layer_key, layer_data in value.items():
-        if isinstance(layer_data, dict):
-            expected_fields = {"expert_frequency", "total_tokens"}
-            if not expected_fields.issubset(layer_data):
-                logger.warning(
-                    "Layer %s in %s lacks expected fields %s",
-                    layer_key, path, expected_fields - set(layer_data),
+        if not isinstance(layer_key, (int, str)) or not isinstance(layer_data, dict):
+            raise ValueError(f"Observer artifact {path} has invalid layer entry {layer_key!r}.")
+        frequency = layer_data.get("expert_frequency")
+        total_tokens = layer_data.get("total_tokens")
+        if not isinstance(frequency, torch.Tensor) or frequency.ndim != 1:
+            raise ValueError(
+                f"Observer artifact {path} layer {layer_key!r} requires a 1-D "
+                "tensor 'expert_frequency'."
+            )
+        if not isinstance(total_tokens, (torch.Tensor, int, float)):
+            raise ValueError(
+                f"Observer artifact {path} layer {layer_key!r} requires numeric 'total_tokens'."
+            )
+    return value
+
+
+def load_observer_artifact(
+    path: pathlib.Path,
+    *,
+    expected_metadata: dict[str, object] | None = None,
+    trust_legacy: bool = False,
+) -> dict[str, object]:
+    """Safely load and schema-check an observation artifact and its manifest."""
+    path = pathlib.Path(path)
+    value = _validate_observer_schema(
+        torch.load(path, weights_only=True, map_location="cpu"), path
+    )
+    metadata_file = observer_metadata_path(path)
+    if expected_metadata is not None:
+        if not metadata_file.exists():
+            if not trust_legacy:
+                raise ValueError(
+                    f"Observation artifact {path} has no manifest. Recompute it or pass "
+                    "--trust-observation-artifact for a legacy artifact you trust."
                 )
+            logger.warning("Loading trusted legacy observation artifact without manifest: %s", path)
+        else:
+            with metadata_file.open() as handle:
+                stored_metadata = json.load(handle)
+            if stored_metadata != expected_metadata:
+                raise ValueError(f"Observation artifact {path} has an incompatible manifest.")
     return value
 
 
@@ -237,41 +340,32 @@ def record_activations(
     all_dir = results_dir / "all"
     all_dir.mkdir(parents=True, exist_ok=True)
     aggregate_path = all_dir / obs_args.output_file_name
-    meta_path = aggregate_path.with_suffix(aggregate_path.suffix + ".meta.json")
+    current_meta = _compute_artifact_metadata(reap_args, model_args, ds_args, obs_args)
 
-    # Early return if valid aggregate cache exists.
+    # The aggregate is the sole authoritative cache. Its manifest and schema
+    # must match before it can bypass model/data loading.
     if aggregate_path.exists() and not obs_args.overwrite_observations:
         try:
-            current_meta = _compute_artifact_metadata(reap_args, model_args, ds_args, obs_args)
-            if meta_path.exists():
-                with open(meta_path) as f:
-                    stored_meta = json.load(f)
-                if stored_meta == current_meta:
-                    logger.info(
-                        "Aggregate cache hit @ %s; returning cached data.",
-                        aggregate_path,
-                    )
-                    return load_observer_artifact(aggregate_path)
-                else:
-                    logger.info(
-                        "Aggregate cache @ %s has mismatched metadata; recomputing.",
-                        aggregate_path,
-                    )
-            else:
-                logger.info(
-                    "Aggregate cache @ %s has no metadata; recomputing.",
-                    aggregate_path,
-                )
+            data = load_observer_artifact(
+                aggregate_path,
+                expected_metadata=current_meta,
+                trust_legacy=bool(getattr(obs_args, "trust_observation_artifact", False)),
+            )
+            logger.info("Aggregate cache hit @ %s; returning cached data.", aggregate_path)
+            return data
         except Exception as exc:
-            logger.warning("Aggregate cache validation failed (%s); recomputing.", exc)
+            logger.warning("Aggregate cache is not reusable (%s); recomputing.", exc)
 
     if ds_args.dataset_name == "combined":
         if aggregate_path.exists():
-            return load_observer_artifact(aggregate_path)
-        else:
-            raise RuntimeError(
-                f"Combined dataset requested but no pre-recorded data found at {aggregate_path}"
+            return load_observer_artifact(
+                aggregate_path,
+                expected_metadata=current_meta,
+                trust_legacy=bool(getattr(obs_args, "trust_observation_artifact", False)),
             )
+        raise RuntimeError(
+            f"Combined dataset requested but no pre-recorded data found at {aggregate_path}"
+        )
 
     # check for composite dataset specification
     composite_components = parse_composite_dataset_spec(
@@ -351,16 +445,16 @@ def record_activations(
             # Save per-category diagnostic snapshot.
             cat_path = cat_dir / obs_args.output_file_name
             observer.save_state(cat_path)
+            write_observer_metadata(cat_path, {**current_meta, "category": str(category)})
             logger.info(f"Category '{category}' data saved to {cat_path}")
 
     # Write aggregate (all categories combined in one observer).
     observer.save_state(aggregate_path)
-    # Write sidecar metadata for future cache validation.
-    meta = _compute_artifact_metadata(reap_args, model_args, ds_args, obs_args)
-    with open(meta_path, "w") as f:
-        json.dump(meta, f, indent=2, default=str)
+    write_observer_metadata(aggregate_path, current_meta)
     logger.info(
-        "Aggregate cache saved @ %s (version=%d)", aggregate_path, meta["version"]
+        "Aggregate cache saved @ %s (schema_version=%d)",
+        aggregate_path,
+        _OBSERVATION_SCHEMA_VERSION,
     )
 
     # Capture the in-memory state BEFORE close_hooks() resets it.

@@ -58,7 +58,8 @@ critical on low host-RAM instances (e.g. g6.xlarge). See [residency.md](residenc
 | [Merging](merging.md) | Clustering, merge methods, skip layers, super-experts |
 | [Layerwise Mode](layerwise.md) | Block replay, CPU activation cache, memory trade-offs |
 | [CLI](cli.md) | Typer commands, flags, legacy scripts |
-| [Evaluation](evaluation.md) | lm-eval, stubs, smoke tests |
+| [Evaluation](evaluation.md) | lm-eval backends, baseline deltas, offline cache, smoke validation |
+| [Security](security.md) | Remote-code and observation-artifact trust boundaries |
 | [Development](development.md) | Install, tests, extension checklist |
 | [Kernels design](kernels/README.md) | Phased kernel design reference (SoC under `kernels/`) |
 

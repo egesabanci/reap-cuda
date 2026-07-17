@@ -84,8 +84,8 @@ Load with plan_load(layerwise): device_map=auto + offload_folder
        for each cached batch: forward block
          MoE hook -> observe_moe_batch
        offload block to CPU
-  -> del model; cleanup_memory()
-  -> reload plan_load(gpu_full) for in-place prune + stream_save_pretrained
+  -> retain the auto+disk-offloaded model
+  -> in-place prune + staged stream_save_pretrained (no gpu_full reload)
 ```
 
 Hidden states between blocks are cached on **CPU** to fit large models; saliency

@@ -44,7 +44,7 @@ from transformers import AutoTokenizer, AutoConfig, Qwen3_5MoeForCausalLM
 from reap.model_adapters import infer_model_adapter, Qwen3_5MoeModelAdapter
 from reap.observer import MoETransformerObserver, MoETransformerObserverConfig
 from reap.args import PruneArgs
-from reap.prune import prune
+from reap.prune import apply_pruning, publish_pruned_model
 
 MODEL_PATH = "/data/models/unsloth/Qwen3.6-35B-A3B"
 DATASET_JSONL = (
@@ -101,7 +101,8 @@ def build_real_fused_model():
     # safetensors index. Source keys live under ``model.language_model.*``;
     # the text-only CausalLM expects ``model.*`` (strip ``language_model.``).
     idx_path = pathlib.Path(MODEL_PATH) / "model.safetensors.index.json"
-    idx = json.load(open(idx_path))
+    with idx_path.open() as handle:
+        idx = json.load(handle)
     wmap = idx["weight_map"]
 
     want_prefix = (
@@ -250,13 +251,11 @@ def run_smoke():
 
     # ---- 4. prune (fused slice + config patch) -------------------------------
     prune_args = PruneArgs(prune_method="frequency", overwrite_pruned_model=True)
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    prune(
+    apply_pruning(
         observer_data=observer_data,
         model=model,
         prune_args=prune_args,
         n_experts_to_prune=N_EXPERTS_TO_PRUNE,
-        pruned_model_dir=OUT_DIR,
     )
 
     # ---- 5. assertions -------------------------------------------------------
@@ -287,6 +286,12 @@ def run_smoke():
           f"(was 256) -- OK")
     print(f"[prune] gate_up_proj shapes before={gup_shape_before} "
           f"after={tuple(adapter.layers(model)[i].mlp.experts.gate_up_proj.shape for i in moe_idx)}")
+    publish_pruned_model(
+        model,
+        tokenizer,
+        OUT_DIR,
+        smoke_test_fn=lambda: smoke_test(model, tokenizer),
+    )
 
     print("\n=== SMOKE PASSED ===")
     print("Wiring verified on real fused Qwen3.6-35B-A3B experts:")

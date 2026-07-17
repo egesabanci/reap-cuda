@@ -8,14 +8,17 @@ Implementation: `src/reap/prune.py`, `src/reap/layerwise_prune.py`.
 ## Algorithm (per MoE layer)
 
 1. Load saliency vector `s ∈ R^E` from observer state (`_resolve_saliency`).
-2. Optionally protect super/outlier experts by setting their score to `+inf`.
-3. Choose `n = min(n_experts_to_prune, E - 1)` lowest scores (`torch.topk`,
-   `largest=False`).
-4. `keep = {0..E-1} \ prune_set`.
-5. `adapter.slice_experts(moe, keep)`.
-6. After all layers: `adapter.update_config(config, retained, top_k)`.
+2. Build an explicit candidate set containing only unprotected experts.
+3. Compute each layer's capacity `E - protected - 1`, then choose one global
+   prune count bounded by the smallest capacity so every MoE layer retains the
+   same expert count.
+4. Select the lowest-saliency experts only from each unprotected candidate set.
+5. `keep = {0..E-1} \ prune_set`; protected indices are an invariant of `keep`.
+6. `adapter.slice_experts(moe, keep)`, then clamp router top-k while patching
+   config after all layers.
 
-All MoE layers share the same retained count (global `num_experts`).
+If protection makes the requested compression impossible, REAP reduces the
+prune count uniformly and logs a warning rather than pruning a protected expert.
 
 ## Saliency methods
 
@@ -73,16 +76,19 @@ See [residency.md](residency.md#stream-save).
 
 ## Layerwise caveat
 
-Observe is memory-efficient (block schedule + disk offload under residency
-`layerwise`); **mutate/save still reloads the full model** with
-`plan_load("gpu_full")` (`device_map="auto"`). Plan **VRAM** for that step
-separately from calibration. Do not confuse with host-RAM pin — that is what
-`--residency` avoids.
+Observe and mutation are memory-efficient under residency `layerwise`: REAP
+reuses the accelerate auto+disk-offloaded model for expert slicing and staged
+stream save. It does **not** reload with `plan_load("gpu_full")`; logs report
+the actual device map and CUDA peak allocation for the observe/mutation phases.
+Do not confuse disk offload with `cpu_full`, which intentionally pins all
+weights in host RAM.
 
 ## Smoke test
 
-Optional generate with chat template (`pipeline.smoke_test`). Enable with
-`--smoke-test` on full prune (default on for `reap prune full`).
+Optional generate with chat template (`pipeline.smoke_test`). It runs before
+publication: a failure raises and leaves no newly published checkpoint or
+staging directory. `reap prune full` defaults it on; layerwise exposes the
+same flag but defaults it off for offloaded-model cost control.
 
 ## Related
 

@@ -1,0 +1,29 @@
+name: GPU / Triton
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+
+jobs:
+  cuda-tests:
+    # This lane is intentionally self-hosted: GitHub-hosted runners have no
+    # CUDA GPU. Repository maintainers can register a runner with these labels.
+    runs-on: [self-hosted, linux, gpu]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Sync locked CUDA dependencies
+        run: uv sync --locked --extra cuda --extra eval --group dev
+      - name: CUDA and Triton parity tests
+        run: |
+          uv run python -m pytest -q --tb=short \
+            tests/test_kernel_parity_bmm.py tests/test_triton_kernels.py \
+            tests/test_fused_slice_forward.py
+      - name: Report GPU memory state
+        if: always()
+        run: nvidia-smi || true

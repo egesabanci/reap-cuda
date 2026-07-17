@@ -97,6 +97,34 @@ def _resolve_num_clusters(
             f"(experts_per_layer={experts_per_layer})."
         )
     return num_clusters
+
+
+_SUPPORTED_CLUSTER_METHODS = {"agglomerative", "kmeans", "mc_smoe"}
+
+
+def validate_cluster_args_static(cluster_args: ClusterArgs) -> None:
+    """Validate merge settings that do not depend on the loaded model.
+
+    This is deliberately called before model/tokenizer loading by both full and
+    layerwise entry points, so invalid public CLI values fail cheaply.
+    """
+    if cluster_args.cluster_method not in _SUPPORTED_CLUSTER_METHODS:
+        raise ValueError(
+            f"Unsupported cluster_method {cluster_args.cluster_method!r}; choose one "
+            f"of {sorted(_SUPPORTED_CLUSTER_METHODS)}."
+        )
+    if cluster_args.num_clusters is None:
+        ratio = cluster_args.compression_ratio
+        if ratio is None:
+            raise ValueError("Either --num-clusters or --compression-ratio must be set.")
+        if not math.isfinite(ratio) or ratio < 0.0 or ratio >= 1.0:
+            raise ValueError(f"compression_ratio must be finite and in [0, 1); got {ratio}")
+    elif cluster_args.num_clusters < 1:
+        raise ValueError(
+            f"--num-clusters must be at least 1; got {cluster_args.num_clusters}."
+        )
+
+
 from reap.pipeline import record_activations, dump_args_to_yaml, create_results_directory
 from reap.merge import MergeMethod, MoEExpertMerger
 from reap.metrics import get_distance_fn
@@ -542,8 +570,21 @@ def run_merge(
 
     if reap_args.do_eval:
         logger.info("Starting evaluation...")
-        model_args_eval = ModelArgs(model_name=str(merged_model_dir))
-        run_evaluate(model_args_eval, merged_model_dir / "eval", eval_args, reap_args.seed)
+        model_args_eval = ModelArgs(
+            model_name=str(merged_model_dir),
+            trust_remote_code=bool(getattr(model_args, "trust_remote_code", False)),
+            local_files_only=True,
+        )
+        run_evaluate(
+            model_args_eval,
+            merged_model_dir / "eval",
+            eval_args,
+            reap_args.seed,
+            baseline_model_name=(
+                str(model_args.model_name) if eval_args.eval_baseline else None
+            ),
+            baseline_model_args=model_args,
+        )
 
     return merged_model_dir
 
@@ -563,6 +604,7 @@ def run(
     from reap.residency import (
         estimate_model_bytes_from_config,
         load_causal_lm,
+        log_model_residency,
         plan_load,
         preflight_or_warn,
         resolve_residency,
@@ -573,6 +615,7 @@ def run(
         raise ValueError(
             "Only one of singleton_super_experts or singleton_outlier_experts can be True."
         )
+    validate_cluster_args_static(cluster_args)
 
     # Merge needs the merging-criteria metrics -> must NOT record pruning-only.
     if obs_args.record_pruning_metrics_only:
@@ -583,9 +626,16 @@ def run(
         obs_args.record_pruning_metrics_only = False
 
     tcr = bool(getattr(model_args, "trust_remote_code", False))
+    revision = getattr(model_args, "model_revision", None)
+    local_files_only = bool(getattr(model_args, "local_files_only", False))
     if _residency_resolved is None:
         residency = validate_residency(getattr(reap_args, "residency", "auto"))
-        model_bytes = estimate_model_bytes_from_config(model_args.model_name, trust_remote_code=tcr)
+        model_bytes = estimate_model_bytes_from_config(
+            model_args.model_name,
+            trust_remote_code=tcr,
+            revision=revision,
+            local_files_only=local_files_only,
+        )
         resolved, reason = resolve_residency(
             residency,
             model_bytes=model_bytes,
@@ -595,7 +645,12 @@ def run(
         preflight_or_warn(resolved, model_bytes)
     else:
         resolved = validate_residency(_residency_resolved)
-        model_bytes = estimate_model_bytes_from_config(model_args.model_name, trust_remote_code=tcr)
+        model_bytes = estimate_model_bytes_from_config(
+            model_args.model_name,
+            trust_remote_code=tcr,
+            revision=revision,
+            local_files_only=local_files_only,
+        )
         logger.info("Residency (pre-resolved): %s", resolved)
         preflight_or_warn(resolved, model_bytes)
 
@@ -624,9 +679,21 @@ def run(
     )
 
     model_name = model_args.model_name
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=tcr)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        trust_remote_code=tcr,
+        revision=revision,
+        local_files_only=local_files_only,
+    )
     plan = plan_load("cpu_full" if resolved == "cpu_full" else "gpu_full")
-    model = load_causal_lm(model_name, plan, trust_remote_code=tcr)
+    model = load_causal_lm(
+        model_name,
+        plan,
+        trust_remote_code=tcr,
+        revision=revision,
+        local_files_only=local_files_only,
+    )
+    log_model_residency(model, phase="full merge load")
 
     logger.info(
         f"Running observer to collect activation+merging data for "

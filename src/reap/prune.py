@@ -1,4 +1,5 @@
 from __future__ import annotations
+import dataclasses
 import gc
 import logging
 import pathlib
@@ -31,6 +32,7 @@ from reap.residency import (
     estimate_model_bytes_from_config,
     estimate_model_bytes_from_module,
     load_causal_lm,
+    log_model_residency,
     plan_load,
     preflight_or_warn,
     resolve_residency,
@@ -221,35 +223,52 @@ def publish_pruned_model(
         logger.info("Running smoke test before publishing...")
         smoke_test_fn()
 
-    # Write to a staging directory next to the final path.
+    # Write to a staging directory next to the final path. Keep any existing
+    # published artifact until the staged artifact is complete and promotable.
+    import shutil
     import uuid
+
     pruned_model_dir = pathlib.Path(pruned_model_dir)
     stage = pruned_model_dir.parent / f".{pruned_model_dir.name}.tmp-{uuid.uuid4().hex[:8]}"
+    backup = pruned_model_dir.parent / f".{pruned_model_dir.name}.old-{uuid.uuid4().hex[:8]}"
+    promoted = False
+    moved_previous = False
     try:
-        stage.mkdir(parents=True, exist_ok=True)
+        stage.mkdir(parents=True, exist_ok=False)
         start = time.time()
         stream_save_pretrained(model, stage)
         tokenizer.save_pretrained(stage)
         if extra_yaml_args:
             from reap.pipeline import dump_args_to_yaml
+
             dump_args_to_yaml(stage, **extra_yaml_args)
-        end = time.time()
         logger.info(
-            "Pruned model saved to staging %s in %.2f seconds",
-            stage, end - start,
+            "Pruned model saved to staging %s in %.2f seconds", stage, time.time() - start
         )
-        # Atomically promote.
+
+        # Renames within a filesystem are atomic. Move a previous directory out
+        # of the way only after the replacement has been fully serialized, and
+        # restore it if promotion itself fails.
         if pruned_model_dir.exists():
-            import shutil
-            shutil.rmtree(pruned_model_dir)
+            pruned_model_dir.rename(backup)
+            moved_previous = True
         stage.rename(pruned_model_dir)
+        promoted = True
         logger.info("Published pruned model to %s", pruned_model_dir)
     except BaseException:
         if stage.exists():
-            import shutil
             shutil.rmtree(stage, ignore_errors=True)
             logger.warning("Staging directory %s cleaned up after failure", stage)
+        if moved_previous and not promoted and backup.exists():
+            backup.rename(pruned_model_dir)
+            logger.warning("Restored previous model after failed publication: %s", pruned_model_dir)
         raise
+    finally:
+        if promoted and backup.exists():
+            try:
+                shutil.rmtree(backup)
+            except OSError as exc:
+                logger.warning("Published model but could not remove backup %s: %s", backup, exc)
 
     return pruned_model_dir
 
@@ -299,10 +318,19 @@ def run(
     Honors ``reap_args.residency``. If resolved mode is ``layerwise``, delegates
     to :func:`reap.layerwise_prune.run`.
     """
+    source_model_name = str(model_args.model_name)
+    baseline_model_args = dataclasses.replace(model_args)
     tcr = bool(getattr(model_args, "trust_remote_code", False))
+    revision = getattr(model_args, "model_revision", None)
+    local_files_only = bool(getattr(model_args, "local_files_only", False))
     if _residency_resolved is None:
         residency = validate_residency(getattr(reap_args, "residency", "auto"))
-        model_bytes = estimate_model_bytes_from_config(model_args.model_name, trust_remote_code=tcr)
+        model_bytes = estimate_model_bytes_from_config(
+            model_args.model_name,
+            trust_remote_code=tcr,
+            revision=revision,
+            local_files_only=local_files_only,
+        )
         resolved, reason = resolve_residency(
             residency,
             model_bytes=model_bytes,
@@ -312,7 +340,12 @@ def run(
         preflight_or_warn(resolved, model_bytes)
     else:
         resolved = validate_residency(_residency_resolved)
-        model_bytes = estimate_model_bytes_from_config(model_args.model_name, trust_remote_code=tcr)
+        model_bytes = estimate_model_bytes_from_config(
+            model_args.model_name,
+            trust_remote_code=tcr,
+            revision=revision,
+            local_files_only=local_files_only,
+        )
         logger.info("Residency (pre-resolved): %s", resolved)
         preflight_or_warn(resolved, model_bytes)
 
@@ -341,10 +374,22 @@ def run(
     )
 
     model_name = model_args.model_name
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=tcr)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        trust_remote_code=tcr,
+        revision=revision,
+        local_files_only=local_files_only,
+    )
     plan = plan_load("cpu_full" if resolved == "cpu_full" else "gpu_full")
 
-    model = load_causal_lm(model_name, plan, trust_remote_code=tcr)
+    model = load_causal_lm(
+        model_name,
+        plan,
+        trust_remote_code=tcr,
+        revision=revision,
+        local_files_only=local_files_only,
+    )
+    log_model_residency(model, phase="full prune load")
     try:
         live_bytes = estimate_model_bytes_from_module(model)
         logger.info("Loaded model weight footprint ~%.2f GiB", live_bytes / 1024**3)
@@ -448,7 +493,14 @@ def run(
             torch.cuda.empty_cache()
         gc.collect()
         model_args.model_name = str(pruned_model_dir)
-        run_evaluate(model_args, pruned_model_dir / "eval", eval_args, reap_args.seed)
+        run_evaluate(
+            model_args,
+            pruned_model_dir / "eval",
+            eval_args,
+            reap_args.seed,
+            baseline_model_name=source_model_name if eval_args.eval_baseline else None,
+            baseline_model_args=baseline_model_args,
+        )
 
     return pruned_model_dir
 
