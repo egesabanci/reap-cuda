@@ -297,9 +297,12 @@ def record_activations(
 
     # Write aggregate (all categories combined in one observer).
     observer.save_state(aggregate_path)
+    # Capture the in-memory state BEFORE close_hooks() resets it. close_hooks()
+    # calls reset() which does ``del self.state; self.state = {}``, so calling
+    # report_state() afterwards would return {} and crash prune (StopIteration).
+    observer_data = observer.report_state()
     observer.close_hooks()
     log_triton_usage_summary()
-    observer_data = observer.report_state()
     return observer_data
 
 
