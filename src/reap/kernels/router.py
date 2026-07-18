@@ -7,6 +7,7 @@ construction stay in PyTorch for correctness across all ``top_k``.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -17,7 +18,9 @@ from reap.kernels.triton_softmax import softmax_rows
 @dataclass
 class RouterPairOutputs:
     selected_experts: torch.Tensor  # (T, k)
-    router_weights_full: torch.Tensor  # (T, E) softmax (+ optional renorm)
+    # Full (T, E) weight matrix for merge-criteria / external callers. ``None``
+    # when the caller requested prune-only mode (no full-weight allocation).
+    router_weights_full: Optional[torch.Tensor]
     pair_token_idx: torch.Tensor  # (T*k,)
     pair_expert_idx: torch.Tensor  # (T*k,)
     pair_router_w: torch.Tensor  # (T*k,)
@@ -200,6 +203,7 @@ def f5_router_from_module(
     *,
     top_k: int,
     valid_token_mask: torch.Tensor | None = None,
+    include_router_weights_full: bool = True,
 ) -> tuple[torch.Tensor, RouterPairOutputs]:
     """Build router pairs by calling the model's own router module.
 
@@ -210,6 +214,12 @@ def f5_router_from_module(
 
     Returns ``(router_logits_full, RouterPairOutputs)`` where
     ``router_logits_full`` is the raw ``(T, E)`` logits.
+
+    When *include_router_weights_full* is False (prune-only routed paths that
+    consume only ``pair_router_w`` / ``selected_experts`` / CSR data), the
+    ``(T, E)`` full normalization matrix is **not** materialized and
+    ``router_weights_full`` is set to ``None``. Full-weight behavior remains
+    the default for direct callers and merge/activation-materialization paths.
     """
     import inspect
 
@@ -261,13 +271,17 @@ def f5_router_from_module(
         )
 
     # Full (T, E) weights for merge-criteria metrics (prune-only ignores these).
-    act = _router_weight_activation(moe, adapter)
-    if act == "sigmoid":
-        router_weights_full = torch.sigmoid(router_logits_full.float()).to(device)
-    else:
-        router_weights_full = F.softmax(
-            router_logits_full, dim=-1, dtype=torch.float32
-        ).to(device)
+    # When the caller requests prune-only mode, skip the (T, E) allocation
+    # entirely; downstream routed consumers use pair_router_w / selected_experts.
+    router_weights_full: torch.Tensor | None = None
+    if include_router_weights_full:
+        act = _router_weight_activation(moe, adapter)
+        if act == "sigmoid":
+            router_weights_full = torch.sigmoid(router_logits_full.float()).to(device)
+        else:
+            router_weights_full = F.softmax(
+                router_logits_full, dim=-1, dtype=torch.float32
+            ).to(device)
 
     pair_token_idx = torch.arange(t, device=device).repeat_interleave(k)
     pair_expert_idx = selected_experts.reshape(-1)
@@ -280,7 +294,8 @@ def f5_router_from_module(
         pair_expert_idx = pair_expert_idx[keep]
         pair_router_w = pair_router_w[keep]
         selected_experts = selected_experts[mask]
-        router_weights_full = router_weights_full[mask]
+        if router_weights_full is not None:
+            router_weights_full = router_weights_full[mask]
 
     if pair_expert_idx.numel() == 0:
         pair_perm = pair_expert_idx

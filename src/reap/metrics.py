@@ -272,13 +272,23 @@ class OnlineStatsTracker:
 
         Args:
             new_mean (torch.Tensor): A tensor of new data to update state.
-            new_count (int | torch.Tensor): The count of new data points in the batch to
-                normalize the mean entires with.
+            new_count (int | torch.Tensor): The count of new data points in the
+                batch to normalize the mean entries with. May be a Python ``int``
+                (broadcast to ``count_shape``), a 0-D tensor, or a broadcastable
+                per-element tensor of shape ``count_shape``. Integer-count
+                arithmetic is preserved: the count stays ``torch.long`` and only
+                the weight expression promotes to ``self.dtype``.
         """
         # Prefer the incoming tensor device so GPU-resident updates never hop to CPU.
         if isinstance(new_mean, torch.Tensor) and new_mean.device != self.device:
             self.to(new_mean.device)
-        new_count = new_count.to(self.device, torch.long)
+        # Normalize scalar/int counts to a count tensor on the tracker's device
+        # and dtype so the Welford/Kahan arithmetic below is always well defined.
+        # ``torch.as_tensor`` preserves existing tensors (no copy) and lifts
+        # Python ints / 0-D tensors to the right device/shape for broadcasting.
+        new_count = torch.as_tensor(
+            new_count, device=self.count.device, dtype=self.count.dtype
+        )
         new_mean = new_mean.to(self.device, dtype=self.dtype)
 
         # Welford's algorithm

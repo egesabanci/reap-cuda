@@ -171,10 +171,6 @@ def _triton_frea_supported(
     act_fn: Callable,
     require_profitable_tiles: bool = False,
 ) -> tuple[bool, str]:
-    dev_scope = _device_key(flat_input.device)
-    disabled = is_component_disabled(_COMPONENT, scope=dev_scope)
-    if disabled:
-        return False, f"disabled: {disabled}"
     if not _is_silu(act_fn):
         return False, "non-SiLU activation"
     if not triton_runtime_available():
@@ -187,6 +183,13 @@ def _triton_frea_supported(
     if h < _MIN_DOT or i_dim < _MIN_DOT:
         return False, f"dims H={h}, I={i_dim} below Triton tl.dot floor {_MIN_DOT}"
     blocks = choose_frea_block_sizes(h, i_dim, device=flat_input.device)
+    # Capability-scoped disable check: a resource failure for one
+    # (device, dtype, H, I, tile) configuration must not poison a compatible
+    # configuration on the same GPU.
+    cap_scope = _capability_key(flat_input, W_gate, blocks)
+    disabled = is_component_disabled(_COMPONENT, scope=cap_scope)
+    if disabled:
+        return False, f"disabled: {disabled}"
     if blocks is None:
         limit = device_shared_memory_bytes(flat_input.device, prefer_optin=True)
         return (
@@ -207,6 +210,34 @@ def _probe_key(flat_input: torch.Tensor, W_gate: torch.Tensor) -> tuple[str, int
     idx = dev.index if dev.type == "cuda" else None
     _e, i_dim, h = W_gate.shape
     return (dev.type, idx, str(flat_input.dtype), int(h), int(i_dim))
+
+
+def _capability_key(
+    flat_input: torch.Tensor,
+    W_gate: torch.Tensor,
+    blocks: tuple[int, int, int] | None,
+) -> str:
+    """Deterministic FREA capability scope for permanent-disable memoization.
+
+    Encodes only launch-resource determinants: CUDA device identity, flat-input
+    dtype, stacked-weight dtype, ``H``, ``I``, and the chosen tile tuple
+    ``(BLOCK_H, BLOCK_I, BLOCK_N)``. When *blocks* is None (no tile fits the
+    device shared-memory budget), the tile component is empty — that capability
+    is (device, dtype, H, I) with no viable tile.
+
+    Excludes batch-varying data (pair count, token count) so the memo remains
+    effective across batches. A resource failure for one configuration
+    suppresses only that configuration; a compatible configuration on the same
+    GPU remains usable.
+    """
+    dev = flat_input.device
+    idx = dev.index if dev.type == "cuda" else None
+    _e, i_dim, h = W_gate.shape
+    tile = blocks if blocks is not None else ()
+    return (
+        f"{_COMPONENT}|{dev.type}|{idx}|{flat_input.dtype}|"
+        f"{W_gate.dtype}|{int(h)}|{int(i_dim)}|{tile}"
+    )
 
 
 def _run_probe(
@@ -391,12 +422,22 @@ def frea_triton_activations(
     )
     if not ok:
         log_triton_fallback(_COMPONENT, reason)
-        dev_scope = _device_key(flat_input.device)
-        if "shared mem" in reason and not is_component_disabled(_COMPONENT, scope=dev_scope):
-            disable_component(_COMPONENT, reason, scope=dev_scope)
+        # Capability-scoped disable: only the (device, dtype, H, I, tile)
+        # configuration that failed is memoized, so a compatible configuration
+        # on the same GPU remains usable.
+        if "shared mem" in reason:
+            _e, i_dim, h = W_gate.shape
+            blocks = choose_frea_block_sizes(h, i_dim, device=flat_input.device)
+            cap_scope = _capability_key(flat_input, W_gate, blocks)
+            if not is_component_disabled(_COMPONENT, scope=cap_scope):
+                disable_component(_COMPONENT, reason, scope=cap_scope)
         return routed_expert_activations_grouped(
             flat_input, router_pairs, W_gate, W_up, W_down, act_fn=act_fn
         )
+    # Compute the launch blocks for capability-scoped disable on launch failure.
+    _e, i_dim, h = W_gate.shape
+    launch_blocks = choose_frea_block_sizes(h, i_dim, device=flat_input.device)
+    cap_scope = _capability_key(flat_input, W_gate, launch_blocks)
     try:
         out = _frea_triton_impl(flat_input, router_pairs, W_gate, W_up, W_down)
         record_triton_ok(_COMPONENT)
@@ -404,11 +445,19 @@ def frea_triton_activations(
     except Exception as exc:  # pragma: no cover
         msg = str(exc)
         log_triton_fallback(_COMPONENT, msg)
-        dev_scope = _device_key(flat_input.device)
         if "shared memory" in msg.lower() or "out of resource" in msg.lower():
-            # Disable opt-in path for this device and retry once with default SM tiles.
+            # Disable the capability that actually failed (original launch tile).
+            if not is_component_disabled(_COMPONENT, scope=cap_scope):
+                disable_component(_COMPONENT, msg, scope=cap_scope)
+            # Retry once with default SM tiles (opt-in disabled). The retry
+            # uses a distinct launch configuration; derive and check its own
+            # capability key rather than poisoning the original configuration.
             if _get_smem_optin(flat_input.device) is not False:
                 _set_smem_optin(flat_input.device, False)
+                retry_blocks = choose_frea_block_sizes(
+                    h, i_dim, device=flat_input.device
+                )
+                retry_scope = _capability_key(flat_input, W_gate, retry_blocks)
                 try:
                     out = _frea_triton_impl(
                         flat_input, router_pairs, W_gate, W_up, W_down
@@ -418,7 +467,8 @@ def frea_triton_activations(
                 except Exception as exc2:
                     msg = str(exc2)
                     log_triton_fallback(_COMPONENT, msg)
-            disable_component(_COMPONENT, msg, scope=dev_scope)
+                    if not is_component_disabled(_COMPONENT, scope=retry_scope):
+                        disable_component(_COMPONENT, msg, scope=retry_scope)
         return routed_expert_activations_grouped(
             flat_input, router_pairs, W_gate, W_up, W_down, act_fn=act_fn
         )

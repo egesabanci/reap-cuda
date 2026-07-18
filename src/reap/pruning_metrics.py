@@ -196,12 +196,24 @@ def update_pruning_state(
     num_experts: int,
     valid_token_mask: Optional[torch.Tensor] = None,
     renormalize_router_weights: bool = False,
+    selected_router_weights: Optional[torch.Tensor] = None,
 ) -> PreparedPruningBatch:
     """Accumulate pruning saliency from a dense ``(E, T, H)`` activation tensor.
 
     Preferred for the legacy ``loop`` backend. Prefer
     :func:`update_pruning_state_routed` for bmm/FREA/F2 (no ``(E,T,H)``).
     All reductions stay on the activations device.
+
+    When *selected_router_weights* is supplied (shape ``(T, top_k)``), the
+    dense update uses these native-router-selected weights directly for the
+    router-weighted saliency statistics (``weighted_frequency_sum``,
+    ``weighted_ean_sum``, and the router-weighted REAP samples). Their pair
+    ordering must exactly align with *selected_experts*. The logits/softmax
+    derivation is retained only as the backward-compatible fallback for
+    callers that do not supply native selected weights (standard softmax
+    routers); a supplied native-router result must not be overridden.
+    Unweighted metrics (``expert_frequency``, EAN, EAN mean, max activation,
+    pair frequency, and token count) preserve their existing behavior.
     """
     pruning_batch = _prepare_pruning_batch(
         activations=activations,
@@ -213,6 +225,48 @@ def update_pruning_state(
 
     device = pruning_batch.activations.device
     move_pruning_state_to_device(layer_state, device)
+
+    # Validate optional native-router selected weights against the prepared
+    # batch before any metric is touched so a contract violation cannot corrupt
+    # the layer state. ``selected_router_weights`` arrives in (T, top-k) order
+    # aligned with ``pruning_batch.selected_experts``.
+    use_native_selected_weights = False
+    if selected_router_weights is not None:
+        # Apply the same ``valid_token_mask`` used inside
+        # ``_prepare_pruning_batch`` to ``selected_router_weights`` so its
+        # token axis matches the already-filtered ``pruning_batch.selected_experts``
+        # before the shape comparison below. The mask is validated against the
+        # original (pre-mask) token dimension shared with ``selected_experts``;
+        # no reshaping, broadcasting, or fallback is introduced. The unmasked
+        # path (``valid_token_mask is None``) is left untouched.
+        if valid_token_mask is not None:
+            mask = valid_token_mask.reshape(-1).bool().to(
+                selected_router_weights.device
+            )
+            if selected_router_weights.shape[0] != mask.shape[0]:
+                raise ValueError(
+                    "valid_token_mask and selected_router_weights token counts "
+                    f"do not match: mask={mask.shape[0]} vs "
+                    f"selected_router_weights={selected_router_weights.shape[0]}"
+                )
+            selected_router_weights = selected_router_weights[mask]
+        if selected_router_weights.shape != pruning_batch.selected_experts.shape:
+            raise ValueError(
+                "selected_router_weights shape "
+                f"{tuple(selected_router_weights.shape)} != selected_experts "
+                f"{tuple(pruning_batch.selected_experts.shape)}"
+            )
+        if selected_router_weights.device != device:
+            raise ValueError(
+                "selected_router_weights must share the activations device "
+                f"({device}); got {selected_router_weights.device}"
+            )
+        if not torch.is_floating_point(selected_router_weights):
+            raise ValueError(
+                "selected_router_weights must be a floating-point tensor"
+            )
+        selected_router_weights = selected_router_weights.to(device)
+        use_native_selected_weights = True
 
     layer_state["total_tokens"] = layer_state["total_tokens"] + pruning_batch.num_tokens
     layer_state["expert_frequency"] = (
@@ -231,33 +285,56 @@ def update_pruning_state(
     )
     batch_max = torch.zeros(num_experts, device=device, dtype=torch.float32)
 
-    routing_weights = F.softmax(
-        pruning_batch.router_logits, dim=1, dtype=torch.float
-    ).to(device)
-    if renormalize_router_weights and pruning_batch.selected_experts.numel() > 0:
-        topk_weights = torch.gather(
-            routing_weights,
-            1,
-            pruning_batch.selected_experts,
-        )
-        routing_weights = routing_weights / topk_weights.sum(dim=-1, keepdim=True)
-        routing_weights = torch.clamp(
-            routing_weights, min=torch.finfo(routing_weights.dtype).eps
-        )
+    # Router-weighted statistics. When native-router selected weights are
+    # supplied, they are authoritative and are gathered per (token, top-k) pair
+    # to align exactly with the dense activations. Otherwise derive weights
+    # from logits via softmax (backward-compatible fallback for standard
+    # softmax routers; must not override a supplied native-router result).
+    if use_native_selected_weights:
+        # routing_weights_per_pair: (T, top_k) aligned with selected_experts.
+        routing_weights_per_pair = selected_router_weights.to(torch.float32)
+        if renormalize_router_weights and pruning_batch.selected_experts.numel() > 0:
+            pair_sum = routing_weights_per_pair.sum(dim=-1, keepdim=True).clamp_min(
+                torch.finfo(routing_weights_per_pair.dtype).eps
+            )
+            routing_weights_per_pair = routing_weights_per_pair / pair_sum
+    else:
+        routing_weights = F.softmax(
+            pruning_batch.router_logits, dim=1, dtype=torch.float
+        ).to(device)
+        if renormalize_router_weights and pruning_batch.selected_experts.numel() > 0:
+            topk_weights = torch.gather(
+                routing_weights,
+                1,
+                pruning_batch.selected_experts,
+            )
+            routing_weights = routing_weights / topk_weights.sum(dim=-1, keepdim=True)
+            routing_weights = torch.clamp(
+                routing_weights, min=torch.finfo(routing_weights.dtype).eps
+            )
+        routing_weights_per_pair = torch.gather(
+            routing_weights, 1, pruning_batch.selected_experts
+        ).to(torch.float32)
 
     for i in range(num_experts):
-        active_mask = (pruning_batch.selected_experts == i).any(dim=-1)
+        # ``expert_mask`` is (T,) True for tokens that route to expert i in any
+        # top-k slot. ``slot_mask`` is (T, top_k) True for the (token, slot)
+        # pairs that select expert i, so gathering per-pair weights matches the
+        # routed CSR construction exactly (no broadcasting across unselected
+        # experts).
+        slot_mask = pruning_batch.selected_experts == i
+        active_mask = slot_mask.any(dim=-1)
         if not active_mask.any():
             continue
 
         selected_activations = pruning_batch.activations[i, active_mask, :]
-        active_router_weights = routing_weights[active_mask, i]
+        active_pair_weights = routing_weights_per_pair[active_mask][slot_mask[active_mask]]
         ean_norm = torch.linalg.norm(selected_activations.float(), dim=-1)
         ean_sum[i] = ean_norm.sum().to(torch.float64)
         ean_mean[i] = ean_norm.mean().to(torch.float32)
-        weighted_expert_frequency_sum[i] = active_router_weights.sum().to(torch.float64)
-        weighted_ean_sum[i] = (ean_norm * active_router_weights).sum().to(torch.float64)
-        reap[i] = (ean_norm * active_router_weights).mean().to(torch.float32)
+        weighted_expert_frequency_sum[i] = active_pair_weights.sum().to(torch.float64)
+        weighted_ean_sum[i] = (ean_norm * active_pair_weights).sum().to(torch.float64)
+        reap[i] = (ean_norm * active_pair_weights).mean().to(torch.float32)
         batch_max[i] = selected_activations.float().max()
 
     layer_state["ean_sum"] = layer_state["ean_sum"] + ean_sum

@@ -60,21 +60,39 @@ def compute_fused_expert_activations(
 
     Uses F4 weight stacks so Llama4 bmm and Qwen/LFM2 linear layouts both work.
     Kept for tests / external callers; observers go through :func:`observe_moe_batch`.
+
+    Routing: native-router-capable MoEs (sigmoid+bias families such as LFM2)
+    are routed through :func:`f5_router_from_module` so the model's own selected
+    indices and selected weights are authoritative — the implicit "all routers
+    are softmax(logits)" assumption is removed. Standard softmax routers stay
+    on the existing softmax+topk path. ``router_logits`` is always the raw
+    ``(T, E)`` logits; the selected weights for native routers are recoverable
+    from ``pairs.pair_router_w`` (see :func:`observe_moe_batch`).
     """
-    from reap.kernels.router import extract_router_logits, f5_router
+    from reap.kernels.router import (
+        extract_router_logits,
+        f5_router,
+        f5_router_from_module,
+        prefers_native_router,
+    )
     from reap.kernels.weight_cache import get_stacked_expert_weights
     from reap.kernels.bmm import (
         routed_expert_activations_grouped,
         materialize_sparse_activations,
     )
 
-    router = getattr(module, adapter.router_attr(), None) or getattr(
-        module, "router", None
-    ) or getattr(module, "gate", None)
-    if router is None:
-        raise ValueError("No router on MoE module")
-    router_logits = extract_router_logits(router, flat_input)
-    pairs = f5_router(router_logits, top_k, norm_topk_prob=False)
+    if prefers_native_router(module, adapter):
+        router_logits, pairs = f5_router_from_module(
+            module, adapter, flat_input, top_k=top_k, valid_token_mask=None
+        )
+    else:
+        router = getattr(module, adapter.router_attr(), None) or getattr(
+            module, "router", None
+        ) or getattr(module, "gate", None)
+        if router is None:
+            raise ValueError("No router on MoE module")
+        router_logits = extract_router_logits(router, flat_input)
+        pairs = f5_router(router_logits, top_k, norm_topk_prob=False)
     stacked = get_stacked_expert_weights(module, adapter, device=flat_input.device)
     pair_out = routed_expert_activations_grouped(
         flat_input,

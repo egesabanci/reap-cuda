@@ -94,18 +94,54 @@ def test_f4_cache_dtype_mismatch_rebuilds():
     free_cache()
 
 
-def test_f4_cache_dtype_none_accepts_cached():
-    """When dtype=None, accept whatever is cached (caller does not care)."""
+def test_f4_cache_dtype_none_resolves_to_source_native():
+    """An omitted dtype after a converted entry must rebuild to source-native.
+
+    Replaces the prior wildcard-cache regression: a ``dtype=torch.float16``
+    call followed by ``dtype=None`` must return the source-weight dtype
+    (fp32 from ``nn.Parameter``) rather than reusing the cached fp16 stack.
+    """
     free_cache()
     moe = _QwenMoe(e=4, h=8, i=4)
     adapter = Qwen3MoeModelAdapter()
 
-    s1 = get_stacked_expert_weights(moe, adapter, dtype=torch.float16)
-    assert s1["W_gate"].dtype == torch.float16
+    # First request: explicit float16 — builds and caches the converted stack.
+    s_fp16 = get_stacked_expert_weights(moe, adapter, dtype=torch.float16)
+    assert s_fp16["W_gate"].dtype == torch.float16
+    assert s_fp16["_resolved_dtype"] == torch.float16
+    assert s_fp16["W_gate"].device == moe.experts.gate_up_proj.device
 
-    # dtype=None should accept the cached fp16 representation.
-    s2 = get_stacked_expert_weights(moe, adapter)
+    # Second request: dtype=None resolves to the source-weight dtype (fp32).
+    # It must NOT reuse the cached fp16 representation.
+    s_native = get_stacked_expert_weights(moe, adapter)
+    assert s_native["W_gate"].dtype == torch.float32
+    assert s_native["_resolved_dtype"] == torch.float32
+    assert s_native["W_gate"].device == moe.experts.gate_up_proj.device
+    # The native stack is not the converted representation.
+    assert s_native is not s_fp16
+    assert not torch.equal(
+        s_native["W_gate"], s_fp16["W_gate"].to(torch.float32)
+    ) or s_native["W_gate"].dtype != s_fp16["W_gate"].dtype
+
+    free_cache()
+
+
+def test_f4_cache_native_converted_native_sequence():
+    """Native -> converted -> native must produce fp32, fp16, fp32 in order."""
+    free_cache()
+    moe = _QwenMoe(e=4, h=8, i=4)
+    adapter = Qwen3MoeModelAdapter()
+
+    s1 = get_stacked_expert_weights(moe, adapter)
+    assert s1["W_gate"].dtype == torch.float32
+
+    s2 = get_stacked_expert_weights(moe, adapter, dtype=torch.float16)
     assert s2["W_gate"].dtype == torch.float16
+
+    s3 = get_stacked_expert_weights(moe, adapter)
+    assert s3["W_gate"].dtype == torch.float32
+    # The final native stack is not the converted representation object.
+    assert s3 is not s2
 
     free_cache()
 

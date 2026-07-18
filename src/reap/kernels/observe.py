@@ -29,19 +29,35 @@ def _loop_activations(
     top_k: int,
     act_fn: Callable,
     fused: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Legacy full-expert activation path (parity oracle).
 
     Routing uses the model router when softmax+topk would be wrong
     (``prefers_native_router``); otherwise top-k on raw logits as historically.
+
+    Returns ``(activations, selected_experts, router_logits, selected_router_weights)``
+    where ``selected_router_weights`` is ``(T, k)`` for native routers (the
+    model-returned selected weights in token/top-k order) and ``None`` for
+    standard softmax routers (the dense update will derive weights from logits).
     """
     device = flat_input.device
+    selected_router_weights: torch.Tensor | None = None
 
     if prefers_native_router(moe, adapter):
         router_logits, pairs = f5_router_from_module(
             moe, adapter, flat_input, top_k=top_k, valid_token_mask=None
         )
         selected_experts = pairs.selected_experts
+        # Recover (T, k) selected weights in token-major order from the
+        # expert-sorted pair arrays. ``pair_perm`` sorts pairs by expert; its
+        # inverse restores token-major order so weights align exactly with
+        # ``selected_experts`` (same (token, top-k) pairing).
+        if pairs.pair_perm.numel() > 0:
+            inv_perm = torch.argsort(pairs.pair_perm, stable=True)
+            k = int(selected_experts.shape[-1])
+            selected_router_weights = (
+                pairs.pair_router_w[inv_perm].reshape(-1, k).to(device)
+            )
     else:
         router = (
             getattr(moe, adapter.router_attr(), None)
@@ -76,7 +92,7 @@ def _loop_activations(
             activations[idx] = expert(flat_input).to(device)
 
     free_cache(moe)
-    return activations, selected_experts, router_logits
+    return activations, selected_experts, router_logits, selected_router_weights
 
 
 def observe_moe_batch(
@@ -120,8 +136,10 @@ def observe_moe_batch(
     from reap.kernels.triton_utils import triton_runtime_available
 
     if backend == "loop":
-        activations, selected_experts, router_logits = _loop_activations(
-            moe, adapter, flat_input, num_experts, top_k, act_fn, fused
+        activations, selected_experts, router_logits, selected_router_weights = (
+            _loop_activations(
+                moe, adapter, flat_input, num_experts, top_k, act_fn, fused
+            )
         )
         pruning_batch = update_pruning_state(
             layer_state,
@@ -131,6 +149,7 @@ def observe_moe_batch(
             num_experts=num_experts,
             valid_token_mask=valid_token_mask,
             renormalize_router_weights=renormalize_router_weights,
+            selected_router_weights=selected_router_weights,
         )
         return {
             "activations": pruning_batch.activations,
@@ -152,12 +171,17 @@ def observe_moe_batch(
 
     # Model-agnostic: use native router when softmax+topk would be wrong.
     if prefers_native_router(moe, adapter):
+        # Prune-only routed paths consume pair_router_w / selected_experts / CSR
+        # only; skip the (T, E) full normalization allocation when merge/merge-
+        # criteria metrics are not requested.
+        include_full = not record_pruning_metrics_only
         router_logits_full, router_pairs = f5_router_from_module(
             moe,
             adapter,
             flat_input,
             top_k=top_k,
             valid_token_mask=valid_token_mask,
+            include_router_weights_full=include_full,
         )
     else:
         router_logits_full = extract_router_logits(

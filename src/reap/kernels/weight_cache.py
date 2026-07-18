@@ -38,6 +38,21 @@ def cache_size() -> int:
     return 1 if _CACHED_STACK is not None else 0
 
 
+def _source_expert_weight(moe: nn.Module, attrs: dict[str, Any]) -> torch.Tensor:
+    """Return one canonical source expert-weight tensor for this MoE layer.
+
+    Used to resolve caller-omitted ``device`` / ``dtype`` to the source-native
+    representation before cache matching. Fused and non-fused layouts are both
+    handled; the returned tensor is the first expert's gate/up weight (any of
+    gate/up/down would carry the same source dtype/device for a given layer).
+    """
+    if attrs["fused"]:
+        exps = getattr(moe, attrs["experts"])
+        return exps.gate_up_proj
+    experts = getattr(moe, attrs["experts"])
+    return getattr(experts[0], attrs["gate_proj"]).weight
+
+
 def get_stacked_expert_weights(
     moe: nn.Module,
     adapter: Any,
@@ -52,14 +67,30 @@ def get_stacked_expert_weights(
     """
     global _CACHED_MOE_ID, _CACHED_STACK
 
+    # Resolve caller omissions against the canonical source-weight
+    # representation of this MoE layer, so that an omitted device/dtype can
+    # never wildcard-match a previously cached converted representation.
+    attrs = adapter.expert_weight_attrs(moe)
+    convention = attrs.get("weight_convention") or getattr(
+        adapter, "weight_convention", lambda: "linear"
+    )()
+    if callable(convention):
+        convention = convention()
+
+    source_weight = _source_expert_weight(moe, attrs)
+    requested_device = (
+        torch.device(device) if device is not None else source_weight.device
+    )
+    requested_dtype = dtype if dtype is not None else source_weight.dtype
+
     if _CACHED_STACK is not None and id(moe) == _CACHED_MOE_ID:
         cached_device = _CACHED_STACK["_resolved_device"]
         cached_dtype = _CACHED_STACK["_resolved_dtype"]
-        # A cache hit is legal only when the requested representation matches
-        # the resolved representation used to build the cached stacks.
-        dev_ok = device is None or cached_device == device
-        dt_ok = dtype is None or cached_dtype == dtype
-        if dev_ok and dt_ok:
+        # A cache hit requires an exact match on the fully resolved
+        # representation (device + dtype). Omitted values are resolved to the
+        # source-native representation above, so a converted entry cannot be
+        # reused by a source-native lookup.
+        if cached_device == requested_device and cached_dtype == requested_dtype:
             return _CACHED_STACK
         # Representation mismatch (device or dtype changed) — rebuild.
         _CACHED_MOE_ID = None
@@ -69,13 +100,6 @@ def get_stacked_expert_weights(
     if _CACHED_STACK is not None:
         _CACHED_MOE_ID = None
         _CACHED_STACK = None
-
-    attrs = adapter.expert_weight_attrs(moe)
-    convention = attrs.get("weight_convention") or getattr(
-        adapter, "weight_convention", lambda: "linear"
-    )()
-    if callable(convention):
-        convention = convention()
 
     if attrs["fused"]:
         exps = getattr(moe, attrs["experts"])
@@ -105,10 +129,10 @@ def get_stacked_expert_weights(
             [getattr(e, attrs["down_proj"]).weight for e in experts]
         )
 
-    if device is not None or dtype is not None:
-        W_gate = W_gate.to(device=device or W_gate.device, dtype=dtype or W_gate.dtype)
-        W_up = W_up.to(device=device or W_up.device, dtype=dtype or W_up.dtype)
-        W_down = W_down.to(device=device or W_down.device, dtype=dtype or W_down.dtype)
+    if requested_device != source_weight.device or requested_dtype != source_weight.dtype:
+        W_gate = W_gate.to(device=requested_device, dtype=requested_dtype)
+        W_up = W_up.to(device=requested_device, dtype=requested_dtype)
+        W_down = W_down.to(device=requested_device, dtype=requested_dtype)
 
     # Detach from autograd to drop memory overhead (observer runs under no_grad).
     W_gate = W_gate.detach()

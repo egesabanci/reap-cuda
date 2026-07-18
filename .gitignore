@@ -9,6 +9,9 @@ wheels/
 .coverage
 htmlcov/
 
+# pi subagent artifacts
+.pi-subagents/
+
 # Virtual environments
 .venv
 
