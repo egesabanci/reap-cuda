@@ -147,6 +147,28 @@ Never call a Triton kernel without a PyTorch path. Dispatch helpers:
 - `select_observe_backend(...)`
 - Per-kernel try/except → `log_triton_fallback(...)`
 
+## Deferred redesigns (not shipped)
+
+The following high-risk kernel redesigns are **intentionally deferred** and
+not implemented in the current codebase:
+
+- **Single-launch CSR FREA**: The per-expert Python loop in `triton_frea.py`
+  remains. A single CSR launch requires a new grid mapping from program IDs to
+  variable-length CSR segments, per-program expert-weight addressing, tuning
+  across routing imbalance, and a performance study.
+- **Multi-tile F5 softmax**: `triton_softmax.py` falls back to `F.softmax` for
+  `E > 1024`. A multi-tile online softmax needs numerically stable multi-pass
+  reduction, workspace management, and wide-MoE parity/stress tests.
+- **In-kernel Welford fusion**: `OnlineStatsTracker` updates stay in PyTorch;
+  fusing them into F2 changes cross-batch reduction semantics.
+- **F2 grid redesign**: The one-program-per-pair grid is simple but can suffer
+  from atomic contention on skewed routing.
+- **Cache thread-safety**: `_STACK_CACHE` and FREA global state are not
+  thread-safe for `DataParallel`/DDP.
+
+See [07-validation-strategy.md](07-validation-strategy.md) for the test matrix
+and deferred-design prerequisites.
+
 ## Environment
 
 | | Dev (Apple Silicon) | EC2 |

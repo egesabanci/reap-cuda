@@ -38,11 +38,30 @@ Tiny models in unit tests (H=8) always use PyTorch.
 
 | Mode | Behavior |
 | --- | --- |
-| `auto` | Empirical probe: warm-up + time Triton vs cuBLAS; memoize winner per `(device,H,I)` |
+| `auto` | Empirical probe: warm-up + time Triton vs cuBLAS; memoize winner per `(device_type, device_index, dtype, H, I)` |
 | `triton` | Force Triton when supported |
 | `pytorch` | Force grouped `F.linear` |
 
 Env: `REAP_FREA_BACKEND`, `REAP_FREA_PROBE=0` (static tile-floor instead of probe).
+
+The probe key is scoped by **device identity and input dtype** so a decision
+for one GPU or precision does not leak to another. Shared-memory opt-in state
+(`_USE_SMEM_OPTIN`) and permanent disable memos are likewise **per-device**.
+
+When the support check fails (CPU input, non-SiLU, disabled, etc.), the probe
+returns ``pytorch`` immediately — **no timing, no CUDA sync, no memoization**.
+
+Probe timing uses **CUDA events** on the launch device (falling back to
+``torch.cuda.synchronize(device)`` when events are unavailable) so unrelated
+streams are not globally synchronized. Warm-up launches are stream-ordered
+before the timed region, so no explicit synchronize is needed between
+warm-up and timing when events are used. The wall-clock fallback path uses a
+narrowly scoped ``torch.cuda.synchronize(device)`` only around the timed
+interval.
+
+CSR expert offsets are bulk-transferred to host once via `.tolist()`
+before the per-expert Python loop, eliminating O(E) scalar `.item()`
+synchronizations.
 
 See [frea-throughput.md](../frea-throughput.md): on L4, Triton can launch with
 opt-in tiles yet remain **~1.9× slower** than cuBLAS; the probe correctly

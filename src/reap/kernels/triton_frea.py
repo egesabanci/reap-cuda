@@ -51,10 +51,11 @@ FREA_BACKENDS: tuple[str, ...] = ("auto", "triton", "pytorch")
 
 # Process-level override (CLI / set_frea_backend). Env wins if set.
 _FREA_BACKEND: str = "auto"
-# Memo: (device_index, h, i_dim) -> "triton" | "pytorch"
-_PROBE_CHOICE: dict[tuple[int | None, int, int], str] = {}
-# Prefer opt-in SM budget after a successful large-tile launch; clear on failure.
-_USE_SMEM_OPTIN: bool | None = None
+# Memo: (device_type, device_index, dtype, h, i_dim) -> "triton" | "pytorch"
+_PROBE_CHOICE: dict[tuple[str, int | None, str, int, int], str] = {}
+# Prefer opt-in SM budget per device after a successful large-tile launch; clear on failure.
+# Keyed by str(device) so different GPUs track opt-in independently.
+_USE_SMEM_OPTIN: dict[str, bool | None] = {}
 
 
 def set_frea_backend(mode: str) -> str:
@@ -75,10 +76,9 @@ def get_frea_backend() -> str:
 
 
 def reset_frea_probe_cache() -> None:
-    """Clear profitability probe memo (tests)."""
-    global _USE_SMEM_OPTIN
+    """Clear profitability probe memo and SM opt-in state (tests)."""
     _PROBE_CHOICE.clear()
-    _USE_SMEM_OPTIN = None
+    _USE_SMEM_OPTIN.clear()
 
 
 def _is_silu(act_fn: Callable) -> bool:
@@ -92,6 +92,23 @@ def estimate_frea_shared_bytes(block_n: int, block_h: int, block_i: int) -> int:
 
 def _smem_budget(device: torch.device | None, *, prefer_optin: bool) -> int | None:
     return device_shared_memory_bytes(device, prefer_optin=prefer_optin)
+
+
+def _device_key(device: torch.device | None) -> str:
+    """Stable string key for per-device state maps."""
+    if device is None:
+        return "cpu"
+    return str(device)
+
+
+def _get_smem_optin(device: torch.device | None) -> bool | None:
+    """Get the per-device SM opt-in state (None = not yet determined)."""
+    return _USE_SMEM_OPTIN.get(_device_key(device))
+
+
+def _set_smem_optin(device: torch.device | None, value: bool | None) -> None:
+    """Set the per-device SM opt-in state."""
+    _USE_SMEM_OPTIN[_device_key(device)] = value
 
 
 def choose_frea_block_sizes(
@@ -110,7 +127,7 @@ def choose_frea_block_sizes(
     device reports enough opt-in budget — **not** on L4/T4-class.
     """
     if prefer_optin is None:
-        prefer_optin = _USE_SMEM_OPTIN is not False
+        prefer_optin = _get_smem_optin(device) is not False
 
     for use_optin in ((True, False) if prefer_optin else (False,)):
         smem = _smem_budget(device, prefer_optin=use_optin)
@@ -154,7 +171,8 @@ def _triton_frea_supported(
     act_fn: Callable,
     require_profitable_tiles: bool = False,
 ) -> tuple[bool, str]:
-    disabled = is_component_disabled(_COMPONENT)
+    dev_scope = _device_key(flat_input.device)
+    disabled = is_component_disabled(_COMPONENT, scope=dev_scope)
     if disabled:
         return False, f"disabled: {disabled}"
     if not _is_silu(act_fn):
@@ -184,10 +202,11 @@ def _triton_frea_supported(
     return True, ""
 
 
-def _probe_key(flat_input: torch.Tensor, W_gate: torch.Tensor) -> tuple[int | None, int, int]:
-    idx = flat_input.device.index if flat_input.device.type == "cuda" else None
+def _probe_key(flat_input: torch.Tensor, W_gate: torch.Tensor) -> tuple[str, int | None, str, int, int]:
+    dev = flat_input.device
+    idx = dev.index if dev.type == "cuda" else None
     _e, i_dim, h = W_gate.shape
-    return (idx, int(h), int(i_dim))
+    return (dev.type, idx, str(flat_input.dtype), int(h), int(i_dim))
 
 
 def _run_probe(
@@ -222,31 +241,87 @@ def _run_probe(
     ok, reason = _triton_frea_supported(
         flat_input, W_gate, act_fn=act_fn, require_profitable_tiles=False
     )
+    # If Triton is structurally unsupported (CPU, disabled, non-SiLU, etc.),
+    # return PyTorch immediately — no timing, no CUDA sync, no memoization.
+    # The support check is cheap and deterministic per scope, so re-checking on
+    # later calls is harmless.
+    if not ok:
+        logger.info(
+            "FREA profitability probe: triton unsupported (%s) -> pytorch",
+            reason,
+        )
+        return "pytorch"
+
+    dev = flat_input.device
     t_tr = float("inf")
     if ok:
         try:
-            # Warm-up (JIT + first-touch); not timed.
+            # Warm-up (JIT + first-touch); not timed. Stream-ordered before
+            # the timed launch, so no explicit synchronize is needed when CUDA
+            # events will provide timing.
             _ = _frea_triton_impl(flat_input, router_pairs, W_gate, W_up, W_down)
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            _ = _frea_triton_impl(flat_input, router_pairs, W_gate, W_up, W_down)
-            torch.cuda.synchronize()
-            t_tr = time.perf_counter() - t0
+
+            # Use CUDA events on the launch device for timing instead of
+            # global torch.cuda.synchronize() so unrelated streams are not
+            # disrupted. Fall back to wall-clock + device-scoped sync if events fail.
+            use_events = dev.type == "cuda"
+            if use_events:
+                try:
+                    start_evt = torch.cuda.Event(enable_timing=True)
+                    end_evt = torch.cuda.Event(enable_timing=True)
+                    start_evt.record(stream=torch.cuda.current_stream(dev))
+                    _ = _frea_triton_impl(
+                        flat_input, router_pairs, W_gate, W_up, W_down
+                    )
+                    end_evt.record(stream=torch.cuda.current_stream(dev))
+                    end_evt.synchronize()
+                    t_tr = start_evt.elapsed_time(end_evt) / 1000.0  # ms -> s
+                except Exception:
+                    use_events = False
+            if not use_events:
+                # Wall-clock fallback: narrow device-scoped sync only.
+                torch.cuda.synchronize(dev)
+                t0 = time.perf_counter()
+                _ = _frea_triton_impl(
+                    flat_input, router_pairs, W_gate, W_up, W_down
+                )
+                torch.cuda.synchronize(dev)
+                t_tr = time.perf_counter() - t0
         except Exception as exc:  # pragma: no cover
             logger.debug("FREA probe Triton failed: %s", exc)
             t_tr = float("inf")
 
-    # Warm-up PyTorch path too (allocator / autotune noise).
+    # Warm-up PyTorch path too (allocator / autotune noise). Stream-ordered
+    # before the timed launch, so no explicit synchronize needed when events
+    # will provide timing.
     _ = routed_expert_activations_grouped(
         flat_input, router_pairs, W_gate, W_up, W_down, act_fn=act_fn
     )
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-    _ = routed_expert_activations_grouped(
-        flat_input, router_pairs, W_gate, W_up, W_down, act_fn=act_fn
-    )
-    torch.cuda.synchronize()
-    t_py = time.perf_counter() - t0
+
+    # Time PyTorch path with CUDA events when possible.
+    use_events_py = dev.type == "cuda"
+    if use_events_py:
+        try:
+            start_py = torch.cuda.Event(enable_timing=True)
+            end_py = torch.cuda.Event(enable_timing=True)
+            start_py.record(stream=torch.cuda.current_stream(dev))
+            _ = routed_expert_activations_grouped(
+                flat_input, router_pairs, W_gate, W_up, W_down, act_fn=act_fn
+            )
+            end_py.record(stream=torch.cuda.current_stream(dev))
+            end_py.synchronize()
+            t_py = start_py.elapsed_time(end_py) / 1000.0  # ms -> s
+        except Exception:
+            use_events_py = False
+    if not use_events_py:
+        # Wall-clock fallback: narrow device-scoped sync only.
+        torch.cuda.synchronize(dev)
+        t0 = time.perf_counter()
+        _ = routed_expert_activations_grouped(
+            flat_input, router_pairs, W_gate, W_up, W_down, act_fn=act_fn
+        )
+        torch.cuda.synchronize(dev)
+        t_py = time.perf_counter() - t0
 
     # Prefer Triton on ties / near-ties (memory win); require clear win for pytorch.
     if t_tr <= t_py * 1.05:
@@ -316,8 +391,9 @@ def frea_triton_activations(
     )
     if not ok:
         log_triton_fallback(_COMPONENT, reason)
-        if "shared mem" in reason and not is_component_disabled(_COMPONENT):
-            disable_component(_COMPONENT, reason)
+        dev_scope = _device_key(flat_input.device)
+        if "shared mem" in reason and not is_component_disabled(_COMPONENT, scope=dev_scope):
+            disable_component(_COMPONENT, reason, scope=dev_scope)
         return routed_expert_activations_grouped(
             flat_input, router_pairs, W_gate, W_up, W_down, act_fn=act_fn
         )
@@ -328,11 +404,11 @@ def frea_triton_activations(
     except Exception as exc:  # pragma: no cover
         msg = str(exc)
         log_triton_fallback(_COMPONENT, msg)
-        global _USE_SMEM_OPTIN
+        dev_scope = _device_key(flat_input.device)
         if "shared memory" in msg.lower() or "out of resource" in msg.lower():
-            # Disable opt-in path and retry once with default SM budget tiles.
-            if _USE_SMEM_OPTIN is not False:
-                _USE_SMEM_OPTIN = False
+            # Disable opt-in path for this device and retry once with default SM tiles.
+            if _get_smem_optin(flat_input.device) is not False:
+                _set_smem_optin(flat_input.device, False)
                 try:
                     out = _frea_triton_impl(
                         flat_input, router_pairs, W_gate, W_up, W_down
@@ -342,7 +418,7 @@ def frea_triton_activations(
                 except Exception as exc2:
                     msg = str(exc2)
                     log_triton_fallback(_COMPONENT, msg)
-            disable_component(_COMPONENT, msg)
+            disable_component(_COMPONENT, msg, scope=dev_scope)
         return routed_expert_activations_grouped(
             flat_input, router_pairs, W_gate, W_up, W_down, act_fn=act_fn
         )
@@ -357,8 +433,6 @@ def _frea_triton_impl(
 ) -> torch.Tensor:
     import triton
     import triton.language as tl
-
-    global _USE_SMEM_OPTIN
 
     pair_token_idx = router_pairs.pair_token_idx.contiguous()
     expert_offsets = router_pairs.expert_offsets.contiguous()
@@ -388,7 +462,7 @@ def _frea_triton_impl(
     if block_h <= 64 and block_i <= 64 and n_pairs >= 32:
         candidate_n = 32
         smem = _smem_budget(
-            flat_input.device, prefer_optin=_USE_SMEM_OPTIN is not False
+            flat_input.device, prefer_optin=_get_smem_optin(flat_input.device) is not False
         )
         if smem is not None:
             need = estimate_frea_shared_bytes(candidate_n, block_h, block_i)
@@ -487,9 +561,12 @@ def _frea_triton_impl(
     if block_h <= 64:
         num_warps = max(num_warps, 8)
 
+    # Bulk-transfer CSR offsets to host once (avoids O(E) scalar .item() syncs).
+    offsets_host = expert_offsets.detach().to("cpu", dtype=torch.long).tolist()
+
     for expert_id in range(e):
-        start = int(expert_offsets[expert_id].item())
-        end = int(expert_offsets[expert_id + 1].item())
+        start = offsets_host[expert_id]
+        end = offsets_host[expert_id + 1]
         n_e = end - start
         if n_e <= 0:
             continue
@@ -524,9 +601,9 @@ def _frea_triton_impl(
         )
         out[start:end].copy_(y_fp32.to(dtype=out.dtype))
 
-    # Successful launch with large tiles implies opt-in path is usable.
-    if block_h >= 128 and block_i >= 128 and _USE_SMEM_OPTIN is None:
-        _USE_SMEM_OPTIN = True
+    # Successful launch with large tiles implies opt-in path is usable for this device.
+    if block_h >= 128 and block_i >= 128 and _get_smem_optin(flat_input.device) is None:
+        _set_smem_optin(flat_input.device, True)
     return out
 
 

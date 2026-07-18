@@ -52,6 +52,41 @@ uv run pytest tests/test_triton_kernels.py -q   # fewer skips
 - [ ] E2E retained-expert identity loop vs f2 on small calib subset
 - [ ] CI GPU job for Triton tests
 
+## New validation cases (hardening patch)
+
+| Test | File | Runs on | Checks |
+| --- | --- | --- | --- |
+| F4 cache dtype transitions | `test_f4_weight_cache.py` | CPU | Cache rebuilds on dtype mismatch; stays bounded |
+| F2 malformed inputs | `test_triton_kernels.py::TestScatterReduceValidation` | CPU (+CUDA skip) | Float indices, rank/length mismatch, out-of-range, cross-device |
+| FREA probe key scoping | `test_run_findings_fixes.py` | CPU | Probe key differs by dtype + device |
+| FREA SM opt-in per-device | `test_run_findings_fixes.py` | CPU | Opt-in state isolated per device |
+| FREA scoped disable isolation | `test_run_findings_fixes.py` | CPU | Disable on one device doesn't affect another |
+| FREA global disable backward compat | `test_run_findings_fixes.py` | CPU | No-scope disable still works globally |
+| bmm bulk offset correctness | `test_run_findings_fixes.py` | CPU | Per-expert outputs match manual computation |
+| Usage summary with scoped disables | `test_run_findings_fixes.py` | CPU | format_triton_usage_summary handles scoped entries |
+
+## Deferred redesigns (not shipped)
+
+The following high-risk kernel redesigns are **intentionally deferred**:
+
+- **Single-launch CSR FREA**: Replacing the Python per-expert loop in
+  `triton_frea.py` requires a new grid mapping from program IDs to
+  variable-length CSR segments, correct per-program expert-weight addressing,
+  tuning across severe routing imbalance, and a fresh performance study.
+- **Multi-tile F5 softmax**: Replacing the intentional `F.softmax` fallback
+  for `E > 1024` needs a numerically stable multi-pass/two-pass max-and-sum
+  reduction or persistent program design, workspace/lifetime choices, and
+  `E > 1024` parity/stress tests.
+- **In-kernel Welford fusion**: Fusing `OnlineStatsTracker` updates into the
+  F2 Triton kernel changes cross-batch reduction semantics.
+- **F2 grid redesign**: Replacing the one-program-per-pair grid with a
+  grouped/segmented grid changes atomic contention patterns.
+- **Cache thread-safety**: Making `_STACK_CACHE` thread-safe for
+  `DataParallel`/DDP requires locking or a different data structure.
+
+These redesigns change reduction order, cross-thread semantics, or
+architecture beyond the current corrective scope.
+
 ## Acceptance (current)
 
 - [x] F3 contract tests

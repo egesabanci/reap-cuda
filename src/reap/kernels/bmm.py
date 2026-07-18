@@ -58,9 +58,12 @@ def routed_expert_activations_grouped(
     # Gather once then segment by expert.
     routed_x = flat_input.index_select(0, pair_token_idx)  # (n_pairs, H)
 
+    # Bulk-transfer CSR offsets to host once (avoids O(E) scalar .item() syncs).
+    offsets_host = expert_offsets.detach().to("cpu", dtype=torch.long).tolist()
+
     for expert_id in range(e):
-        start = int(expert_offsets[expert_id].item())
-        end = int(expert_offsets[expert_id + 1].item())
+        start = offsets_host[expert_id]
+        end = offsets_host[expert_id + 1]
         if start == end:
             continue
         xe = routed_x[start:end]

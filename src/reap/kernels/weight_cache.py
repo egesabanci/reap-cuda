@@ -53,8 +53,16 @@ def get_stacked_expert_weights(
     key = id(moe)
     if key in _STACK_CACHE:
         cached = _STACK_CACHE[key]
-        if device is None or cached["W_gate"].device == device:
+        cached_device = cached["_resolved_device"]
+        cached_dtype = cached["_resolved_dtype"]
+        # A cache hit is legal only when the requested representation matches
+        # the resolved representation used to build the cached stacks.
+        dev_ok = device is None or cached_device == device
+        dt_ok = dtype is None or cached_dtype == dtype
+        if dev_ok and dt_ok:
             return cached
+        # Representation mismatch (device or dtype changed) — rebuild.
+        _STACK_CACHE.pop(key, None)
 
     # Evict other layers before building a new stack (OOM guard for full observe).
     if key not in _STACK_CACHE and len(_STACK_CACHE) >= _MAX_CACHE_ENTRIES:
@@ -106,6 +114,8 @@ def get_stacked_expert_weights(
         "W_down": W_down,
         "fused": bool(attrs["fused"]),
         "weight_convention": "linear",  # always normalized
+        "_resolved_device": W_gate.device,
+        "_resolved_dtype": W_gate.dtype,
     }
     _STACK_CACHE[key] = stacked
     return stacked

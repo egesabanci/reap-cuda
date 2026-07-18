@@ -23,7 +23,7 @@ export REAP_FREA_BACKEND=auto|triton|pytorch
 
 | Mode | Behavior |
 | --- | --- |
-| **`auto` (default)** | One-shot **profitability probe**: warm-up then time Triton vs cuBLAS grouped PyTorch on the first dense batch for `(device, H, I)`. Memoize the winner. Tiny batches (`n_pairs < 16`) use PyTorch **without** memoizing so a later dense batch can still probe. |
+| **`auto` (default)** | One-shot **profitability probe**: warm-up then time Triton vs cuBLAS grouped PyTorch on the first dense batch for `(device_type, device_index, dtype, H, I)`. Memoize the winner. Tiny batches (`n_pairs < 16`) use PyTorch **without** memoizing so a later dense batch can still probe. Probe timing uses **CUDA events** on the launch device (falls back to `torch.cuda.synchronize(device)` if events fail). |
 | **`triton`** | Always try Triton when tiles fit shared memory; fall back only on unsupported shapes / launch failure. |
 | **`pytorch`** | Always `routed_expert_activations_grouped` (per-expert `F.linear` / cuBLAS). Often max throughput on L4/T4. |
 
@@ -101,8 +101,8 @@ Implementation: `choose_frea_block_sizes` in `triton_frea.py`.
 2. Walk `(128, 64, 32, 16)` for `BLOCK_H` / `BLOCK_I` until estimate fits
    (+ safety margin).
 3. Optional larger `BLOCK_N` when H/I tiles are small, re-checked against SM.
-4. On launch SM OOM: set `_USE_SMEM_OPTIN=False`, retry with default budget;
-   permanent disable memo for hard failures.
+4. On launch SM OOM: set per-device opt-in to `False`, retry with default budget;
+   permanent (per-device) disable memo for hard failures.
 
 **“Tile fit”** = chosen block sizes fit this GPU’s per-block shared-memory
 limit so the kernel can launch.

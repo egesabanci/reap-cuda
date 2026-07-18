@@ -21,6 +21,101 @@ from reap.kernels.triton_utils import (
 _COMPONENT = "f2_reduce"
 
 
+def _validate_inputs(
+    pair_out: torch.Tensor,
+    pair_expert_idx: torch.Tensor,
+    pair_router_w: torch.Tensor,
+    num_experts: int,
+) -> None:
+    """Validate the public F2 input contract before any Triton launch.
+
+    Raises ``ValueError`` / ``TypeError`` with actionable messages for
+    malformed structural, dtype, device, or index-domain inputs. This guard
+    runs *before* the empty-result short-circuit and Triton eligibility so
+    that invalid data never reaches unchecked atomic writes.
+    """
+    if not isinstance(num_experts, int) or isinstance(num_experts, bool):
+        raise TypeError(f"num_experts must be int, got {type(num_experts).__name__}")
+    if num_experts < 0:
+        raise ValueError(f"num_experts must be non-negative, got {num_experts}")
+
+    if not isinstance(pair_out, torch.Tensor):
+        raise TypeError(f"pair_out must be a Tensor, got {type(pair_out).__name__}")
+    if pair_out.ndim != 2:
+        raise ValueError(f"pair_out must be 2-D, got {pair_out.ndim}-D")
+    n = pair_out.shape[0]
+    if pair_out.shape[1] == 0:
+        raise ValueError("pair_out hidden dimension must be non-zero")
+    if not torch.is_floating_point(pair_out):
+        raise TypeError(f"pair_out must be floating-point, got dtype={pair_out.dtype}")
+
+    if not isinstance(pair_expert_idx, torch.Tensor):
+        raise TypeError(
+            f"pair_expert_idx must be a Tensor, got {type(pair_expert_idx).__name__}"
+        )
+    if pair_expert_idx.ndim != 1:
+        raise ValueError(f"pair_expert_idx must be 1-D, got {pair_expert_idx.ndim}-D")
+    if pair_expert_idx.shape[0] != n:
+        raise ValueError(
+            f"pair_expert_idx length {pair_expert_idx.shape[0]} != pair_out rows {n}"
+        )
+    # Accept only index dtypes that PyTorch index_add_ / Triton safely support.
+    # Rejects bool, uint8, int8, int16, float, complex, etc.
+    if pair_expert_idx.dtype not in (torch.int32, torch.int64):
+        raise TypeError(
+            f"pair_expert_idx must be int32 or int64, got {pair_expert_idx.dtype}"
+        )
+
+    if not isinstance(pair_router_w, torch.Tensor):
+        raise TypeError(
+            f"pair_router_w must be a Tensor, got {type(pair_router_w).__name__}"
+        )
+    if pair_router_w.ndim != 1:
+        raise ValueError(f"pair_router_w must be 1-D, got {pair_router_w.ndim}-D")
+    if pair_router_w.shape[0] != n:
+        raise ValueError(
+            f"pair_router_w length {pair_router_w.shape[0]} != pair_out rows {n}"
+        )
+
+    if n > 0:
+        if num_experts == 0:
+            raise ValueError("num_experts must be > 0 when pair_out is non-empty")
+        # Device consistency: all three tensors must agree.
+        dev = pair_out.device
+        if pair_expert_idx.device != dev:
+            raise ValueError(
+                f"pair_expert_idx device {pair_expert_idx.device} != pair_out device {dev}"
+            )
+        if pair_router_w.device != dev:
+            raise ValueError(
+                f"pair_router_w device {pair_router_w.device} != pair_out device {dev}"
+        )
+
+
+def _validate_index_domain(
+    pair_expert_idx: torch.Tensor,
+    num_experts: int,
+) -> None:
+    """Ensure all expert indices are within ``[0, num_experts)``.
+
+    Uses a single combined validity reduction (one CUDA sync) on the valid
+    path. Only on the exceptional invalid path do we compute min/max for a
+    descriptive error message. This prevents arbitrary-address atomic
+    writes in the Triton kernel and out-of-bounds ``index_add_`` on the
+    PyTorch path.
+    """
+    if pair_expert_idx.numel() == 0:
+        return
+    # One .all().item() sync instead of two min/max .item() syncs.
+    in_range = (pair_expert_idx >= 0) & (pair_expert_idx < num_experts)
+    if not bool(in_range.all()):
+        lo = int(pair_expert_idx.min().item())
+        hi = int(pair_expert_idx.max().item())
+        raise ValueError(
+            f"pair_expert_idx values [{lo}, {hi}] out of range [0, {num_experts})"
+        )
+
+
 def scatter_pair_stats(
     pair_out: torch.Tensor,
     pair_expert_idx: torch.Tensor,
@@ -33,6 +128,8 @@ def scatter_pair_stats(
       ``ean_sum``, ``weighted_ean_sum``, ``weighted_freq``, ``batch_max``
     all on ``pair_out.device``. Sums are ``float64``; ``batch_max`` is ``float32``.
     """
+    _validate_inputs(pair_out, pair_expert_idx, pair_router_w, num_experts)
+
     device = pair_out.device
     if pair_out.numel() == 0:
         z64 = torch.zeros(num_experts, device=device, dtype=torch.float64)
@@ -43,6 +140,10 @@ def scatter_pair_stats(
             "weighted_freq": z64.clone(),
             "batch_max": z32,
         }
+
+    # Validate index domain for ALL paths (not just Triton) to prevent
+    # silent index_add_ out-of-bounds errors on the PyTorch path too.
+    _validate_index_domain(pair_expert_idx, num_experts)
 
     if (
         triton_runtime_available()

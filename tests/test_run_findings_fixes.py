@@ -449,3 +449,128 @@ def test_cli_passes_dataset_path_and_artifacts(mock_run: MagicMock):
     ds_args = mock_run.call_args.args[1]
     assert reap_args.artifacts_dir == "/data/out"
     assert ds_args.dataset_path == "/tmp/local.arrow"
+
+
+# ---------------------------------------------------------------------------
+# FREA probe/SM state scoping + bulk offset extraction
+# ---------------------------------------------------------------------------
+
+
+def test_frea_probe_cache_is_dtor_scoped():
+    """Probe choices must be scoped by device type, index, and dtype."""
+    from reap.kernels.triton_frea import _probe_key, reset_frea_probe_cache
+
+    reset_frea_probe_cache()
+    wg_fp16 = torch.randn(4, 32, 64, dtype=torch.float16)
+    wg_fp32 = torch.randn(4, 32, 64, dtype=torch.float32)
+    key_fp16 = _probe_key(torch.empty(1, dtype=torch.float16), wg_fp16)
+    key_fp32 = _probe_key(torch.empty(1, dtype=torch.float32), wg_fp32)
+    assert key_fp16 != key_fp32
+    key_cpu = _probe_key(torch.empty(1, 1, dtype=torch.float32), wg_fp32)
+    assert key_cpu[0] == "cpu"
+    reset_frea_probe_cache()
+
+
+def test_frea_smem_optin_is_per_device():
+    """SM opt-in state must be tracked per-device, not globally."""
+    from reap.kernels.triton_frea import (
+        _get_smem_optin,
+        _set_smem_optin,
+        reset_frea_probe_cache,
+    )
+
+    reset_frea_probe_cache()
+    dev_a = torch.device("cpu")
+    dev_b_str = "cuda:0"
+
+    _set_smem_optin(dev_a, True)
+    _set_smem_optin(dev_b_str, False)
+    assert _get_smem_optin(dev_a) is True
+    assert _get_smem_optin(dev_b_str) is False
+    assert _get_smem_optin(torch.device("cpu")) is True
+    reset_frea_probe_cache()
+    assert _get_smem_optin(dev_a) is None
+
+
+def test_frea_scoped_disable_isolates_devices():
+    """A scoped disable on one device must not affect another."""
+    from reap.kernels.triton_utils import (
+        clear_triton_disable_memo,
+        disable_component,
+        is_component_disabled,
+    )
+
+    clear_triton_disable_memo()
+    assert is_component_disabled("frea", scope="cuda:0") is None
+    disable_component("frea", "SM OOM", scope="cuda:0")
+    assert is_component_disabled("frea", scope="cuda:0") is not None
+    assert is_component_disabled("frea", scope="cuda:1") is None
+    assert is_component_disabled("frea") is None
+    clear_triton_disable_memo()
+
+
+def test_frea_global_disable_still_works():
+    """Backward compat: disable_component without scope still works globally."""
+    from reap.kernels.triton_utils import (
+        clear_triton_disable_memo,
+        disable_component,
+        is_component_disabled,
+    )
+
+    clear_triton_disable_memo()
+    disable_component("frea", "global SM failure")
+    assert is_component_disabled("frea") is not None
+    assert is_component_disabled("frea", scope="cuda:0") is not None
+    clear_triton_disable_memo()
+
+
+def test_bmm_bulk_offset_extraction_correctness():
+    """bmm.routed_expert_activations_grouped must produce correct results with bulk offsets."""
+    from reap.kernels.bmm import routed_expert_activations_grouped
+    from reap.kernels.router import f5_router_pytorch
+
+    torch.manual_seed(42)
+    t, e, k, h, i = 16, 4, 2, 32, 32
+    flat = torch.randn(t, h)
+    logits = torch.randn(t, e)
+    pairs = f5_router_pytorch(logits, k, use_triton_softmax=False)
+    W_gate = torch.randn(e, i, h)
+    W_up = torch.randn(e, i, h)
+    W_down = torch.randn(e, h, i)
+
+    out = routed_expert_activations_grouped(flat, pairs, W_gate, W_up, W_down)
+    assert out.shape == (t * k, h)
+
+    offsets = pairs.expert_offsets.tolist()
+    for eid in range(e):
+        start, end = offsets[eid], offsets[eid + 1]
+        if start == end:
+            continue
+        xe = flat[pairs.pair_token_idx[start:end]]
+        g = torch.nn.functional.linear(xe, W_gate[eid])
+        u = torch.nn.functional.linear(xe, W_up[eid])
+        expected = torch.nn.functional.linear(
+            torch.nn.functional.silu(g) * u, W_down[eid]
+        )
+        assert torch.allclose(out[start:end], expected, atol=1e-5), (
+            f"Expert {eid} mismatch"
+        )
+
+
+def test_frea_usage_summary_handles_scoped_disables():
+    """format_triton_usage_summary must handle scoped disable entries gracefully."""
+    from reap.kernels.triton_utils import (
+        clear_triton_disable_memo,
+        disable_component,
+        format_triton_usage_summary,
+        reset_triton_usage,
+    )
+
+    reset_triton_usage()
+    clear_triton_disable_memo()
+    disable_component("frea", "SM OOM", scope="cuda:0")
+    text = format_triton_usage_summary()
+    assert "frea" in text
+    assert "scope=cuda:0" in text
+    clear_triton_disable_memo()
+    reset_triton_usage()

@@ -119,6 +119,38 @@ class TestFreaParity:
         # fp16 fused dots: abs diffs ~0.25–0.5 on magnitudes ~400–1200 is normal.
         assert torch.allclose(got.float(), ref.float(), atol=1.0, rtol=5e-2)
 
+    def test_frea_auto_fallback_on_cpu(self):
+        """Direct frea_triton_activations(backend='auto') on CPU must fall back
+        to PyTorch without calling torch.cuda.synchronize."""
+        from reap.kernels.triton_frea import frea_triton_activations, reset_frea_probe_cache
+
+        reset_frea_probe_cache()
+        flat, pairs, wg, wu, wd = self._make_pairs(t=32, e=8, k=2, h=64, i=64)
+        ref = routed_expert_activations_grouped(flat, pairs, wg, wu, wd)
+        got = frea_triton_activations(flat, pairs, wg, wu, wd, backend="auto")
+        assert got.shape == ref.shape
+        assert torch.allclose(got, ref, atol=1e-4, rtol=1e-4)
+
+    def test_frea_auto_fallback_on_cpu_no_probe_sync(self, monkeypatch):
+        """Probe on CPU must not call torch.cuda.synchronize at all."""
+        import reap.kernels.triton_frea as frea_mod
+        from reap.kernels.triton_frea import frea_triton_activations, reset_frea_probe_cache
+
+        reset_frea_probe_cache()
+        sync_calls = []
+        orig_sync = torch.cuda.synchronize
+
+        def fake_sync(*args, **kwargs):
+            sync_calls.append(args)
+
+        monkeypatch.setattr(torch.cuda, "synchronize", fake_sync)
+        flat, pairs, wg, wu, wd = self._make_pairs(t=32, e=8, k=2, h=64, i=64)
+        got = frea_triton_activations(flat, pairs, wg, wu, wd, backend="auto")
+        assert got.shape == (pairs.pair_token_idx.numel(), flat.shape[-1])
+        assert len(sync_calls) == 0, (
+            f"torch.cuda.synchronize should not be called on CPU, got {len(sync_calls)} calls"
+        )
+
 
 class TestScatterReduce:
     def test_scatter_pytorch_path(self):
@@ -163,6 +195,97 @@ class TestScatterReduce:
             atol=1e-2,
             rtol=1e-2,
         )
+
+
+class TestScatterReduceValidation:
+    """F2 input-contract validation: malformed inputs must fail before Triton."""
+
+    def test_scatter_rejects_non_2d_pair_out(self):
+        from reap.kernels.triton_reduce import scatter_pair_stats
+
+        with pytest.raises(ValueError, match="2-D"):
+            scatter_pair_stats(torch.randn(10), torch.zeros(10, dtype=torch.long), torch.rand(10), 4)
+
+    def test_scatter_rejects_length_mismatch_idx(self):
+        from reap.kernels.triton_reduce import scatter_pair_stats
+
+        with pytest.raises(ValueError, match="pair_expert_idx length"):
+            scatter_pair_stats(torch.randn(10, 16), torch.zeros(5, dtype=torch.long), torch.rand(10), 4)
+
+    def test_scatter_rejects_length_mismatch_w(self):
+        from reap.kernels.triton_reduce import scatter_pair_stats
+
+        with pytest.raises(ValueError, match="pair_router_w length"):
+            scatter_pair_stats(torch.randn(10, 16), torch.zeros(10, dtype=torch.long), torch.rand(5), 4)
+
+    def test_scatter_rejects_float_indices(self):
+        from reap.kernels.triton_reduce import scatter_pair_stats
+
+        with pytest.raises(TypeError, match="int32 or int64"):
+            scatter_pair_stats(torch.randn(10, 16), torch.zeros(10, dtype=torch.float32), torch.rand(10), 4)
+
+    def test_scatter_rejects_negative_num_experts(self):
+        from reap.kernels.triton_reduce import scatter_pair_stats
+
+        with pytest.raises(ValueError, match="non-negative"):
+            scatter_pair_stats(torch.randn(10, 16), torch.zeros(10, dtype=torch.long), torch.rand(10), -1)
+
+    def test_scatter_rejects_non_tensor_pair_out(self):
+        from reap.kernels.triton_reduce import scatter_pair_stats
+
+        with pytest.raises(TypeError, match="pair_out must be"):
+            scatter_pair_stats([1, 2, 3], torch.zeros(3, dtype=torch.long), torch.rand(3), 4)
+
+    def test_scatter_rejects_out_of_range_indices(self):
+        from reap.kernels.triton_reduce import scatter_pair_stats
+
+        idx = torch.tensor([0, 1, 5, 3], dtype=torch.long)  # 5 >= num_experts=4
+        with pytest.raises(ValueError, match="out of range"):
+            scatter_pair_stats(torch.randn(4, 16), idx, torch.rand(4), 4)
+
+    def test_scatter_rejects_cross_device_mismatch(self):
+        """On CUDA hosts, cross-device inputs must raise before any launch."""
+        from reap.kernels.triton_reduce import scatter_pair_stats
+
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required")
+        pair_out = torch.randn(10, 16, device="cuda")
+        idx = torch.zeros(10, dtype=torch.long, device="cpu")
+        w = torch.rand(10, device="cuda")
+        with pytest.raises(ValueError, match="device"):
+            scatter_pair_stats(pair_out, idx, w, 4)
+
+    def test_scatter_empty_valid_still_works(self):
+        from reap.kernels.triton_reduce import scatter_pair_stats
+
+        out = scatter_pair_stats(torch.empty(0, 16), torch.empty(0, dtype=torch.long), torch.empty(0), 4)
+        assert out["ean_sum"].shape == (4,)
+        assert out["ean_sum"].dtype == torch.float64
+        assert out["batch_max"].dtype == torch.float32
+
+    def test_scatter_rejects_zero_num_experts_with_pairs(self):
+        from reap.kernels.triton_reduce import scatter_pair_stats
+
+        with pytest.raises(ValueError, match="num_experts must be > 0"):
+            scatter_pair_stats(torch.randn(5, 16), torch.zeros(5, dtype=torch.long), torch.rand(5), 0)
+
+    @pytest.mark.parametrize("dtype", [torch.bool, torch.uint8, torch.int8, torch.int16, torch.complex64])
+    def test_scatter_rejects_unsafe_index_dtype(self, dtype):
+        """Only int32/int64 index dtypes are safe for index_add_/Triton atomics."""
+        from reap.kernels.triton_reduce import scatter_pair_stats
+
+        idx = torch.zeros(5, dtype=dtype)
+        with pytest.raises(TypeError, match="int32 or int64"):
+            scatter_pair_stats(torch.randn(5, 16), idx, torch.rand(5), 4)
+
+    def test_scatter_accepts_int32_indices(self):
+        """int32 is a valid index dtype for both PyTorch index_add_ and Triton."""
+        from reap.kernels.triton_reduce import scatter_pair_stats
+
+        idx = torch.tensor([0, 1, 2, 3, 0], dtype=torch.int32)
+        out = scatter_pair_stats(torch.randn(5, 16), idx, torch.rand(5), 4)
+        assert out["ean_sum"].shape == (4,)
+        assert out["ean_sum"].dtype == torch.float64
 
 
 class TestEndToEndObserveBackend:

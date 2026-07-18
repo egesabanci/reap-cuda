@@ -33,7 +33,9 @@ except Exception as exc:  # pragma: no cover - environment dependent
 _USAGE: dict[str, dict[str, int]] = defaultdict(lambda: {"ok": 0, "fallback": 0})
 _FALLBACK_WARNED: set[str] = set()
 # Memoized permanent disable reasons for a component (process-local).
-_DISABLED: dict[str, str] = {}
+# Key is either a bare component string (global disable) or a
+# ``(component, scope)`` tuple (device/capability-scoped disable).
+_DISABLED: dict[str | tuple[str, str], str] = {}
 
 
 def triton_package_available() -> bool:
@@ -155,17 +157,44 @@ def next_power_of_2(n: int) -> int:
     return 1 << (n - 1).bit_length()
 
 
-def is_component_disabled(component: str) -> str | None:
-    """Return disable reason if *component* was memoized as permanently failed."""
+def is_component_disabled(component: str, *, scope: str | None = None) -> str | None:
+    """Return disable reason if *component* was memoized as permanently failed.
+
+    When *scope* is provided (e.g. a device identifier), checks the scoped
+    entry first, then falls back to the global entry. When *scope* is None,
+    checks only the global entry (backward compatible).
+    """
+    if scope is not None:
+        scoped_reason = _DISABLED.get((component, scope))
+        if scoped_reason is not None:
+            return scoped_reason
     return _DISABLED.get(component)
 
 
-def disable_component(component: str, reason: str) -> None:
-    """Memoize a permanent failure so we stop re-attempting the same launch."""
-    if component not in _DISABLED:
-        _DISABLED[component] = reason
+def disable_component(
+    component: str,
+    reason: str,
+    *,
+    scope: str | None = None,
+) -> None:
+    """Memoize a permanent failure so we stop re-attempting the same launch.
+
+    When *scope* is provided, the disable applies only to that device/
+    capability scope (e.g. one CUDA device). When *scope* is None, the disable
+    is global (backward compatible).
+    """
+    key: str | tuple[str, str]
+    if scope is not None:
+        key = (component, scope)
+    else:
+        key = component
+    if key not in _DISABLED:
+        _DISABLED[key] = reason
         logger.warning(
-            "Triton %s disabled for this process: %s", component, reason
+            "Triton %s disabled for this process: %s%s",
+            component,
+            reason,
+            f" (scope={scope})" if scope else "",
         )
 
 
@@ -206,14 +235,26 @@ def format_triton_usage_summary() -> str:
     if not _USAGE and not _DISABLED:
         return "no Triton kernel attempts this run"
     parts: list[str] = []
-    keys = sorted(set(_USAGE) | set(_DISABLED))
-    for name in keys:
+    # Collect component names from both usage and disable dicts (handles scoped keys).
+    component_names: set[str] = set()
+    for name in _USAGE:
+        component_names.add(name)
+    for key in _DISABLED:
+        component_names.add(key if isinstance(key, str) else key[0])
+    for name in sorted(component_names):
         stats = _USAGE.get(name, {"ok": 0, "fallback": 0})
         ok = stats.get("ok", 0)
         fb = stats.get("fallback", 0)
-        disabled = _DISABLED.get(name)
-        if disabled:
-            parts.append(f"{name}: {ok} Triton / {fb} PyTorch (disabled: {disabled})")
+        # Gather all disable reasons (global + scoped).
+        reasons: list[str] = []
+        global_reason = _DISABLED.get(name)
+        if global_reason:
+            reasons.append(global_reason)
+        for k, v in _DISABLED.items():
+            if isinstance(k, tuple) and k[0] == name:
+                reasons.append(f"{v} (scope={k[1]})")
+        if reasons:
+            parts.append(f"{name}: {ok} Triton / {fb} PyTorch (disabled: {'; '.join(reasons)})")
         else:
             parts.append(f"{name}: {ok} Triton / {fb} PyTorch")
     return "; ".join(parts)

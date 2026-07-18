@@ -442,8 +442,4 @@ class MoETransformerObserver(BaseTransformerObserver):
                     activations.mean(dim=1), num_tokens
                 )
 
-            # Keep GPU free of large transients; do not force CPU on metrics.
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
         return _hook_fn

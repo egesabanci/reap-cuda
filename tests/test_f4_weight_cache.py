@@ -65,3 +65,73 @@ def test_f4_llama_bmm_normalized():
         stacked["W_gate"], moe.experts.gate_up_proj[..., :i].transpose(-1, -2)
     )
     free_cache()
+
+
+# ---------------------------------------------------------------------------
+# Cache representation safety (device + dtype)
+# ---------------------------------------------------------------------------
+
+
+def test_f4_cache_dtype_mismatch_rebuilds():
+    """A dtype change must not return a stale cached representation."""
+    free_cache()
+    moe = _QwenMoe(e=4, h=8, i=4)
+    adapter = Qwen3MoeModelAdapter()
+
+    # First request: native dtype (float32 from nn.Parameter).
+    s1 = get_stacked_expert_weights(moe, adapter)
+    assert s1["W_gate"].dtype == torch.float32
+
+    # Second request: explicit float16 — must rebuild, not return fp32.
+    s2 = get_stacked_expert_weights(moe, adapter, dtype=torch.float16)
+    assert s2["W_gate"].dtype == torch.float16
+    assert s2["_resolved_dtype"] == torch.float16
+
+    # Third request: back to float32 — must rebuild again.
+    s3 = get_stacked_expert_weights(moe, adapter, dtype=torch.float32)
+    assert s3["W_gate"].dtype == torch.float32
+
+    free_cache()
+
+
+def test_f4_cache_dtype_none_accepts_cached():
+    """When dtype=None, accept whatever is cached (caller does not care)."""
+    free_cache()
+    moe = _QwenMoe(e=4, h=8, i=4)
+    adapter = Qwen3MoeModelAdapter()
+
+    s1 = get_stacked_expert_weights(moe, adapter, dtype=torch.float16)
+    assert s1["W_gate"].dtype == torch.float16
+
+    # dtype=None should accept the cached fp16 representation.
+    s2 = get_stacked_expert_weights(moe, adapter)
+    assert s2["W_gate"].dtype == torch.float16
+
+    free_cache()
+
+
+def test_f4_cache_stays_bounded_after_dtype_changes():
+    """Cache size remains <= 1 even after multiple dtype-triggered rebuilds."""
+    from reap.kernels.weight_cache import cache_size
+
+    free_cache()
+    moe = _QwenMoe(e=4, h=8, i=4)
+    adapter = Qwen3MoeModelAdapter()
+
+    for dt in (torch.float16, torch.float32, torch.float16, torch.bfloat16):
+        get_stacked_expert_weights(moe, adapter, dtype=dt)
+        assert cache_size() <= 1
+
+    free_cache()
+
+
+def test_f4_cache_resolved_metadata_present():
+    """Cache entries carry _resolved_device and _resolved_dtype metadata."""
+    free_cache()
+    moe = _QwenMoe(e=4, h=8, i=4)
+    adapter = Qwen3MoeModelAdapter()
+    stacked = get_stacked_expert_weights(moe, adapter, dtype=torch.float16)
+    assert "_resolved_device" in stacked
+    assert "_resolved_dtype" in stacked
+    assert stacked["_resolved_dtype"] == torch.float16
+    free_cache()
