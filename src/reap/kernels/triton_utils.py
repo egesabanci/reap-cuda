@@ -53,11 +53,12 @@ def triton_runtime_available() -> bool:
         return False
     if not torch.cuda.is_available():
         return False
-    if os.environ.get("REAP_DISABLE_TRITON", "").strip() in {
+    if os.environ.get("REAP_DISABLE_TRITON", "").strip().lower() in {
         "1",
         "true",
-        "TRUE",
         "yes",
+        "y",
+        "on",
     }:
         return False
     try:
@@ -74,6 +75,32 @@ def _cuda_device_index(device: torch.device | int | None = None) -> int:
     if isinstance(device, torch.device):
         return device.index if device.index is not None else 0
     return int(device)
+
+
+_MIN_CC_FOR_FP64_ATOMICS = (6, 0)
+
+
+def device_compute_capability(
+    device: torch.device | int | None = None,
+) -> tuple[int, int] | None:
+    """Return ``(major, minor)`` compute capability for *device*, or None on CPU."""
+    if not torch.cuda.is_available():
+        return None
+    try:
+        idx = _cuda_device_index(device)
+        return torch.cuda.get_device_capability(idx)
+    except Exception:
+        return None
+
+
+def supports_fp64_atomics(
+    device: torch.device | int | None = None,
+) -> bool:
+    """True when device compute capability >= 6.0 (Pascal+, fp64 atomics)."""
+    cc = device_compute_capability(device)
+    if cc is None:
+        return False
+    return cc >= _MIN_CC_FOR_FP64_ATOMICS
 
 
 def device_shared_memory_bytes(

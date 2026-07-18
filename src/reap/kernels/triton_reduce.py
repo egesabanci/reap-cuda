@@ -205,6 +205,17 @@ def _scatter_triton(
     import triton
     import triton.language as tl
 
+    from reap.kernels.triton_utils import (
+        device_compute_capability,
+        supports_fp64_atomics,
+    )
+
+    if not supports_fp64_atomics(device=pair_out.device):
+        raise RuntimeError(
+            f"Device compute capability {device_compute_capability(pair_out.device)} "
+            "below minimum (6,0) for fp64 atomics"
+        )
+
     n, h = pair_out.shape
     y = pair_out.contiguous()
     idx = pair_expert_idx.to(device=y.device, dtype=torch.int64).contiguous()

@@ -83,7 +83,7 @@ def f5_router_pytorch(
         routing_weights = torch.clamp(
             routing_weights, min=torch.finfo(routing_weights.dtype).eps
         )
-        selected_vals = torch.gather(routing_weights, 1, selected_experts)
+        selected_vals = selected_vals / topk_sum
 
     pair_token_idx = torch.arange(t, device=device).repeat_interleave(k)
     pair_expert_idx = selected_experts.reshape(-1)
@@ -224,10 +224,21 @@ def f5_router_from_module(
     except (TypeError, ValueError):
         sig = None
     expert_bias = getattr(moe, "expert_bias", None)
-    if expert_bias is not None and sig is not None and "expert_bias" in sig.parameters:
+    has_expert_bias = expert_bias is not None and (
+        (sig is not None and "expert_bias" in sig.parameters)
+        or bool(getattr(router, "use_expert_bias", False))
+    )
+    if has_expert_bias:
         kw["expert_bias"] = expert_bias
 
-    out = router(flat_input, **kw)
+    try:
+        out = router(flat_input, **kw)
+    except TypeError:
+        if "expert_bias" in kw:
+            kw.pop("expert_bias")
+            out = router(flat_input, **kw)
+        else:
+            raise
     if not (isinstance(out, tuple) and len(out) >= 3):
         raise ValueError(
             "f5_router_from_module expects a router returning "

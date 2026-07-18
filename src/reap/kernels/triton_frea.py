@@ -537,7 +537,7 @@ def _frea_triton_impl(
                 g_acc += tl.dot(x, tl.trans(wg))
                 u_acc += tl.dot(x, tl.trans(wu))
 
-            act = g_acc * (1.0 / (1.0 + tl.exp(-g_acc))) * u_acc
+            act = tl.sigmoid(g_acc) * g_acc * u_acc
 
             for h0 in range(0, H, BLOCK_H):
                 offs_h = h0 + tl.arange(0, BLOCK_H)

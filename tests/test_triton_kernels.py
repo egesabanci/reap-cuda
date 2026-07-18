@@ -46,6 +46,17 @@ class TestBackendSelection:
         monkeypatch.delenv("REAP_DISABLE_TRITON", raising=False)
         triton_utils.triton_runtime_available.cache_clear()
 
+    @pytest.mark.parametrize("env_val", ["true", "yes", "True", "Yes", "TRUE", "1", "on", "On"])
+    def test_disable_env_case_insensitive(self, monkeypatch, env_val):
+        """REAP_DISABLE_TRITON must accept common truthy values case-insensitively."""
+        monkeypatch.setenv("REAP_DISABLE_TRITON", env_val)
+        from reap.kernels import triton_utils
+
+        triton_utils.triton_runtime_available.cache_clear()
+        assert triton_runtime_available() is False
+        monkeypatch.delenv("REAP_DISABLE_TRITON", raising=False)
+        triton_utils.triton_runtime_available.cache_clear()
+
 
 class TestSoftmaxParity:
     def test_softmax_rows_matches_torch_cpu(self):
@@ -83,6 +94,22 @@ class TestF5Router:
         out = f5_router(logits, 2, valid_token_mask=mask)
         assert out.selected_experts.shape[0] == 3
         assert out.pair_token_idx.numel() == 6
+
+    def test_f5_norm_topk_prob_selected_vals_sum_to_one(self):
+        """After norm_topk_prob, per-token selected_vals sum to 1.0.
+
+        pair_router_w is sorted by expert (pair_perm). We must invert that
+        permutation to recover token-major order before reshaping to (T, k).
+        """
+        torch.manual_seed(0)
+        t, e, k = 8, 6, 3
+        logits = torch.randn(t, e)
+        out = f5_router(logits, k, norm_topk_prob=True)
+        # Invert expert-sort permutation to get back token-major order.
+        inv_perm = torch.argsort(out.pair_perm)
+        pw = out.pair_router_w[inv_perm].reshape(t, k)
+        row_sums = pw.sum(dim=-1)
+        assert torch.allclose(row_sums, torch.ones(t), atol=1e-5)
 
 
 class TestFreaParity:
@@ -286,6 +313,31 @@ class TestScatterReduceValidation:
         out = scatter_pair_stats(torch.randn(5, 16), idx, torch.rand(5), 4)
         assert out["ean_sum"].shape == (4,)
         assert out["ean_sum"].dtype == torch.float64
+
+
+class TestFp64AtomicsCapability:
+    """CC guard for fp64 atomics on F2 Triton reduce path."""
+
+    def test_supports_fp64_atomics_cpu(self):
+        from reap.kernels.triton_utils import supports_fp64_atomics
+
+        if not torch.cuda.is_available():
+            assert not supports_fp64_atomics()
+        else:
+            cc = torch.cuda.get_device_capability()
+            expected = cc >= (6, 0)
+            assert supports_fp64_atomics() == expected
+
+    def test_device_compute_capability_cpu(self):
+        from reap.kernels.triton_utils import device_compute_capability
+
+        if not torch.cuda.is_available():
+            assert device_compute_capability() is None
+        else:
+            cc = device_compute_capability()
+            assert isinstance(cc, tuple)
+            assert len(cc) == 2
+            assert cc == torch.cuda.get_device_capability()
 
 
 class TestEndToEndObserveBackend:

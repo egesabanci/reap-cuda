@@ -135,3 +135,56 @@ def test_f4_cache_resolved_metadata_present():
     assert "_resolved_dtype" in stacked
     assert stacked["_resolved_dtype"] == torch.float16
     free_cache()
+
+
+# ---------------------------------------------------------------------------
+# Fix 2: .detach() — stacked weights must not carry requires_grad
+# ---------------------------------------------------------------------------
+
+
+def test_f4_stacked_weights_are_detached():
+    """Stacked weights must be detached from autograd for memory safety."""
+    free_cache()
+    moe = _QwenMoe(e=4, h=8, i=4)
+    adapter = Qwen3MoeModelAdapter()
+    stacked = get_stacked_expert_weights(moe, adapter)
+    assert not stacked["W_gate"].requires_grad
+    assert not stacked["W_up"].requires_grad
+    assert not stacked["W_down"].requires_grad
+    free_cache()
+
+
+# ---------------------------------------------------------------------------
+# Fix 3: free_cache with specific moe argument
+# ---------------------------------------------------------------------------
+
+
+def test_f4_free_cache_specific_moe():
+    """free_cache(moe) must evict only the matching entry."""
+    free_cache()
+    moe_a = _QwenMoe(e=4, h=8, i=4)
+    moe_b = _QwenMoe(e=4, h=8, i=4)
+    adapter = Qwen3MoeModelAdapter()
+
+    stacked_a = get_stacked_expert_weights(moe_a, adapter)
+    assert stacked_a is not None
+    free_cache(moe_a)
+    # Fresh request on moe_b must build from scratch (no stale hit from moe_a).
+    from reap.kernels.weight_cache import cache_size
+    assert cache_size() == 0
+    stacked_b = get_stacked_expert_weights(moe_b, adapter)
+    assert stacked_b is not None
+    assert not torch.equal(stacked_a["W_gate"], stacked_b["W_gate"])
+    free_cache()
+
+
+def test_f4_free_cache_none_clears_all():
+    """free_cache() without argument must clear the single-entry cache."""
+    free_cache()
+    moe = _QwenMoe(e=4, h=8, i=4)
+    adapter = Qwen3MoeModelAdapter()
+    get_stacked_expert_weights(moe, adapter)
+    from reap.kernels.weight_cache import cache_size
+    assert cache_size() == 1
+    free_cache()
+    assert cache_size() == 0

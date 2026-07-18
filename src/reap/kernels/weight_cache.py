@@ -19,23 +19,23 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-_STACK_CACHE: dict[int, dict[str, Any]] = {}
+_CACHED_MOE_ID: int | None = None
+_CACHED_STACK: dict[str, Any] | None = None
 # Full-observer path hooks every MoE each batch. Keep at most one entry so
 # stacked weights do not accumulate across layers (tight-VRAM OOM guard).
-_MAX_CACHE_ENTRIES = 1
 
 
 def free_cache(moe: nn.Module | None = None) -> None:
     """Drop the stacked-weight cache (after a layer finishes calibrating)."""
-    if moe is None:
-        _STACK_CACHE.clear()
-    else:
-        _STACK_CACHE.pop(id(moe), None)
+    global _CACHED_MOE_ID, _CACHED_STACK
+    if moe is None or id(moe) == _CACHED_MOE_ID:
+        _CACHED_MOE_ID = None
+        _CACHED_STACK = None
 
 
 def cache_size() -> int:
     """Number of MoE modules currently holding stacked weights (tests)."""
-    return len(_STACK_CACHE)
+    return 1 if _CACHED_STACK is not None else 0
 
 
 def get_stacked_expert_weights(
@@ -47,26 +47,28 @@ def get_stacked_expert_weights(
 ) -> dict[str, torch.Tensor]:
     """Return contiguous stacked expert weights in Linear convention.
 
-    Cached on ``id(moe)``. At most :data:`_MAX_CACHE_ENTRIES` MoEs are retained
-    so the full-observer path cannot pin every layer's stacks simultaneously.
+    Single-entry cache per process — at most one MoE's stacked weights are
+    retained so the full-observer path cannot pin every layer's stacks.
     """
-    key = id(moe)
-    if key in _STACK_CACHE:
-        cached = _STACK_CACHE[key]
-        cached_device = cached["_resolved_device"]
-        cached_dtype = cached["_resolved_dtype"]
+    global _CACHED_MOE_ID, _CACHED_STACK
+
+    if _CACHED_STACK is not None and id(moe) == _CACHED_MOE_ID:
+        cached_device = _CACHED_STACK["_resolved_device"]
+        cached_dtype = _CACHED_STACK["_resolved_dtype"]
         # A cache hit is legal only when the requested representation matches
         # the resolved representation used to build the cached stacks.
         dev_ok = device is None or cached_device == device
         dt_ok = dtype is None or cached_dtype == dtype
         if dev_ok and dt_ok:
-            return cached
+            return _CACHED_STACK
         # Representation mismatch (device or dtype changed) — rebuild.
-        _STACK_CACHE.pop(key, None)
+        _CACHED_MOE_ID = None
+        _CACHED_STACK = None
 
-    # Evict other layers before building a new stack (OOM guard for full observe).
-    if key not in _STACK_CACHE and len(_STACK_CACHE) >= _MAX_CACHE_ENTRIES:
-        _STACK_CACHE.clear()
+    # Evict stale entry before building a new stack (OOM guard for full observe).
+    if _CACHED_STACK is not None:
+        _CACHED_MOE_ID = None
+        _CACHED_STACK = None
 
     attrs = adapter.expert_weight_attrs(moe)
     convention = attrs.get("weight_convention") or getattr(
@@ -108,6 +110,11 @@ def get_stacked_expert_weights(
         W_up = W_up.to(device=device or W_up.device, dtype=dtype or W_up.dtype)
         W_down = W_down.to(device=device or W_down.device, dtype=dtype or W_down.dtype)
 
+    # Detach from autograd to drop memory overhead (observer runs under no_grad).
+    W_gate = W_gate.detach()
+    W_up = W_up.detach()
+    W_down = W_down.detach()
+
     stacked = {
         "W_gate": W_gate,
         "W_up": W_up,
@@ -117,7 +124,8 @@ def get_stacked_expert_weights(
         "_resolved_device": W_gate.device,
         "_resolved_dtype": W_gate.dtype,
     }
-    _STACK_CACHE[key] = stacked
+    _CACHED_MOE_ID = id(moe)
+    _CACHED_STACK = stacked
     return stacked
 
 
