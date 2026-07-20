@@ -55,6 +55,22 @@ REAP scores each expert based on calibration data importance:
 
 **Key finding**: The pruned model is an exact subset — weights are bit-for-bit identical to the base model. No renormalization is applied to gate weights or expert weights. The "-renorm" flag in the run name refers to router probability normalization (norm_topk_prob), not weight adjustment.
 
+### Empirical Validation (bit-for-bit)
+
+The exact-subset claim was verified empirically by loading both base and pruned safetensors on CPU and comparing every tensor:
+
+| Tensor category | Count compared | Bit-for-bit identical |
+|-----------------|---------------|----------------------:|
+| Surviving expert weights (w1/w2/w3) | 352 | 352 / 352 ✓ |
+| Router `gate.weight` rows (per layer) | 16 × 22 | 352 / 352 ✓ |
+| Router `expert_bias` scalars (per layer) | 16 × 22 | 352 / 352 ✓ |
+| Non-MoE weights (attention, conv, norms, embeddings, lm_head) | 146 | 146 / 146 ✓ |
+| **Total** | **1,202** | **1,202 / 1,202 ✓** |
+
+- Expert weights were matched by recovering the survivor map: for each pruned expert, the base expert with identical w1/w2/w3 was found via `torch.equal` (short-circuit). All 352 surviving experts map to exactly one base expert (bijection), confirming the per-layer survivor map below.
+- `gate.weight` shrinks from `(32, 2048)` → `(16, 2048)` by keeping the surviving experts' rows; `expert_bias` shrinks from `(32,)` → `(16,)` analogously. Both are exact row/value subsets.
+- Zero value mismatches across all 1,202 compared tensors — no renormalization, rescaling, or modification of any kind. The `reap-renorm_true` flag did not alter any weight.
+
 ## Per-Layer Expert Pruning Map
 
 Each layer independently selects 16 out of 32 experts. The selection varies significantly across layers:

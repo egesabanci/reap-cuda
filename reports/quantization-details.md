@@ -107,6 +107,8 @@ The pack-quantized INT4 model loads correctly with `AutoModelForCausalLM.from_pr
 
 ### Bugs Fixed
 
+> **Upstream PR**: These two bugs have been reported and fixed upstream — see [huggingface/transformers#47430](https://github.com/huggingface/transformers/pull/47430). The fix is general for any MoE model with fused expert `nn.Parameter` weights (LFM2.5, Qwen2-MoE family) quantized with an asymmetric compressed-tensors scheme. A self-contained, idempotent patch script is shipped with the published INT4 model at [`konic-labs/LFM2.5-8B-A1B-REAP-50-AWQ-INT4`](https://huggingface.co/konic-labs/LFM2.5-8B-A1B-REAP-50-AWQ-INT4) (`patches/apply_int4_patch.py`) — re-run it after every `pip install -U transformers` until the PR lands in a release.
+
 **Bug 1 — Missing `weight_zero_point` in source patterns** (`transformers/quantizers/quantizer_compressed_tensors.py:137`):
 
 ```python

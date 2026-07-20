@@ -415,6 +415,27 @@ Focused suites: `tests/test_residency.py`, `tests/test_run_findings_fixes.py`,
 
 Conventional Commits are used (`feat:`, `fix:`, `test:`, `docs:`, …).
 
+## Research Outputs
+
+This repository has been used to produce a published REAP + AWQ compression study on LiquidAI's LFM2.5-8B-A1B MoE model. The full analysis lives in [`reports/`](./reports):
+
+| Report | Contents |
+|--------|---------|
+| [`reports/architecture-analysis.md`](./reports/architecture-analysis.md) | Per-layer expert pruning map, survival rates, empirical bit-for-bit subset validation (1,202/1,202 tensors identical) |
+| [`reports/benchmark-results.md`](./reports/benchmark-results.md) | MATH500 + BFCLv3 scores for pruned & quantized models |
+| [`reports/compression-metrics.md`](./reports/compression-metrics.md) | Size / VRAM / throughput numbers (vLLM 4,809 tok/s peak) |
+| [`reports/quantization-details.md`](./reports/quantization-details.md) | AWQ config, custom LFM2.5 mappings, INT4 loading fix |
+| [`reports/published-artifacts.md`](./reports/published-artifacts.md) | Published HuggingFace model artifacts + loading instructions |
+
+**Published models** (HuggingFace, `konic-labs`):
+
+- [`konic-labs/LFM2.5-8B-A1B-REAP-50`](https://huggingface.co/konic-labs/LFM2.5-8B-A1B-REAP-50) — 50% expert pruning, 8.57 GB
+- [`konic-labs/LFM2.5-8B-A1B-REAP-50-AWQ-INT4`](https://huggingface.co/konic-labs/LFM2.5-8B-A1B-REAP-50-AWQ-INT4) — pruning + AWQ INT4, 2.79 GB (83.5% total compression)
+
+**Results**: 81–88% quality retention (MATH500 72.0%, BFCLv3 single-turn 57.36%) at 83.5% compression vs the 16.94 GB base.
+
+**Upstream contribution**: Two `transformers` bugs blocking asymmetric MoE INT4 loading were fixed in [huggingface/transformers#47430](https://github.com/huggingface/transformers/pull/47430).
+
 ## Related
 
 - [reap-mlx](https://github.com/egesabanci/reap-mlx) — Apple Silicon / MLX port
